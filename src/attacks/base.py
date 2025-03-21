@@ -1,143 +1,163 @@
+"""Base class for adversarial attacks."""
+
 import torch
-import numpy as np
 from abc import ABC, abstractmethod
+from typing import Tuple, Optional, Dict, Any, Union
 
 
 class BaseAttack(ABC):
     """
-    Base class for all adversarial attack implementations.
+    Base class for adversarial attacks.
 
-    Parameters:
-    -----------
-    model : torch.nn.Module
-        The target model to attack
-    epsilon : float
-        Maximum perturbation magnitude
-    norm : str
-        Norm type for constraint ('L2' or 'Linf')
-    targeted : bool
-        Whether to perform a targeted attack
+    This defines the interface that all optimization-based attacks should implement.
     """
 
-    def __init__(self, model, epsilon=0.3, norm="L2", targeted=False):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        norm: str = "L2",
+        eps: float = 0.5,
+        targeted: bool = False,
+        loss_fn: str = "cross_entropy",
+        device: Optional[torch.device] = None,
+        verbose: bool = False,
+    ):
+        """
+        Initialize the attack.
+
+        Args:
+            model: The model to attack
+            norm: The norm to use for the perturbation constraint ('L2' or 'Linf')
+            eps: The maximum perturbation size
+            targeted: Whether to perform a targeted attack
+            loss_fn: The loss function to use ('cross_entropy' or 'margin')
+            device: The device to use (CPU or GPU)
+            verbose: Whether to print progress information
+        """
         self.model = model
-        self.epsilon = epsilon
         self.norm = norm
+        self.eps = eps
         self.targeted = targeted
+        self.loss_fn = loss_fn
+        self.device = (
+            device
+            if device is not None
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        self.verbose = verbose
 
-        # Set device
-        self.device = next(model.parameters()).device
+        # Performance tracking
+        self.total_iterations = 0
+        self.total_gradient_calls = 0
+        self.total_time = 0
 
-        # Set loss function
-        self.loss_fn = torch.nn.CrossEntropyLoss()
-
-        # Ensure model is in eval mode
+        # Put model in evaluation mode
         self.model.eval()
 
-    def _project(self, x, x_orig):
+    def _compute_loss(
+        self, outputs: torch.Tensor, targets: torch.Tensor
+    ) -> torch.Tensor:
         """
-        Project perturbation according to specified norm constraints.
+        Compute the loss function.
 
-        Parameters:
-        -----------
-        x : torch.Tensor
-            Current perturbed image
-        x_orig : torch.Tensor
-            Original unperturbed image
+        Args:
+            outputs: The model outputs
+            targets: The target labels
 
         Returns:
-        --------
-        torch.Tensor
-            Projected image that satisfies constraints
+            The loss value
         """
-        # Calculate perturbation
-        delta = x - x_orig
+        if self.loss_fn == "cross_entropy":
+            return torch.nn.functional.cross_entropy(outputs, targets)
+        elif self.loss_fn == "margin":
+            # Margin loss maximizes the difference between the target class and all other classes
+            if self.targeted:
+                # For targeted attacks, we want to maximize the target class
+                target_logits = outputs.gather(1, targets.unsqueeze(1)).squeeze(1)
+                other_logits = outputs.clone()
+                other_logits.scatter_(1, targets.unsqueeze(1), float("-inf"))
+                other_logits = other_logits.max(1)[0]
+                return other_logits - target_logits
+            else:
+                # For untargeted attacks, we want to minimize the true class
+                true_logits = outputs.gather(1, targets.unsqueeze(1)).squeeze(1)
+                other_logits = outputs.clone()
+                other_logits.scatter_(1, targets.unsqueeze(1), float("-inf"))
+                other_logits = other_logits.max(1)[0]
+                return true_logits - other_logits
+        else:
+            raise ValueError(f"Unsupported loss function: {self.loss_fn}")
 
-        # Project based on norm type
-        if self.norm == "L2":
-            # L2 projection
-            norm = torch.norm(delta.view(delta.shape[0], -1), dim=1)
-            mask = norm > self.epsilon
-            if mask.any():
-                delta[mask] = delta[mask] / norm[mask].view(-1, 1, 1, 1) * self.epsilon
-        elif self.norm == "Linf":
-            # L∞ projection
-            delta = torch.clamp(delta, -self.epsilon, self.epsilon)
+    def _compute_gradient(
+        self, inputs: torch.Tensor, targets: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute the gradient of the loss with respect to the inputs.
 
-        # Ensure valid image range [0, 1]
-        return torch.clamp(x_orig + delta, 0, 1)
+        Args:
+            inputs: The input data
+            targets: The target labels
+
+        Returns:
+            The gradient of the loss with respect to the inputs
+        """
+        inputs.requires_grad_(True)
+        outputs = self.model(inputs)
+        loss = self._compute_loss(outputs, targets)
+        self.model.zero_grad()
+        loss.backward()
+        grad = inputs.grad.clone()
+        inputs.requires_grad_(False)
+        self.total_gradient_calls += 1
+        return grad
+
+    def _check_success(
+        self, outputs: torch.Tensor, targets: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Check if the attack was successful.
+
+        Args:
+            outputs: The model outputs
+            targets: The target labels
+
+        Returns:
+            A boolean tensor indicating success for each input
+        """
+        if self.targeted:
+            return outputs.argmax(dim=1) == targets
+        else:
+            return outputs.argmax(dim=1) != targets
 
     @abstractmethod
-    def generate(self, x, y):
+    def generate(
+        self, inputs: torch.Tensor, targets: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Generate adversarial examples.
 
-        Parameters:
-        -----------
-        x : torch.Tensor
-            Original input images
-        y : torch.Tensor
-            True labels for untargeted attack, target labels for targeted attack
+        Args:
+            inputs: The input data
+            targets: The true labels for untargeted attacks, target labels for targeted attacks
 
         Returns:
-        --------
-        torch.Tensor
-            Adversarial examples
+            A tuple of (adversarial_examples, metrics)
+
+        Raises:
+            NotImplementedError: If the method is not implemented
         """
-        pass
+        raise NotImplementedError("Subclasses must implement generate()")
 
-    def _compute_loss(self, x, y):
-        """
-        Compute the loss for optimization.
+    def reset_metrics(self) -> None:
+        """Reset the performance tracking metrics."""
+        self.total_iterations = 0
+        self.total_gradient_calls = 0
+        self.total_time = 0
 
-        Parameters:
-        -----------
-        x : torch.Tensor
-            Current input
-        y : torch.Tensor
-            Target labels
-
-        Returns:
-        --------
-        torch.Tensor
-            Loss value
-        """
-        outputs = self.model(x)
-
-        if self.targeted:
-            # For targeted attacks, minimize loss to target
-            return -self.loss_fn(outputs, y)
-        else:
-            # For untargeted attacks, maximize loss from true class
-            return self.loss_fn(outputs, y)
-
-    def success_rate(self, x_adv, x_orig, y):
-        """
-        Calculate attack success rate.
-
-        Parameters:
-        -----------
-        x_adv : torch.Tensor
-            Adversarial examples
-        x_orig : torch.Tensor
-            Original inputs
-        y : torch.Tensor
-            True labels
-
-        Returns:
-        --------
-        float
-            Success rate (percentage of successful attacks)
-        """
-        with torch.no_grad():
-            orig_preds = self.model(x_orig).argmax(dim=1)
-            adv_preds = self.model(x_adv).argmax(dim=1)
-
-            if self.targeted:
-                # For targeted attacks, success means prediction matches target
-                success = (adv_preds == y).float().mean().item()
-            else:
-                # For untargeted attacks, success means prediction differs from original
-                success = (adv_preds != y).float().mean().item()
-
-        return success * 100  # Return as percentage
+    def get_metrics(self) -> Dict[str, Union[int, float]]:
+        """Get the performance metrics."""
+        return {
+            "iterations": self.total_iterations,
+            "gradient_calls": self.total_gradient_calls,
+            "time": self.total_time,
+        }
