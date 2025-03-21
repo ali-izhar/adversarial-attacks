@@ -5,7 +5,7 @@ import time
 from typing import Tuple, Dict, Any, Optional
 
 from .base import BaseAttack
-from .optimization import PGDOptimizer
+from .optimize import PGDOptimizer
 
 
 class PGD(BaseAttack):

@@ -5,7 +5,7 @@ import time
 from typing import Tuple, Dict, Any, Optional
 
 from .base import BaseAttack
-from .optimization import ConjugateGradientOptimizer
+from .optimize import ConjugateGradientOptimizer
 
 
 class ConjugateGradient(BaseAttack):

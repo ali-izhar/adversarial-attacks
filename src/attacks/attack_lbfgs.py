@@ -5,7 +5,7 @@ import time
 from typing import Tuple, Dict, Any, Optional
 
 from .base import BaseAttack
-from .optimization import LBFGSOptimizer
+from .optimize import LBFGSOptimizer
 
 
 class LBFGS(BaseAttack):
