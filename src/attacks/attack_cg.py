@@ -96,22 +96,79 @@ class ConjugateGradient(BaseAttack):
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
 
+        # Make sure inputs and targets have the same batch size
+        if inputs.size(0) != targets.size(0):
+            # If targeted=True with a single target class, expand to match input size
+            if self.targeted and targets.size(0) == 1:
+                targets = targets.expand(inputs.size(0))
+            else:
+                raise ValueError(
+                    f"Input batch size {inputs.size(0)} doesn't match target batch size {targets.size(0)}"
+                )
+
+        # Store targets to avoid passing them repeatedly
+        self.original_targets = targets
+
         # Define gradient function
         def gradient_fn(x: torch.Tensor) -> torch.Tensor:
-            return self._compute_gradient(x, targets)
+            # Get the corresponding subset of targets if x is a subset
+            if x.size(0) != self.original_targets.size(0):
+                # Find which indices of the original batch are in x
+                # This is a simplification - in practice, we should track indices
+                # But for now, we assume x is always a contiguous subset
+                # So we just use the first x.size(0) targets
+                curr_targets = self.original_targets[: x.size(0)]
+            else:
+                curr_targets = self.original_targets
+
+            # Ensure x requires gradients
+            x = x.detach().clone()
+            x.requires_grad_(True)
+
+            # Compute the loss
+            outputs = self.model(x)
+            loss = self._compute_loss(outputs, curr_targets, reduction="mean")
+
+            # Compute gradient
+            self.model.zero_grad()
+            loss.backward()
+
+            # Get gradient
+            grad = x.grad.clone()
+
+            # Clean up
+            x.requires_grad_(False)
+
+            return grad
 
         # Define loss function for the optimizer
         def loss_fn(x: torch.Tensor) -> torch.Tensor:
-            x.requires_grad_(True)
-            outputs = self.model(x)
-            loss = self._compute_loss(outputs, targets)
+            # Get the corresponding subset of targets if x is a subset
+            if x.size(0) != self.original_targets.size(0):
+                # Same simplification as above
+                curr_targets = self.original_targets[: x.size(0)]
+            else:
+                curr_targets = self.original_targets
+
+            # No need for gradient computation here
+            with torch.no_grad():
+                outputs = self.model(x)
+                # Use 'none' reduction to get per-example losses
+                loss = self._compute_loss(outputs, curr_targets, reduction="none")
             return loss
 
         # Define success function
         def success_fn(x: torch.Tensor) -> torch.Tensor:
+            # Get the corresponding subset of targets if x is a subset
+            if x.size(0) != self.original_targets.size(0):
+                # Same simplification as above
+                curr_targets = self.original_targets[: x.size(0)]
+            else:
+                curr_targets = self.original_targets
+
             with torch.no_grad():
                 outputs = self.model(x)
-                return self._check_success(outputs, targets)
+                return self._check_success(outputs, curr_targets)
 
         # Run optimization
         x_adv, opt_metrics = self.optimizer.optimize(

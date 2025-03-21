@@ -1,8 +1,6 @@
-"""
-Utility functions for adversarial attack implementations.
-"""
+"""Utility functions for adversarial attack implementations."""
 
-from src.utils.projections import (
+from .projections import (
     project_box,
     project_l2_ball,
     project_linf_ball,

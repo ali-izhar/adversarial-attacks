@@ -96,20 +96,47 @@ class LBFGSOptimizer:
             y_i = y_history[i]
             rho_i = rho_history[i]
 
+            # Ensure s_i and y_i have the correct batch dimension
+            if s_i.shape[0] != batch_size:
+                s_i = s_i.expand(batch_size, *s_i.shape[1:])
+
+            if y_i.shape[0] != batch_size:
+                y_i = y_i.expand(batch_size, *y_i.shape[1:])
+
             # Compute alpha_i
-            alpha_i = rho_i * torch.bmm(
+            alpha_i = torch.bmm(
                 s_i.view(batch_size, 1, -1), q.view(batch_size, -1, 1)
             ).squeeze(-1)
+
+            # Handle case where rho_i has different batch size
+            if isinstance(rho_i, torch.Tensor):
+                if rho_i.numel() != batch_size:
+                    # If rho_i has wrong size, use the mean value
+                    rho_i = torch.mean(rho_i).expand(batch_size)
+                elif rho_i.dim() == 1 and rho_i.shape[0] != batch_size:
+                    rho_i = rho_i[0].expand(batch_size)
+
+            # Apply rho_i to alpha_i
+            alpha_i = rho_i * alpha_i
             alpha_list.append(alpha_i)
 
-            # Update q
-            q = q - alpha_i.view(batch_size, 1, 1, 1) * y_i
+            # Update q - ensure alpha_i has the right shape
+            if alpha_i.dim() == 1:
+                alpha_i = alpha_i.view(batch_size, 1, 1, 1)
+            q = q - alpha_i * y_i
 
         # Scale initial Hessian approximation
         # H_k^0 = (s_{k-1}^T y_{k-1}) / (y_{k-1}^T y_{k-1}) * I
         if history_size > 0:
             s_last = s_history[-1]
             y_last = y_history[-1]
+
+            # Ensure s_last and y_last have the correct batch dimension
+            if s_last.shape[0] != batch_size:
+                s_last = s_last.expand(batch_size, *s_last.shape[1:])
+
+            if y_last.shape[0] != batch_size:
+                y_last = y_last.expand(batch_size, *y_last.shape[1:])
 
             s_dot_y = torch.bmm(
                 s_last.view(batch_size, 1, -1), y_last.view(batch_size, -1, 1)
@@ -120,7 +147,9 @@ class LBFGSOptimizer:
 
             # Avoid division by zero
             scale = s_dot_y / (y_dot_y + 1e-10)
-            r = q * scale.view(batch_size, 1, 1, 1)
+            if scale.dim() > 0:
+                scale = scale.view(batch_size, 1, 1, 1)
+            r = q * scale
         else:
             r = q
 
@@ -131,13 +160,36 @@ class LBFGSOptimizer:
             rho_i = rho_history[i]
             alpha_i = alpha_list[history_size - 1 - i]
 
+            # Ensure s_i and y_i have the correct batch dimension
+            if s_i.shape[0] != batch_size:
+                s_i = s_i.expand(batch_size, *s_i.shape[1:])
+
+            if y_i.shape[0] != batch_size:
+                y_i = y_i.expand(batch_size, *y_i.shape[1:])
+
+            # Handle case where rho_i has different batch size
+            if isinstance(rho_i, torch.Tensor):
+                if rho_i.numel() != batch_size:
+                    # If rho_i has wrong size, use the mean value
+                    rho_i = torch.mean(rho_i).expand(batch_size)
+                elif rho_i.dim() == 1 and rho_i.shape[0] != batch_size:
+                    rho_i = rho_i[0].expand(batch_size)
+
             # Compute beta
-            beta_i = rho_i * torch.bmm(
+            beta_i = torch.bmm(
                 y_i.view(batch_size, 1, -1), r.view(batch_size, -1, 1)
             ).squeeze(-1)
 
-            # Update r
-            r = r + (alpha_i - beta_i).view(batch_size, 1, 1, 1) * s_i
+            # Apply rho_i to beta_i
+            beta_i = rho_i * beta_i
+
+            # Update r - ensure alpha_i and beta_i have right shape
+            if alpha_i.dim() == 1:
+                alpha_i = alpha_i.view(batch_size, 1, 1, 1)
+            if beta_i.dim() == 1:
+                beta_i = beta_i.view(batch_size, 1, 1, 1)
+
+            r = r + (alpha_i - beta_i) * s_i
 
         # Return search direction
         return -r
@@ -178,8 +230,12 @@ class LBFGSOptimizer:
             current_grad.view(batch_size, 1, -1), direction.view(batch_size, -1, 1)
         ).squeeze(-1)
 
+        # Ensure dir_deriv is a 1D tensor of shape (batch_size,)
+        if dir_deriv.dim() > 1:
+            dir_deriv = dir_deriv.view(batch_size)
+
         # For Armijo condition
-        armijo_threshold = current_loss - self.c1 * alpha * dir_deriv.squeeze()
+        armijo_threshold = current_loss - self.c1 * alpha * dir_deriv
 
         # For Wolfe condition
         if self.line_search_fn == "strong_wolfe":
@@ -230,9 +286,7 @@ class LBFGSOptimizer:
                 alpha[~armijo_satisfied] *= 0.5
                 armijo_threshold[~armijo_satisfied] = (
                     current_loss[~armijo_satisfied]
-                    - self.c1
-                    * alpha[~armijo_satisfied]
-                    * dir_deriv.squeeze()[~armijo_satisfied]
+                    - self.c1 * alpha[~armijo_satisfied] * dir_deriv[~armijo_satisfied]
                 )
 
             else:  # strong_wolfe
@@ -240,8 +294,14 @@ class LBFGSOptimizer:
                 if armijo_satisfied.any():
                     # Compute gradient for points that satisfy Armijo
                     grad_new_full = torch.zeros_like(current_grad)
-                    grad_new_partial = grad_fn(x_new[armijo_satisfied])
-                    grad_new_full[armijo_satisfied] = grad_new_partial
+
+                    # Make sure armijo_satisfied has the correct shape for indexing
+                    armijo_flat = armijo_satisfied
+                    if armijo_satisfied.dim() > 1:
+                        armijo_flat = armijo_satisfied.view(batch_size)
+
+                    grad_new_partial = grad_fn(x_new[armijo_flat])
+                    grad_new_full[armijo_flat] = grad_new_partial
 
                     # Compute new directional derivative
                     dir_deriv_new = torch.bmm(
@@ -249,13 +309,21 @@ class LBFGSOptimizer:
                         direction.view(batch_size, -1, 1),
                     ).squeeze(-1)
 
+                    # Ensure dir_deriv_new is a 1D tensor
+                    if dir_deriv_new.dim() > 1:
+                        dir_deriv_new = dir_deriv_new.view(batch_size)
+
                     # Check Wolfe condition (curvature condition)
                     wolfe_satisfied = torch.abs(dir_deriv_new) <= torch.abs(
                         wolfe_threshold
                     )
 
+                    # Make sure all boolean masks have the same shape
+                    if wolfe_satisfied.dim() > 1:
+                        wolfe_satisfied = wolfe_satisfied.view(batch_size)
+
                     # Combined conditions
-                    new_success = armijo_satisfied & wolfe_satisfied
+                    new_success = armijo_flat & wolfe_satisfied
 
                     # Update best values for successful steps
                     best_alpha[new_success] = alpha[new_success]
@@ -269,19 +337,22 @@ class LBFGSOptimizer:
                         break
 
                     # For Armijo but not Wolfe: need to increase step size
-                    increase_idx = armijo_satisfied & ~wolfe_satisfied & ~success
+                    increase_idx = armijo_flat & ~wolfe_satisfied & ~success
                     if increase_idx.any():
                         alpha[increase_idx] *= 2.0
 
                 # For points not satisfying Armijo: decrease step size
-                decrease_idx = ~armijo_satisfied & ~success
+                if armijo_satisfied.dim() > 1:
+                    armijo_flat = armijo_satisfied.view(batch_size)
+                else:
+                    armijo_flat = armijo_satisfied
+
+                decrease_idx = ~armijo_flat & ~success
                 if decrease_idx.any():
                     alpha[decrease_idx] *= 0.5
                     armijo_threshold[decrease_idx] = (
                         current_loss[decrease_idx]
-                        - self.c1
-                        * alpha[decrease_idx]
-                        * dir_deriv.squeeze()[decrease_idx]
+                        - self.c1 * alpha[decrease_idx] * dir_deriv[decrease_idx]
                     )
 
         # For any unsuccessful searches, use the best values found

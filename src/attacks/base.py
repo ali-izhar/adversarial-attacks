@@ -55,7 +55,7 @@ class BaseAttack(ABC):
         self.model.eval()
 
     def _compute_loss(
-        self, outputs: torch.Tensor, targets: torch.Tensor
+        self, outputs: torch.Tensor, targets: torch.Tensor, reduction: str = "mean"
     ) -> torch.Tensor:
         """
         Compute the loss function.
@@ -63,12 +63,15 @@ class BaseAttack(ABC):
         Args:
             outputs: The model outputs
             targets: The target labels
+            reduction: How to reduce the loss ('none', 'mean', 'sum')
 
         Returns:
-            The loss value
+            The loss value (per-example losses if reduction='none')
         """
         if self.loss_fn == "cross_entropy":
-            return torch.nn.functional.cross_entropy(outputs, targets)
+            return torch.nn.functional.cross_entropy(
+                outputs, targets, reduction=reduction
+            )
         elif self.loss_fn == "margin":
             # Margin loss maximizes the difference between the target class and all other classes
             if self.targeted:
@@ -77,14 +80,26 @@ class BaseAttack(ABC):
                 other_logits = outputs.clone()
                 other_logits.scatter_(1, targets.unsqueeze(1), float("-inf"))
                 other_logits = other_logits.max(1)[0]
-                return other_logits - target_logits
+                # Return per-example losses
+                batch_loss = other_logits - target_logits
             else:
                 # For untargeted attacks, we want to minimize the true class
                 true_logits = outputs.gather(1, targets.unsqueeze(1)).squeeze(1)
                 other_logits = outputs.clone()
                 other_logits.scatter_(1, targets.unsqueeze(1), float("-inf"))
                 other_logits = other_logits.max(1)[0]
-                return true_logits - other_logits
+                # Return per-example losses
+                batch_loss = true_logits - other_logits
+
+            # Apply reduction if requested
+            if reduction == "mean":
+                return batch_loss.mean()
+            elif reduction == "sum":
+                return batch_loss.sum()
+            elif reduction == "none":
+                return batch_loss
+            else:
+                raise ValueError(f"Unsupported reduction: {reduction}")
         else:
             raise ValueError(f"Unsupported loss function: {self.loss_fn}")
 
@@ -103,7 +118,8 @@ class BaseAttack(ABC):
         """
         inputs.requires_grad_(True)
         outputs = self.model(inputs)
-        loss = self._compute_loss(outputs, targets)
+        # Use mean reduction for backward pass to get proper gradients
+        loss = self._compute_loss(outputs, targets, reduction="mean")
         self.model.zero_grad()
         loss.backward()
         grad = inputs.grad.clone()

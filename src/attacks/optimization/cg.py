@@ -112,12 +112,12 @@ class ConjugateGradientOptimizer:
             x: Current point
             direction: Search direction
             current_grad: Gradient at current point
-            current_loss: Loss at current point
+            current_loss: Loss at current point (per-example)
             x_original: Original input for projection (if provided)
-            loss_fn: Function to compute loss
+            loss_fn: Function to compute loss (should return per-example losses)
 
         Returns:
-            Step size
+            Step size (per-example)
         """
         batch_size = x.shape[0]
         alpha = torch.ones(batch_size, device=x.device)
@@ -147,7 +147,7 @@ class ConjugateGradientOptimizer:
             # Compute new loss
             new_loss = loss_fn(x_new)
 
-            # Check Armijo condition
+            # Check Armijo condition - per-example comparison
             armijo_condition = new_loss <= armijo_threshold
 
             # If all satisfy Armijo, we're done
@@ -157,9 +157,11 @@ class ConjugateGradientOptimizer:
             # Otherwise, reduce step size for examples that failed
             alpha[~armijo_condition] *= self.backtracking_factor
 
-            # Update threshold
-            armijo_threshold = (
-                current_loss - self.sufficient_decrease * alpha * dir_deriv
+            # Update threshold for those examples
+            armijo_threshold[~armijo_condition] = current_loss[~armijo_condition] - (
+                self.sufficient_decrease
+                * alpha[~armijo_condition]
+                * dir_deriv[~armijo_condition]
             )
 
         return alpha
@@ -178,7 +180,7 @@ class ConjugateGradientOptimizer:
         Args:
             x_init: Initial point
             gradient_fn: Function that computes gradient given current x
-            loss_fn: Function that computes loss given current x
+            loss_fn: Function that computes loss given current x (should return per-example losses)
             success_fn: Function that returns True if optimization goal is achieved
             x_original: Original input (for projection)
 
@@ -216,7 +218,7 @@ class ConjugateGradientOptimizer:
         grad = gradient_fn(x_adv)
         gradient_calls += 1
         d = -grad  # Initial search direction
-        loss_current = loss_fn(x_adv)
+        loss_current = loss_fn(x_adv)  # Per-example losses
 
         # Main optimization loop
         for t in range(self.n_iterations):
@@ -235,10 +237,10 @@ class ConjugateGradientOptimizer:
                 if working_examples.sum() == 0:
                     break
 
-                # Compute line search only for examples that are still being optimized
-                alpha_full = torch.zeros(batch_size, device=device)
+                # Create alpha tensor for all examples, will only update working ones
+                alpha = torch.zeros(batch_size, device=device)
 
-                # Perform line search for working examples
+                # Only perform line search on working examples
                 alpha_working = self._line_search(
                     x_adv[working_examples],
                     d[working_examples],
@@ -248,8 +250,8 @@ class ConjugateGradientOptimizer:
                     lambda x: loss_fn(x),
                 )
 
-                alpha_full[working_examples] = alpha_working
-                alpha = alpha_full
+                # Update alpha only for working examples
+                alpha[working_examples] = alpha_working
             else:
                 alpha = self._line_search(
                     x_adv, d, grad_old, loss_current, x_original, loss_fn
@@ -284,18 +286,8 @@ class ConjugateGradientOptimizer:
             gradient_calls += 1
 
             # Compute new loss for line search
-            if self.early_stopping:
-                working_examples = ~success
-                if working_examples.sum() == 0:
-                    break
-
-                # Compute loss only for examples that are still being optimized
-                loss_full = torch.zeros(batch_size, device=device)
-                loss_working = loss_fn(x_adv[working_examples])
-                loss_full[working_examples] = loss_working
-                loss_current = loss_full
-            else:
-                loss_current = loss_fn(x_adv)
+            # This must return per-example losses
+            loss_current = loss_fn(x_adv)
 
             # Check for success
             if success_fn is not None:

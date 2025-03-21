@@ -75,6 +75,7 @@ class PGDOptimizer:
         self,
         x_init: torch.Tensor,
         gradient_fn: Callable[[torch.Tensor], torch.Tensor],
+        loss_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         success_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         x_original: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
@@ -84,6 +85,7 @@ class PGDOptimizer:
         Args:
             x_init: Initial point
             gradient_fn: Function that computes gradient given current x
+            loss_fn: Function that computes loss given current x (should return per-example losses)
             success_fn: Function that returns True if optimization goal is achieved
             x_original: Original input (for projection)
 
