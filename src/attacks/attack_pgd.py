@@ -1,4 +1,29 @@
-"""Projected Gradient Descent (PGD) adversarial attack implementation."""
+"""Projected Gradient Descent (PGD) adversarial attack implementation.
+
+This file implements the PGD attack, which is a powerful first-order iterative method for
+generating adversarial examples. The PGD method works by taking steps in the direction of the
+gradient and then projecting back onto the constraint set defined by the perturbation norm ball,
+making it an effective and widely used attack in adversarial machine learning.
+
+Key features:
+- Simple yet powerful first-order optimization method
+- Supports both targeted and untargeted attacks
+- Configurable step size schedules (constant or diminishing)
+- Compatible with different loss functions (cross-entropy and margin loss)
+- Constraint handling for both L2 and Linf perturbation norms
+- Optional random initialization within the perturbation space
+- Early stopping capability when adversarial criteria are met
+
+Expected inputs:
+- A neural network model to attack
+- Input samples (images) to perturb
+- Target labels (true labels for untargeted attacks, target labels for targeted attacks)
+- Configuration parameters for the attack and optimizer
+
+Expected outputs:
+- Adversarial examples that aim to fool the model
+- Performance metrics (iterations, gradient calls, time, success rate)
+"""
 
 import torch
 import time
@@ -12,7 +37,10 @@ class PGD(BaseAttack):
     """
     Projected Gradient Descent (PGD) adversarial attack.
 
-    This attack uses the PGDOptimizer to generate adversarial examples.
+    This attack uses the PGDOptimizer to generate adversarial examples by iteratively taking
+    steps in the gradient direction (to maximize or minimize the loss depending on the attack)
+    and then projecting the perturbed input back onto the constraint set (the eps-ball).
+    It supports both targeted and untargeted attacks and allows for different step size schedules.
     """
 
     def __init__(
@@ -35,23 +63,24 @@ class PGD(BaseAttack):
         Initialize the PGD attack.
 
         Args:
-            model: The model to attack
-            norm: The norm to use for the perturbation constraint ('L2' or 'Linf')
-            eps: The maximum perturbation size
-            targeted: Whether to perform a targeted attack
-            loss_fn: The loss function to use ('cross_entropy' or 'margin')
-            n_iterations: Maximum number of iterations
-            alpha_init: Initial step size
-            alpha_type: Step size schedule ('constant' or 'diminishing')
-            rand_init: Whether to initialize with random perturbation
-            init_std: Standard deviation for random initialization
-            early_stopping: Whether to stop early when attack succeeds
-            verbose: Whether to print progress information
-            device: The device to use (CPU or GPU)
+            model: The model to attack.
+            norm: Norm for the perturbation constraint ('L2' or 'Linf').
+            eps: Maximum allowed perturbation magnitude.
+            targeted: Whether to perform a targeted attack.
+            loss_fn: Loss function to use ('cross_entropy' or 'margin').
+            n_iterations: Maximum number of iterations to run.
+            alpha_init: Initial step size for the updates.
+            alpha_type: Step size schedule ('constant' or 'diminishing').
+            rand_init: Whether to initialize the attack with random noise.
+            init_std: Standard deviation for random initialization.
+            early_stopping: Stop early if adversarial criteria are met.
+            verbose: Print progress updates.
+            device: Device to run the attack on (e.g., CPU or GPU).
         """
+        # Initialize the base attack with model and common parameters.
         super().__init__(model, norm, eps, targeted, loss_fn, device, verbose)
 
-        # Initialize the optimizer
+        # Instantiate the PGD optimizer with the specified configuration.
         self.optimizer = PGDOptimizer(
             norm=norm,
             eps=eps,
@@ -70,26 +99,34 @@ class PGD(BaseAttack):
         """
         Generate adversarial examples using PGD.
 
+        The attack performs the following steps:
+          1. Moves inputs and targets to the appropriate device.
+          2. Ensures that the batch sizes match (expanding targets if needed for targeted attacks).
+          3. Defines helper functions for gradient computation, loss evaluation, and success checking.
+          4. Calls the PGDOptimizer to update the inputs iteratively.
+          5. Returns the final adversarial examples along with metrics.
+
         Args:
-            inputs: The input images
-            targets: The target labels (true labels for untargeted attacks, target labels for targeted attacks)
+            inputs: Input images (clean samples) to perturb.
+            targets: Target labels (for targeted attacks) or true labels (for untargeted attacks).
 
         Returns:
-            A tuple of (adversarial_examples, metrics)
+            A tuple (adversarial_examples, metrics), where metrics include the number of iterations,
+            gradient calls, total time, and the attack success rate.
         """
-        # Reset metrics
+        # Reset any stored metrics from previous runs.
         self.reset_metrics()
         start_time = time.time()
 
         batch_size = inputs.shape[0]
 
-        # Move inputs and targets to the attack device
+        # Ensure inputs and targets are on the same device (e.g., GPU).
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
 
-        # Make sure inputs and targets have the same batch size
+        # Check that inputs and targets have the same batch size.
         if inputs.size(0) != targets.size(0):
-            # If targeted=True with a single target class, expand to match input size
+            # For targeted attacks with a single target class, expand targets.
             if self.targeted and targets.size(0) == 1:
                 targets = targets.expand(inputs.size(0))
             else:
@@ -97,85 +134,78 @@ class PGD(BaseAttack):
                     f"Input batch size {inputs.size(0)} doesn't match target batch size {targets.size(0)}"
                 )
 
-        # Store targets to avoid passing them repeatedly
+        # Store targets to reuse them in helper functions.
         self.original_targets = targets
 
-        # Define gradient function
+        # Define a helper function to compute the gradient of the loss with respect to inputs.
         def gradient_fn(x: torch.Tensor) -> torch.Tensor:
-            # Get the corresponding subset of targets if x is a subset
+            # If x is a subset, use the corresponding targets (assumed to be a contiguous subset).
             if x.size(0) != self.original_targets.size(0):
-                # Find which indices of the original batch are in x
-                # This is a simplification - in practice, we should track indices
-                # But for now, we assume x is always a contiguous subset
-                # So we just use the first x.size(0) targets
                 curr_targets = self.original_targets[: x.size(0)]
             else:
                 curr_targets = self.original_targets
 
-            # Ensure x requires gradients
+            # Detach and clone x to ensure fresh computation and enable gradient tracking.
             x = x.detach().clone()
             x.requires_grad_(True)
 
-            # Compute the loss
+            # Forward pass: compute model outputs.
             outputs = self.model(x)
+            # Compute loss with mean reduction to obtain a scalar loss per batch.
             loss = self._compute_loss(outputs, curr_targets, reduction="mean")
 
-            # Compute gradient
+            # Zero out previous gradients and backpropagate.
             self.model.zero_grad()
             loss.backward()
 
-            # Get gradient
+            # Clone the computed gradient.
             grad = x.grad.clone()
 
-            # Clean up
+            # Disable further gradient tracking.
             x.requires_grad_(False)
-
             return grad
 
-        # Define loss function for the optimizer
+        # Define a loss function that returns per-example losses (without gradient computation).
         def loss_fn(x: torch.Tensor) -> torch.Tensor:
-            # Get the corresponding subset of targets if x is a subset
+            # Use the appropriate targets for the current batch.
             if x.size(0) != self.original_targets.size(0):
-                # Same simplification as above
                 curr_targets = self.original_targets[: x.size(0)]
             else:
                 curr_targets = self.original_targets
 
-            # No need for gradient computation here
             with torch.no_grad():
                 outputs = self.model(x)
-                # Use 'none' reduction to get per-example losses
+                # Use 'none' reduction to get individual losses per example.
                 loss = self._compute_loss(outputs, curr_targets, reduction="none")
             return loss
 
-        # Define success function
+        # Define a helper function to check whether the adversarial example is successful.
         def success_fn(x: torch.Tensor) -> torch.Tensor:
-            # Get the corresponding subset of targets if x is a subset
             if x.size(0) != self.original_targets.size(0):
-                # Same simplification as above
                 curr_targets = self.original_targets[: x.size(0)]
             else:
                 curr_targets = self.original_targets
 
             with torch.no_grad():
                 outputs = self.model(x)
+                # _check_success should return a Boolean tensor for each example.
                 return self._check_success(outputs, curr_targets)
 
-        # Run optimization
+        # Run the PGD optimizer using the helper functions defined above.
         x_adv, opt_metrics = self.optimizer.optimize(
             x_init=inputs,
             gradient_fn=gradient_fn,
             loss_fn=loss_fn,
             success_fn=success_fn,
-            x_original=inputs,
+            x_original=inputs,  # Use original inputs for projection constraints.
         )
 
-        # Update metrics
+        # Update internal metrics based on optimizer outputs.
         self.total_iterations = opt_metrics["iterations"]
         self.total_gradient_calls = opt_metrics["gradient_calls"]
         self.total_time = time.time() - start_time
 
-        # Calculate final metrics
+        # Compile final metrics and convert the success rate to a percentage.
         metrics = {
             **self.get_metrics(),
             "success_rate": opt_metrics["success_rate"] * 100,

@@ -1,4 +1,27 @@
-"""Conjugate Gradient (CG) adversarial attack implementation."""
+"""Conjugate Gradient (CG) adversarial attack implementation.
+
+This file implements the Conjugate Gradient attack, which uses non-linear conjugate gradient descent
+to create adversarial examples.
+
+Key features:
+- Leverages the conjugate gradient optimization algorithm for improved convergence
+- Supports both targeted and untargeted attacks
+- Configurable convergence criteria and optimization parameters
+- Compatible with different loss functions (cross-entropy and margin loss)
+- Optional random initialization within the perturbation space
+- Early stopping when examples successfully fool the model
+- Constraint handling for both L2 and Linf perturbation norms
+
+Expected inputs:
+- A neural network model to attack
+- Input samples (images) to perturb
+- Target labels (true labels for untargeted attacks, target labels for targeted attacks)
+- Configuration parameters for the attack and optimizer
+
+Expected outputs:
+- Adversarial examples that aim to fool the model
+- Performance metrics (iterations, gradient calls, time, success rate)
+"""
 
 import torch
 import time
@@ -12,7 +35,11 @@ class ConjugateGradient(BaseAttack):
     """
     Conjugate Gradient adversarial attack.
 
-    This attack uses the ConjugateGradientOptimizer to generate adversarial examples.
+    This attack uses non-linear conjugate gradient descent to craft adversarial examples.
+    It leverages the ConjugateGradientOptimizer to iteratively update the input by combining
+    gradient information with conjugate directions. The attack supports both targeted and
+    untargeted scenarios and includes mechanisms for early stopping and projection
+    onto the allowed perturbation space.
     """
 
     def __init__(
@@ -38,26 +65,27 @@ class ConjugateGradient(BaseAttack):
         Initialize the Conjugate Gradient attack.
 
         Args:
-            model: The model to attack
-            norm: The norm to use for the perturbation constraint ('L2' or 'Linf')
-            eps: The maximum perturbation size
-            targeted: Whether to perform a targeted attack
-            loss_fn: The loss function to use ('cross_entropy' or 'margin')
-            n_iterations: Maximum number of iterations
-            fletcher_reeves: Whether to use Fletcher-Reeves formula (True) or Polak-Ribière (False)
-            restart_interval: Restart conjugacy every N iterations
-            backtracking_factor: Factor to reduce step size in line search
-            sufficient_decrease: Sufficient decrease parameter for Armijo condition
-            line_search_max_iter: Maximum number of iterations for line search
-            rand_init: Whether to initialize with random perturbation
-            init_std: Standard deviation for random initialization
-            early_stopping: Whether to stop early when attack succeeds
-            verbose: Whether to print progress information
-            device: The device to use (CPU or GPU)
+            model: The neural network to attack.
+            norm: The perturbation norm ('L2' or 'Linf').
+            eps: Maximum perturbation allowed.
+            targeted: Whether the attack is targeted (aiming for a specific target label).
+            loss_fn: Loss function to use ('cross_entropy' or 'margin').
+            n_iterations: Maximum number of optimization iterations.
+            fletcher_reeves: Use Fletcher-Reeves (True) or Polak-Ribière (False) for conjugate update.
+            restart_interval: Restart conjugate directions every N iterations.
+            backtracking_factor: Factor to decrease step size in line search.
+            sufficient_decrease: Armijo condition parameter for sufficient loss decrease.
+            line_search_max_iter: Maximum iterations for the line search procedure.
+            rand_init: Whether to start with random perturbation.
+            init_std: Standard deviation for random initialization.
+            early_stopping: Stop early if the adversarial criterion is met.
+            verbose: Print progress updates.
+            device: Device to run the attack on (CPU or GPU).
         """
+        # Initialize the base attack with the provided model and parameters.
         super().__init__(model, norm, eps, targeted, loss_fn, device, verbose)
 
-        # Initialize the optimizer
+        # Instantiate the Conjugate Gradient optimizer with the provided configuration.
         self.optimizer = ConjugateGradientOptimizer(
             norm=norm,
             eps=eps,
@@ -77,28 +105,32 @@ class ConjugateGradient(BaseAttack):
         self, inputs: torch.Tensor, targets: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
-        Generate adversarial examples using Conjugate Gradient.
+        Generate adversarial examples using the Conjugate Gradient method.
+
+        This method prepares the inputs and targets, defines helper functions for
+        computing the gradient, loss, and success condition, and then calls the optimizer.
 
         Args:
-            inputs: The input images
-            targets: The target labels (true labels for untargeted attacks, target labels for targeted attacks)
+            inputs: The input images (clean samples to perturb).
+            targets: Target labels for targeted attacks, or true labels for untargeted attacks.
 
         Returns:
-            A tuple of (adversarial_examples, metrics)
+            A tuple of (adversarial_examples, metrics) where metrics include iterations,
+            gradient calls, total time, and success rate.
         """
-        # Reset metrics
+        # Reset any stored metrics from previous attacks.
         self.reset_metrics()
         start_time = time.time()
 
         batch_size = inputs.shape[0]
 
-        # Move inputs and targets to the attack device
+        # Ensure inputs and targets are on the correct device.
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
 
-        # Make sure inputs and targets have the same batch size
+        # Make sure the number of targets matches the number of inputs.
         if inputs.size(0) != targets.size(0):
-            # If targeted=True with a single target class, expand to match input size
+            # If a single target is provided for a targeted attack, expand it.
             if self.targeted and targets.size(0) == 1:
                 targets = targets.expand(inputs.size(0))
             else:
@@ -106,85 +138,80 @@ class ConjugateGradient(BaseAttack):
                     f"Input batch size {inputs.size(0)} doesn't match target batch size {targets.size(0)}"
                 )
 
-        # Store targets to avoid passing them repeatedly
+        # Store the targets so they can be reused in the helper functions.
         self.original_targets = targets
 
-        # Define gradient function
+        # Define a gradient function that computes the gradient of the loss with respect to x.
         def gradient_fn(x: torch.Tensor) -> torch.Tensor:
-            # Get the corresponding subset of targets if x is a subset
+            # If x is a subset of the original inputs, use the corresponding targets.
             if x.size(0) != self.original_targets.size(0):
-                # Find which indices of the original batch are in x
-                # This is a simplification - in practice, we should track indices
-                # But for now, we assume x is always a contiguous subset
-                # So we just use the first x.size(0) targets
+                # Here we assume x is a contiguous subset; in practice, tracking indices is preferable.
                 curr_targets = self.original_targets[: x.size(0)]
             else:
                 curr_targets = self.original_targets
 
-            # Ensure x requires gradients
+            # Ensure that x requires gradients.
             x = x.detach().clone()
             x.requires_grad_(True)
 
-            # Compute the loss
+            # Forward pass through the model.
             outputs = self.model(x)
+            # Compute the loss using the chosen loss function.
             loss = self._compute_loss(outputs, curr_targets, reduction="mean")
 
-            # Compute gradient
+            # Backpropagate to compute gradients.
             self.model.zero_grad()
             loss.backward()
 
-            # Get gradient
+            # Clone the gradient from x.
             grad = x.grad.clone()
 
-            # Clean up
+            # Turn off gradient tracking for x.
             x.requires_grad_(False)
-
             return grad
 
-        # Define loss function for the optimizer
+        # Define a loss function for the optimizer that returns per-example losses.
         def loss_fn(x: torch.Tensor) -> torch.Tensor:
-            # Get the corresponding subset of targets if x is a subset
+            # Retrieve the appropriate targets for the given x.
             if x.size(0) != self.original_targets.size(0):
-                # Same simplification as above
                 curr_targets = self.original_targets[: x.size(0)]
             else:
                 curr_targets = self.original_targets
 
-            # No need for gradient computation here
             with torch.no_grad():
                 outputs = self.model(x)
-                # Use 'none' reduction to get per-example losses
+                # Use 'none' reduction to compute individual losses for each example.
                 loss = self._compute_loss(outputs, curr_targets, reduction="none")
             return loss
 
-        # Define success function
+        # Define a success function to check if the adversarial example fools the model.
         def success_fn(x: torch.Tensor) -> torch.Tensor:
-            # Get the corresponding subset of targets if x is a subset
+            # Retrieve the appropriate targets if x is a subset.
             if x.size(0) != self.original_targets.size(0):
-                # Same simplification as above
                 curr_targets = self.original_targets[: x.size(0)]
             else:
                 curr_targets = self.original_targets
 
             with torch.no_grad():
                 outputs = self.model(x)
+                # _check_success should return a Boolean tensor indicating success per example.
                 return self._check_success(outputs, curr_targets)
 
-        # Run optimization
+        # Run the conjugate gradient optimizer using the helper functions.
         x_adv, opt_metrics = self.optimizer.optimize(
             x_init=inputs,
             gradient_fn=gradient_fn,
             loss_fn=loss_fn,
             success_fn=success_fn,
-            x_original=inputs,
+            x_original=inputs,  # Use the original inputs as the reference for projection.
         )
 
-        # Update metrics
+        # Update the attack metrics with the optimizer's results.
         self.total_iterations = opt_metrics["iterations"]
         self.total_gradient_calls = opt_metrics["gradient_calls"]
         self.total_time = time.time() - start_time
 
-        # Calculate final metrics
+        # Compile the final metrics dictionary, converting success rate to percentage.
         metrics = {
             **self.get_metrics(),
             "success_rate": opt_metrics["success_rate"] * 100,

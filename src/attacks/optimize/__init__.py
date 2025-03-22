@@ -1,7 +1,7 @@
 """Optimization-based methods for adversarial attacks."""
 
-from .pgd import PGDOptimizer
 from .cg import ConjugateGradientOptimizer
 from .lbfgs import LBFGSOptimizer
+from .pgd import PGDOptimizer
 
-__all__ = ["PGDOptimizer", "ConjugateGradientOptimizer", "LBFGSOptimizer"]
+__all__ = ["ConjugateGradientOptimizer", "LBFGSOptimizer", "PGDOptimizer"]
