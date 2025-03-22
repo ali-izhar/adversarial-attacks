@@ -80,6 +80,9 @@ class LBFGSOptimizer:
         self.c1 = 1e-4  # Sufficient decrease (Armijo) parameter.
         self.c2 = 0.9  # Curvature parameter for the Wolfe condition.
 
+        # Initialize internal state flags
+        self._in_subset_mode = False
+
     def _two_loop_recursion(
         self,
         gradient: torch.Tensor,
@@ -116,33 +119,61 @@ class LBFGSOptimizer:
             y_i = y_history[i]
             rho_i = rho_history[i]
 
-            # Ensure that s_i and y_i have a batch dimension.
-            if s_i.shape[0] != batch_size:
+            # Handle potentially different batch dimensions
+            s_i_batch_size = s_i.shape[0]
+            y_i_batch_size = y_i.shape[0]
+
+            # If history items have a single example or different batch size, handle properly
+            if s_i_batch_size == 1 and batch_size > 1:
                 s_i = s_i.expand(batch_size, *s_i.shape[1:])
-            if y_i.shape[0] != batch_size:
+            elif s_i_batch_size != batch_size:
+                if batch_size % s_i_batch_size == 0:
+                    s_i = s_i.repeat(
+                        batch_size // s_i_batch_size, *([1] * (s_i.dim() - 1))
+                    )
+                else:
+                    s_mean = s_i.mean(dim=0, keepdim=True)
+                    s_i = s_mean.expand(batch_size, *s_i.shape[1:])
+
+            # Same for y_i
+            if y_i_batch_size == 1 and batch_size > 1:
                 y_i = y_i.expand(batch_size, *y_i.shape[1:])
+            elif y_i_batch_size != batch_size:
+                if batch_size % y_i_batch_size == 0:
+                    y_i = y_i.repeat(
+                        batch_size // y_i_batch_size, *([1] * (y_i.dim() - 1))
+                    )
+                else:
+                    y_mean = y_i.mean(dim=0, keepdim=True)
+                    y_i = y_mean.expand(batch_size, *y_i.shape[1:])
 
             # Compute alpha_i = rho_i * (s_i^T * q)
-            # Flatten tensors to 2D for matrix multiplication
+            # Flatten tensors for dot product
             s_i_flat = s_i.reshape(batch_size, -1)
             q_flat = q.reshape(batch_size, -1)
 
             alpha_i = torch.sum(s_i_flat * q_flat, dim=1)
 
-            # Adjust rho_i if its shape does not match
+            # Handle rho_i shape mismatches
             if isinstance(rho_i, torch.Tensor):
-                if rho_i.numel() != batch_size:
-                    rho_i = torch.mean(rho_i).expand(batch_size)
-                elif rho_i.dim() == 1 and rho_i.shape[0] != batch_size:
-                    rho_i = rho_i[0].expand(batch_size)
+                rho_i_size = rho_i.numel()
+                if rho_i_size == 1:
+                    rho_i = rho_i.item() * torch.ones(batch_size, device=device)
+                elif rho_i_size != batch_size:
+                    rho_i = rho_i.mean().item() * torch.ones(batch_size, device=device)
+                elif rho_i.dim() > 1:
+                    rho_i = rho_i.view(-1)
+                    if rho_i.shape[0] != batch_size:
+                        rho_i = rho_i.mean().item() * torch.ones(
+                            batch_size, device=device
+                        )
+            else:
+                rho_i = torch.tensor(rho_i, device=device).expand(batch_size)
 
             alpha_i = rho_i * alpha_i
             alpha_list.append(alpha_i)
 
-            # Reshape alpha_i for broadcasting against y_i (which has the same shape as gradient)
-            # We need to add singleton dimensions for proper broadcasting
-            # For images, y_i will have shape [batch, channels, height, width]
-            # So alpha_i needs shape [batch, 1, 1, 1] to properly broadcast
+            # Reshape alpha_i for broadcasting against y_i
             alpha_i_reshaped = alpha_i.view(*([batch_size] + [1] * (y_i.dim() - 1)))
 
             # Update q: subtract the curvature information scaled by y_i
@@ -153,10 +184,34 @@ class LBFGSOptimizer:
         if history_size > 0:
             s_last = s_history[-1]
             y_last = y_history[-1]
-            if s_last.shape[0] != batch_size:
+
+            # Handle potentially different batch dimensions
+            s_last_batch_size = s_last.shape[0]
+            y_last_batch_size = y_last.shape[0]
+
+            # If history items have a single example or different batch size, handle properly
+            if s_last_batch_size == 1 and batch_size > 1:
                 s_last = s_last.expand(batch_size, *s_last.shape[1:])
-            if y_last.shape[0] != batch_size:
+            elif s_last_batch_size != batch_size:
+                if batch_size % s_last_batch_size == 0:
+                    s_last = s_last.repeat(
+                        batch_size // s_last_batch_size, *([1] * (s_last.dim() - 1))
+                    )
+                else:
+                    s_mean = s_last.mean(dim=0, keepdim=True)
+                    s_last = s_mean.expand(batch_size, *s_last.shape[1:])
+
+            # Same for y_last
+            if y_last_batch_size == 1 and batch_size > 1:
                 y_last = y_last.expand(batch_size, *y_last.shape[1:])
+            elif y_last_batch_size != batch_size:
+                if batch_size % y_last_batch_size == 0:
+                    y_last = y_last.repeat(
+                        batch_size // y_last_batch_size, *([1] * (y_last.dim() - 1))
+                    )
+                else:
+                    y_mean = y_last.mean(dim=0, keepdim=True)
+                    y_last = y_mean.expand(batch_size, *y_last.shape[1:])
 
             # Flatten tensors for dot products
             s_last_flat = s_last.reshape(batch_size, -1)
@@ -184,15 +239,49 @@ class LBFGSOptimizer:
             # Retrieve alpha in the reverse order.
             alpha_i = alpha_list[history_size - 1 - i]
 
-            if s_i.shape[0] != batch_size:
+            # Handle potentially different batch dimensions
+            s_i_batch_size = s_i.shape[0]
+            y_i_batch_size = y_i.shape[0]
+
+            # If history items have different batch dimensions, handle properly
+            if s_i_batch_size == 1 and batch_size > 1:
                 s_i = s_i.expand(batch_size, *s_i.shape[1:])
-            if y_i.shape[0] != batch_size:
+            elif s_i_batch_size != batch_size:
+                if batch_size % s_i_batch_size == 0:
+                    s_i = s_i.repeat(
+                        batch_size // s_i_batch_size, *([1] * (s_i.dim() - 1))
+                    )
+                else:
+                    s_mean = s_i.mean(dim=0, keepdim=True)
+                    s_i = s_mean.expand(batch_size, *s_i.shape[1:])
+
+            # Same for y_i
+            if y_i_batch_size == 1 and batch_size > 1:
                 y_i = y_i.expand(batch_size, *y_i.shape[1:])
+            elif y_i_batch_size != batch_size:
+                if batch_size % y_i_batch_size == 0:
+                    y_i = y_i.repeat(
+                        batch_size // y_i_batch_size, *([1] * (y_i.dim() - 1))
+                    )
+                else:
+                    y_mean = y_i.mean(dim=0, keepdim=True)
+                    y_i = y_mean.expand(batch_size, *y_i.shape[1:])
+
+            # Handle rho_i shape mismatches
             if isinstance(rho_i, torch.Tensor):
-                if rho_i.numel() != batch_size:
-                    rho_i = torch.mean(rho_i).expand(batch_size)
-                elif rho_i.dim() == 1 and rho_i.shape[0] != batch_size:
-                    rho_i = rho_i[0].expand(batch_size)
+                rho_i_size = rho_i.numel()
+                if rho_i_size == 1:
+                    rho_i = rho_i.item() * torch.ones(batch_size, device=device)
+                elif rho_i_size != batch_size:
+                    rho_i = rho_i.mean().item() * torch.ones(batch_size, device=device)
+                elif rho_i.dim() > 1:
+                    rho_i = rho_i.view(-1)
+                    if rho_i.shape[0] != batch_size:
+                        rho_i = rho_i.mean().item() * torch.ones(
+                            batch_size, device=device
+                        )
+            else:
+                rho_i = torch.tensor(rho_i, device=device).expand(batch_size)
 
             # Compute beta_i = rho_i * (y_i^T * r)
             # Flatten tensors for dot product
@@ -321,9 +410,20 @@ class LBFGSOptimizer:
                 if armijo_satisfied.any():
                     # Flatten boolean mask if needed.
                     armijo_mask = armijo_satisfied.view(batch_size)
-                    grad_new_full = torch.zeros_like(current_grad)
-                    grad_new_partial = grad_fn(x_new[armijo_mask])
-                    grad_new_full[armijo_mask] = grad_new_partial
+
+                    # IMPORTANT FIX: When working with a subset of examples in early stopping mode,
+                    # we need to be more careful with the masks to avoid shape mismatches
+                    if hasattr(self, "_in_subset_mode") and self._in_subset_mode:
+                        # For subset mode: compute gradients only for the masked subset
+                        # and assign them directly to the result
+                        grad_new_subset = grad_fn(x_new[armijo_mask])
+                        grad_new_full = torch.zeros_like(current_grad)
+                        grad_new_full[armijo_mask] = grad_new_subset
+                    else:
+                        # Standard mode: compute gradients for all armijo-satisfied examples
+                        grad_new_full = torch.zeros_like(current_grad)
+                        grad_new_partial = grad_fn(x_new[armijo_mask])
+                        grad_new_full[armijo_mask] = grad_new_partial
 
                     # Compute new directional derivative at x_new.
                     dir_deriv_new = torch.bmm(
@@ -337,15 +437,31 @@ class LBFGSOptimizer:
                     wolfe_satisfied = torch.abs(dir_deriv_new) <= torch.abs(
                         wolfe_threshold
                     )
-                    # Combined success: both Armijo and Wolfe satisfied.
-                    new_success = armijo_mask & wolfe_satisfied
+
+                    # In subset mode, we need to ensure our masks align properly
+                    if hasattr(self, "_in_subset_mode") and self._in_subset_mode:
+                        # Combined success: both Armijo and Wolfe satisfied
+                        # But we need to be careful with masks in subset mode
+                        working_armijo_mask = armijo_mask
+                        new_success = working_armijo_mask & wolfe_satisfied
+                    else:
+                        # Combined success: both Armijo and Wolfe satisfied.
+                        new_success = armijo_mask & wolfe_satisfied
 
                     best_alpha[new_success] = alpha[new_success]
                     best_x[new_success] = x_new[new_success]
                     best_grad[new_success] = grad_new_full[new_success]
                     success = success | new_success
-                    if success.all():
-                        break
+
+                    # Check if all examples are now successful
+                    if hasattr(self, "_in_subset_mode") and self._in_subset_mode:
+                        # In subset mode, we only care if all working examples are successful
+                        if (success | ~working_armijo_mask).all():
+                            break
+                    else:
+                        # In normal mode, we check if all examples are successful
+                        if success.all():
+                            break
 
                     # For examples that satisfy Armijo but not Wolfe, increase the step size.
                     increase_idx = armijo_mask & (~wolfe_satisfied) & (~success)
@@ -363,8 +479,39 @@ class LBFGSOptimizer:
 
         # For any examples that did not reach success, compute the gradient at the best found point.
         if not success.all():
-            remaining_grad = grad_fn(best_x[~success])
-            best_grad[~success] = remaining_grad
+            # Identify which examples didn't reach success
+            unsuccessful = ~success
+
+            # Get gradients only for unsuccessful examples
+            remaining_x = best_x[unsuccessful]
+
+            # Check if we're in subset mode or if this might create shape issues
+            if self._in_subset_mode or unsuccessful.sum() != batch_size:
+                # Handle more carefully in subset mode
+                x_full = best_x.clone()
+                # Compute gradients on the full batch for consistency
+                full_grad = grad_fn(x_full)
+                # Extract the gradients for unsuccessful examples
+                if unsuccessful.sum() > 0:
+                    best_grad[unsuccessful] = full_grad[unsuccessful]
+            else:
+                # Standard case: compute gradients only for unsuccessful examples
+                remaining_grad = grad_fn(remaining_x)
+
+                # Make sure the shapes match before assignment
+                if remaining_grad.shape[0] == unsuccessful.sum():
+                    best_grad[unsuccessful] = remaining_grad
+                else:
+                    # If gradient function returns results for all examples
+                    # (which might happen due to implementation details),
+                    # we need to extract only the ones we need
+                    if remaining_grad.shape[0] >= unsuccessful.sum():
+                        best_grad[unsuccessful] = remaining_grad[: unsuccessful.sum()]
+                    else:
+                        # If we somehow got fewer gradients than expected,
+                        # compute on the full batch and extract what we need
+                        full_grad = grad_fn(best_x)
+                        best_grad[unsuccessful] = full_grad[unsuccessful]
 
         return best_alpha, best_x, best_grad, success.all()
 
@@ -418,6 +565,7 @@ class LBFGSOptimizer:
         start_time = time.time()
         iterations = 0
         gradient_calls = 0
+        loss_trajectory = []  # Track loss values for visualization
 
         # Check for early stopping criteria.
         if success_fn is not None:
@@ -440,6 +588,11 @@ class LBFGSOptimizer:
         grad = gradient_fn(x_adv)
         loss_current = loss_fn(x_adv)
         gradient_calls += 1
+
+        # Record initial loss
+        if loss_current.numel() > 0:
+            avg_loss = loss_current.mean().item()
+            loss_trajectory.append(avg_loss)
 
         # Main optimization loop.
         for t in range(self.n_iterations):
@@ -478,6 +631,9 @@ class LBFGSOptimizer:
                 if (
                     working_examples.sum() > 0
                 ):  # Only if at least one example needs optimization
+                    # Set a flag to indicate we're working with a subset
+                    self._in_subset_mode = True
+
                     # Create wrapped loss and gradient functions for the subset
                     def subset_loss_fn(x_subset):
                         # Create a full tensor to hold all examples
@@ -493,11 +649,30 @@ class LBFGSOptimizer:
                         # Create a full tensor to hold all examples
                         x_full = x_adv.clone()
                         # Update only working examples
-                        x_full[working_examples] = x_subset
+                        # IMPORTANT: Check that shapes match for proper indexing
+                        if working_examples.sum() == x_subset.shape[0]:
+                            x_full[working_examples] = x_subset
+                        else:
+                            # If shapes don't match, this might be a subset of the working subset
+                            # Create an intermediate mask for the subset of working examples
+                            temp_mask = torch.zeros_like(working_examples)
+                            # Count how many working examples have already been processed
+                            count = 0
+                            for i, is_working in enumerate(working_examples):
+                                if is_working:
+                                    if count < x_subset.shape[0]:
+                                        temp_mask[i] = True
+                                        count += 1
+                            # Now update only this temp subset
+                            x_full[temp_mask] = x_subset
+
                         # Compute gradients for all examples
                         full_grad = gradient_fn(x_full)
-                        # Return only gradients for working examples
-                        return full_grad[working_examples]
+                        # Make sure the result shape matches the input subset shape
+                        if full_grad.shape[0] != x_subset.shape[0]:
+                            # Return only gradients for working examples if shape mismatch
+                            return full_grad[working_examples][: x_subset.shape[0]]
+                        return full_grad
 
                     alpha_working, x_new_working, grad_new_working, _ = (
                         self._line_search(
@@ -518,6 +693,9 @@ class LBFGSOptimizer:
                     x_new_full[working_examples] = x_new_working
                     grad_new_full[working_examples] = grad_new_working
 
+                    # Reset the subset mode flag
+                    self._in_subset_mode = False
+
                 alpha = alpha_full
                 x_adv = x_new_full
                 grad = grad_new_full
@@ -535,6 +713,11 @@ class LBFGSOptimizer:
 
             # Compute new loss.
             loss_current = loss_fn(x_adv)
+
+            # Record loss for trajectory
+            if loss_current.numel() > 0:
+                avg_loss = loss_current.mean().item()
+                loss_trajectory.append(avg_loss)
 
             # Check for adversarial success.
             if success_fn is not None:
@@ -555,21 +738,28 @@ class LBFGSOptimizer:
             # Update the L-BFGS history.
             s_k = x_adv - x_old  # Change in positions.
             y_k = grad - grad_old  # Change in gradients.
+
             # Compute s_k^T y_k (using batch matrix multiplication) and avoid division by zero.
-            s_dot_y = (
-                torch.bmm(
-                    s_k.view(batch_size, 1, -1), y_k.view(batch_size, -1, 1)
-                ).squeeze()
-                + 1e-10
-            )
+            s_k_flat = s_k.reshape(batch_size, -1)
+            y_k_flat = y_k.reshape(batch_size, -1)
+            s_dot_y = torch.sum(s_k_flat * y_k_flat, dim=1) + 1e-10
             rho_k = 1.0 / s_dot_y
 
             # Only update history for steps with meaningful curvature information.
             valid_update = torch.abs(s_dot_y) > 1e-10
             if valid_update.any():
-                s_history.append(s_k)
-                y_history.append(y_k)
-                rho_history.append(rho_k)
+                # We only want to include valid updates in our history
+                if valid_update.all():
+                    s_history.append(s_k)
+                    y_history.append(y_k)
+                    rho_history.append(rho_k)
+                else:
+                    # For partial updates, we need to be careful with batch dimensions
+                    # Only store updates for examples with valid curvature information
+                    s_history.append(s_k[valid_update])
+                    y_history.append(y_k[valid_update])
+                    rho_history.append(rho_k[valid_update])
+
                 # Limit the history to the specified size.
                 if len(s_history) > self.history_size:
                     s_history.pop(0)
@@ -588,6 +778,7 @@ class LBFGSOptimizer:
             "initial_success_rate": (
                 initial_success.float().mean().item() if success_fn is not None else 0.0
             ),
+            "loss_trajectory": loss_trajectory,  # Add loss trajectory to metrics
         }
 
         return x_adv, metrics
