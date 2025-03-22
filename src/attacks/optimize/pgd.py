@@ -12,9 +12,9 @@ class PGDOptimizer:
     """
     Projected Gradient Descent (PGD) optimization method.
 
-    PGD is a first-order method that iteratively takes steps in the direction
-    of the gradient, projecting the perturbation back onto the constraint set
-    after each step.
+    PGD is a first-order method that iteratively updates the adversarial examples
+    by taking a step in the gradient direction (to increase the loss) and then
+    projects the perturbed inputs back onto a feasible set defined by a norm constraint.
     """
 
     def __init__(
@@ -30,18 +30,10 @@ class PGDOptimizer:
         verbose: bool = False,
     ):
         """
-        Initialize the PGD optimizer.
-
-        Args:
-            norm: The norm to use for the perturbation constraint ('L2' or 'Linf')
-            eps: The maximum perturbation size
-            n_iterations: Maximum number of iterations
-            alpha_init: Initial step size
-            alpha_type: Step size schedule ('constant', 'diminishing', or 'adaptive')
-            rand_init: Whether to initialize with random perturbation
-            init_std: Standard deviation for random initialization
-            early_stopping: Whether to stop early when objective is achieved
-            verbose: Whether to print progress information
+        Initialize the PGD optimizer with parameters controlling:
+          - the perturbation norm and maximum allowed perturbation (eps)
+          - the maximum number of iterations and the step size schedule
+          - whether to start with random perturbation and early stopping behavior
         """
         self.norm = norm
         self.eps = eps
@@ -55,18 +47,21 @@ class PGDOptimizer:
 
     def _get_step_size(self, t: int) -> float:
         """
-        Get the step size for the current iteration.
+        Determine the step size for iteration t.
+
+        For a constant schedule, the step size remains alpha_init.
+        For a diminishing schedule, the step size decays as alpha_init / sqrt(t + 1).
 
         Args:
-            t: Current iteration
+            t: Current iteration number (starting from 0)
 
         Returns:
-            Step size
+            Step size (alpha) for this iteration.
         """
         if self.alpha_type == "constant":
             return self.alpha_init
         elif self.alpha_type == "diminishing":
-            # Diminishing step size schedule: alpha_t = alpha_0 / sqrt(t+1)
+            # Diminishing step size: decreases as iterations increase.
             return self.alpha_init / np.sqrt(t + 1)
         else:
             raise ValueError(f"Unsupported alpha_type: {self.alpha_type}")
@@ -80,83 +75,93 @@ class PGDOptimizer:
         x_original: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
-        Run PGD optimization.
+        Run PGD optimization to generate adversarial examples.
+
+        The algorithm follows these steps:
+          1. (Optionally) initialize the adversarial example with random noise.
+          2. For each iteration, compute the gradient of the loss with respect to the input.
+          3. Update the input by taking a step in the direction of the gradient.
+          4. Project the updated input back onto the allowed perturbation set (eps-ball) and clamp
+             values to valid ranges (e.g., [0, 1] for image pixels).
+          5. Optionally stop early if the adversarial success condition is met.
 
         Args:
-            x_init: Initial point
-            gradient_fn: Function that computes gradient given current x
-            loss_fn: Function that computes loss given current x (should return per-example losses)
-            success_fn: Function that returns True if optimization goal is achieved
-            x_original: Original input (for projection)
+            x_init: The initial input (e.g., clean images).
+            gradient_fn: Function to compute the gradient of the loss with respect to x.
+            loss_fn: Function to compute the loss (per-example).
+            success_fn: Function that returns a Boolean tensor indicating adversarial success.
+            x_original: The original input, used for projection onto the eps-ball.
 
         Returns:
-            Tuple of (optimized_x, metrics_dict)
+            A tuple (x_adv, metrics) where:
+              - x_adv: The adversarial examples after optimization.
+              - metrics: Dictionary with iteration count, gradient call count, total time, and success rate.
         """
         device = x_init.device
         batch_size = x_init.shape[0]
 
-        # Initialize adversarial example
+        # Step 1: Initialize adversarial examples.
         if self.rand_init and self.init_std > 0:
-            # Random initialization
+            # Add random noise scaled by init_std.
             noise = torch.randn_like(x_init) * self.init_std
             x_adv = x_init + noise
             if x_original is not None:
-                # Project back to eps-ball
+                # Project the initial noisy example back into the allowed eps-ball.
                 x_adv = project_adversarial_example(
                     x_adv, x_original, self.eps, self.norm
                 )
         else:
+            # Use a copy of the original inputs if no random initialization.
             x_adv = x_init.clone()
 
-        # Initialize metrics
+        # Initialize metrics for tracking the optimization.
         start_time = time.time()
         iterations = 0
         gradient_calls = 0
 
-        # For early stopping
+        # Check initial adversarial success.
         if success_fn is not None:
             success = success_fn(x_adv)
         else:
             success = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        # Main optimization loop
+        # Main optimization loop.
         for t in range(self.n_iterations):
             iterations += 1
 
-            # Skip already successful examples if early stopping is enabled
+            # Early stopping: if all examples are already adversarial, break.
             if self.early_stopping and success.all():
                 break
 
-            # Compute gradient (skip successful examples)
+            # Step 2: Compute the gradient for unsolved examples.
             if self.early_stopping:
+                # Compute gradient only for examples that haven't succeeded.
                 working_examples = ~success
                 if working_examples.sum() == 0:
                     break
 
-                # Compute gradient only for examples that are still being optimized
                 grad_full = torch.zeros_like(x_adv)
                 grad_working = gradient_fn(x_adv[working_examples])
                 grad_full[working_examples] = grad_working
                 grad = grad_full
             else:
                 grad = gradient_fn(x_adv)
-
             gradient_calls += 1
 
-            # Take a step in the gradient direction
+            # Step 3: Determine the step size for the current iteration.
             alpha = self._get_step_size(t)
+            # PGD update: take a step in the gradient direction.
+            # (Note: Depending on the loss formulation, the gradient direction may be ascent or descent.)
             x_adv = x_adv + alpha * grad
 
-            # Project back to eps-ball
+            # Step 4: Project the updated example back onto the eps-ball (and ensure valid pixel range).
             if x_original is not None:
                 x_adv = project_adversarial_example(
                     x_adv, x_original, self.eps, self.norm
                 )
-
-            # Ensure valid image range [0, 1]
             x_adv = torch.clamp(x_adv, 0.0, 1.0)
 
-            # Check for success
+            # Step 5: Check for adversarial success.
             if success_fn is not None:
                 success = success_fn(x_adv)
                 if self.verbose and (t + 1) % 10 == 0:
@@ -165,7 +170,7 @@ class PGDOptimizer:
                         f"Iteration {t+1}/{self.n_iterations}, Success rate: {success_rate:.2f}%"
                     )
 
-        # Return the adversarial examples and metrics
+        # Compile final metrics.
         total_time = time.time() - start_time
         metrics = {
             "iterations": iterations,

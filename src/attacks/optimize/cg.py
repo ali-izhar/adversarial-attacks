@@ -152,7 +152,6 @@ class ConjugateGradientOptimizer:
         ).sum(dim=1)
 
         # Compute the Armijo threshold.
-        # Correct Armijo: f(x + αd) <= f(x) + c * α * (d^T grad)
         armijo_threshold = current_loss + self.sufficient_decrease * alpha * dir_deriv
 
         # Iterate to find a step size that satisfies the condition.
