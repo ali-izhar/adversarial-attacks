@@ -1,9 +1,6 @@
-"""
-Projection utilities for constraint handling in adversarial attacks.
-"""
+"""Projection utilities for constraint handling in adversarial attacks."""
 
 import torch
-from typing import Tuple, Optional
 
 
 def project_box(
