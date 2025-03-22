@@ -177,5 +177,5 @@ cython_debug/
 paper/
 
 # imagenet
-data/imagenet/
+data/
 
