@@ -309,7 +309,49 @@ def main():
     print("\nResults:")
     print(f"Attack method: {args.method.upper()}")
     print(f"Attack type: {'Targeted' if args.targeted else 'Untargeted'}")
-    print(f"Reported Success Rate: {metrics['success_rate']:.1f}%")
+
+    # Get initial predictions to check which examples were already successful
+    initial_success = []
+    if args.targeted:
+        initial_success = [predictions[i] == targets[i] for i in range(len(images))]
+    else:
+        # For untargeted attacks, an example is initially successful if the model already misclassifies it
+        # That means prediction ≠ true label
+        initial_success = [predictions[i] != labels[i] for i in range(len(images))]
+
+    # Print individual results for diagnosis
+    print("\nOriginal predictions vs true labels:")
+    for i in range(len(images)):
+        print(
+            f"Image {i+1}: {class_names[labels[i]]} → predicted as {class_names[predictions[i]]} "
+            + ("(misclassified)" if predictions[i] != labels[i] else "(correct)")
+        )
+
+    # Print how many samples were already successful initially
+    initial_success_count = sum(initial_success)
+    print(
+        f"Initially Successful Examples: {initial_success_count}/{len(images)} ({initial_success_count*100/len(images):.1f}%)"
+    )
+
+    # Print the "new" success rate (examples that weren't initially successful)
+    print(f"New Success Rate: {metrics['success_rate']:.1f}%")
+
+    # Add additional explanation for new success rate calculation
+    new_successes = 0
+    for i in range(len(images)):
+        if args.targeted:
+            if adv_predictions[i] == targets[i] and not initial_success[i]:
+                new_successes += 1
+        else:
+            if predictions[i] != adv_predictions[i] and not initial_success[i]:
+                new_successes += 1
+
+    # Calculate new success rate manually for verification
+    verified_new_success_rate = new_successes * 100.0 / len(images)
+    print(
+        f"Verified New Success Rate: {verified_new_success_rate:.1f}% ({new_successes}/{len(images)} examples)"
+    )
+
     print(f"Average L2 Norm: {norms['L2'].mean().item():.4f}")
     print(f"Average Linf Norm: {norms['Linf'].mean().item():.4f}")
 
@@ -321,20 +363,38 @@ def main():
     for i in range(total_attacks):
         if args.targeted:
             is_success = adv_predictions[i] == targets[i]
+            was_initial_success = initial_success[i]
             success_marker = "✓" if is_success else "✗"
+            success_type = ""
+            if is_success:
+                success_type = (
+                    " (initially successful)"
+                    if was_initial_success
+                    else " (NEW SUCCESS)"
+                )
+
             print(
                 f"Image {i+1}: {class_names[labels[i]]} → {class_names[adv_predictions[i]]} "
                 f"(Target: {class_names[targets[i]]}) "
-                f"(L2: {norms['L2'][i]:.4f}, Linf: {norms['Linf'][i]:.4f}) {success_marker}"
+                f"(L2: {norms['L2'][i]:.4f}, Linf: {norms['Linf'][i]:.4f}) {success_marker}{success_type}"
             )
             if is_success:
                 successful_attacks += 1
         else:
             is_success = predictions[i] != adv_predictions[i]
+            was_initial_success = initial_success[i]
             success_marker = "✓" if is_success else "✗"
+            success_type = ""
+            if is_success:
+                success_type = (
+                    " (initially successful)"
+                    if was_initial_success
+                    else " (NEW SUCCESS)"
+                )
+
             print(
                 f"Image {i+1}: {class_names[labels[i]]} → {class_names[adv_predictions[i]]} "
-                f"(L2: {norms['L2'][i]:.4f}, Linf: {norms['Linf'][i]:.4f}) {success_marker}"
+                f"(L2: {norms['L2'][i]:.4f}, Linf: {norms['Linf'][i]:.4f}) {success_marker}{success_type}"
             )
             if is_success:
                 successful_attacks += 1
@@ -342,15 +402,11 @@ def main():
     # Calculate and display actual success rate
     actual_success_rate = (successful_attacks / total_attacks) * 100
     print(
-        f"\nActual Success Rate: {actual_success_rate:.1f}% ({successful_attacks}/{total_attacks})"
+        f"\nTotal Success Rate: {actual_success_rate:.1f}% ({successful_attacks}/{total_attacks})"
     )
 
-    # If there's a discrepancy, warn the user
-    if abs(actual_success_rate - metrics["success_rate"]) > 1.0:
-        print(f"\nWARNING: Discrepancy between reported and actual success rates!")
-        print(
-            f"This may indicate that the attack is counting initially successful examples incorrectly."
-        )
+    # Create a metrics dictionary that includes both metrics for visualization
+    vis_metrics = {**metrics, "total_success_rate": actual_success_rate}
 
     # Visualize the results
     print("\nVisualizing results...")
@@ -362,7 +418,7 @@ def main():
         predictions,
         adv_predictions,
         attack_params,
-        metrics,
+        vis_metrics,
         args.method,
         args.targeted,
         output_dir,

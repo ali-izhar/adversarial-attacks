@@ -128,6 +128,9 @@ class ConjugateGradient(BaseAttack):
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
 
+        # Get and store original predictions
+        self.store_original_predictions(inputs)
+
         # Make sure the number of targets matches the number of inputs.
         if inputs.size(0) != targets.size(0):
             # If a single target is provided for a targeted attack, expand it.

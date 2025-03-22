@@ -128,6 +128,9 @@ class LBFGS(BaseAttack):
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
 
+        # Get and store original predictions
+        self.store_original_predictions(inputs)
+
         # Ensure that the number of targets matches the number of inputs.
         if inputs.size(0) != targets.size(0):
             # For targeted attacks with a single target class, expand the target tensor.

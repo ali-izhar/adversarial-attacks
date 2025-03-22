@@ -144,7 +144,16 @@ def visualize_results(
                 param_text += f"• {key}: {value}\n"
 
         # Add metrics with styled text
-        param_text += f"\nResults:\n• Success Rate: {metrics['success_rate']:.1f}%\n"
+        param_text += f"\nResults:\n"
+        # Show both success rates if total_success_rate is provided
+        if "total_success_rate" in metrics:
+            param_text += f"• New Success Rate: {metrics['success_rate']:.1f}%\n"
+            param_text += (
+                f"• Total Success Rate: {metrics['total_success_rate']:.1f}%\n"
+            )
+        else:
+            param_text += f"• Success Rate: {metrics['success_rate']:.1f}%\n"
+
         param_text += f"• Iterations: {metrics['iterations']:.1f}\n"
         param_text += f"• Time: {metrics['time']:.2f}s"
 
@@ -215,8 +224,11 @@ def visualize_results(
 
             # Add a visual indicator for attack success
             if targeted:
+                # For targeted attacks, success is prediction = target class
                 success = adv_predictions[i] == targets[i]
             else:
+                # For untargeted attacks, success is original prediction ≠ adversarial prediction
+                # This checks if the prediction has changed, which is the goal
                 success = predictions[i] != adv_predictions[i]
 
             success_text = "Success" if success else "Failure"
@@ -394,8 +406,11 @@ def visualize_perturbations(
 
             # Add a visual indicator for attack success
             if targeted:
+                # For targeted attacks, success is prediction = target class
                 success = adv_predictions[i] == targets[i]
             else:
+                # For untargeted attacks, success is original prediction ≠ adversarial prediction
+                # This checks if the prediction has changed, which is the goal
                 success = predictions[i] != adv_predictions[i]
 
             success_text = "Success" if success else "Failure"
