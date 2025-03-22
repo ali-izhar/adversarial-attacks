@@ -6,6 +6,15 @@ attack methods and visualizes the original and perturbed images side by side.
 
 Usage:
     python attack_example.py --method [cg|pgd|lbfgs] [--targeted] [--eps 0.5]
+
+Arguments:
+    --method: Attack method to use (pgd, cg, lbfgs)
+    --targeted: Use targeted attack (default: untargeted)
+    --eps: Perturbation budget (epsilon) for the attack
+    --norm: Norm to use for constraining perturbations (L2, Linf)
+    --iterations: Number of optimization iterations
+    --output: Output directory for saving visualizations
+    --show-norms: Display detailed norm analysis visualizations
 """
 
 import os
@@ -13,7 +22,6 @@ import sys
 import torch
 import torchvision
 import torchvision.transforms as transforms
-import matplotlib.pyplot as plt
 import argparse
 
 # Add the project root to the path
@@ -24,6 +32,14 @@ if project_root not in sys.path:
 from src.attacks.attack_pgd import PGD
 from src.attacks.attack_cg import ConjugateGradient
 from src.attacks.attack_lbfgs import LBFGS
+from examples.plot import (
+    visualize_results,
+    visualize_perturbations,
+    visualize_convergence,
+    visualize_norm_comparison,
+    compare_norms,
+    CLASSES,
+)
 
 
 # Configuration
@@ -31,18 +47,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_PATH = "models/resnet18_cifar10.pth"  # Path to a pre-trained model
 DATA_PATH = "data"  # Path to dataset
 NUM_IMAGES = 5  # Number of images to attack
-CLASSES = (
-    "plane",
-    "car",
-    "bird",
-    "cat",
-    "deer",
-    "dog",
-    "frog",
-    "horse",
-    "ship",
-    "truck",
-)  # CIFAR-10 classes
 
 
 def parse_args():
@@ -81,6 +85,11 @@ def parse_args():
         type=str,
         default=None,
         help="Output directory for saving visualizations",
+    )
+    parser.add_argument(
+        "--show-norms",
+        action="store_true",
+        help="Display detailed norm analysis visualizations",
     )
 
     return parser.parse_args()
@@ -202,255 +211,6 @@ def generate_adversarial_examples(model, images, labels, attack, targeted=False)
     return adv_images, metrics, targets
 
 
-def compute_perturbation_visualization(images, adv_images, factor=5):
-    """
-    Compute and visualize the perturbation with enhanced contrast.
-
-    Args:
-        images: Original images
-        adv_images: Adversarial images
-        factor: Enhancement factor to make perturbations more visible
-
-    Returns:
-        The enhanced perturbation visualization
-    """
-    perturbation = adv_images - images
-
-    # Enhance the perturbation to make it more visible
-    enhanced_perturbation = perturbation * factor
-
-    # Ensure the values are in a valid range
-    enhanced_perturbation = torch.clamp(enhanced_perturbation + 0.5, 0, 1)
-
-    return enhanced_perturbation
-
-
-def compare_norms(images, adv_images):
-    """
-    Compare different norms of the perturbation.
-
-    Args:
-        images: Original images
-        adv_images: Adversarial images
-
-    Returns:
-        Dictionary with L0, L1, L2, and Linf norms
-    """
-    perturbation = adv_images - images
-    batch_size = perturbation.shape[0]
-
-    # Reshape to (batch_size, -1) for norm calculations
-    perturbation_flat = perturbation.reshape(batch_size, -1)
-
-    # Calculate L0 norm (number of changed pixels)
-    l0_norm = (perturbation_flat.abs() > 1e-5).float().sum(dim=1)
-
-    # Calculate L1 norm (sum of absolute values)
-    l1_norm = perturbation_flat.abs().sum(dim=1)
-
-    # Calculate L2 norm (Euclidean distance)
-    l2_norm = torch.norm(perturbation_flat, dim=1, p=2)
-
-    # Calculate Linf norm (maximum absolute value)
-    linf_norm = perturbation_flat.abs().max(dim=1)[0]
-
-    return {"L0": l0_norm, "L1": l1_norm, "L2": l2_norm, "Linf": linf_norm}
-
-
-def visualize_results(
-    images,
-    adv_images,
-    labels,
-    targets,
-    predictions,
-    adv_predictions,
-    attack_params,
-    metrics,
-    method,
-    targeted,
-    output_dir=None,
-):
-    """Visualize original and adversarial images side by side with a legend."""
-    n = len(images)
-
-    # Create a figure with n rows and 2 columns
-    fig, axes = plt.subplots(n, 2, figsize=(10, 2.5 * n))
-
-    # Format the attack name for the title
-    method_name = method.upper()
-    if method == "cg":
-        method_name = "Conjugate Gradient"
-    elif method == "lbfgs":
-        method_name = "L-BFGS"
-
-    # Add a title for the entire figure
-    attack_type = "Targeted" if targeted else "Untargeted"
-    fig.suptitle(
-        f"{method_name} {attack_type} Attack: Original vs Adversarial Images",
-        fontsize=16,
-    )
-
-    # Add a legend with attack parameters in the bottom
-    param_text = "Attack Parameters:\n"
-    for key, value in attack_params.items():
-        if key not in ["model", "verbose"]:
-            param_text += f"- {key}: {value}\n"
-
-    # Add metrics
-    param_text += f"\nResults:\n- Success Rate: {metrics['success_rate']:.1f}%\n"
-    param_text += f"- Avg. Iterations: {metrics['iterations']:.1f}\n"
-    param_text += f"- Time: {metrics['time']:.2f}s"
-
-    # Add the text in a separate axes
-    fig.text(0.1, 0.01, param_text, fontsize=10, verticalalignment="bottom")
-
-    # Function to denormalize images if needed
-    def denormalize(img):
-        return img.permute(1, 2, 0).detach().cpu().numpy().clip(0, 1)
-
-    # Plot each image
-    for i in range(n):
-        # Original image
-        if n > 1:
-            ax1 = axes[i, 0]
-            ax2 = axes[i, 1]
-        else:
-            ax1 = axes[0]
-            ax2 = axes[1]
-
-        ax1.imshow(denormalize(images[i]))
-        ax1.set_title(
-            f"Original: {CLASSES[labels[i]]}\nPredicted: {CLASSES[predictions[i]]}"
-        )
-        ax1.axis("off")
-
-        # Adversarial image - different title based on targeted/untargeted
-        ax2.imshow(denormalize(adv_images[i]))
-        if targeted:
-            ax2.set_title(
-                f"Adversarial (Target: {CLASSES[targets[i]]})\nPredicted: {CLASSES[adv_predictions[i]]}"
-            )
-        else:
-            ax2.set_title(f"Adversarial\nPredicted: {CLASSES[adv_predictions[i]]}")
-        ax2.axis("off")
-
-    plt.tight_layout(rect=[0, 0.1, 1, 0.95])  # Make room for the text
-
-    # Save the figure if output directory is specified
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        filename = f"{method}_{attack_type.lower()}_visualization.png"
-        plt.savefig(os.path.join(output_dir, filename), dpi=150, bbox_inches="tight")
-
-    plt.show()
-
-
-def visualize_perturbations(
-    images,
-    adv_images,
-    labels,
-    targets,
-    adv_predictions,
-    method,
-    targeted,
-    enhancement_factor=5,
-    output_dir=None,
-):
-    """Create a visualization showing original, perturbation, and adversarial images."""
-    # Create an enhanced visualization with perturbations
-    perturbation_vis = compute_perturbation_visualization(
-        images, adv_images, enhancement_factor
-    )
-
-    # Create a figure showing original, perturbation, and adversarial
-    fig, axes = plt.subplots(NUM_IMAGES, 3, figsize=(15, 3 * NUM_IMAGES))
-
-    # Format the attack name for the title
-    method_name = method.upper()
-    if method == "cg":
-        method_name = "Conjugate Gradient"
-    elif method == "lbfgs":
-        method_name = "L-BFGS"
-
-    attack_type = "Targeted" if targeted else "Untargeted"
-    fig.suptitle(
-        f"{method_name} {attack_type} Attack Analysis: Original, Perturbation (Enhanced), and Adversarial",
-        fontsize=16,
-    )
-
-    for i in range(NUM_IMAGES):
-        # Plot original
-        axes[i, 0].imshow(images[i].permute(1, 2, 0).detach().cpu().numpy())
-        axes[i, 0].set_title(f"Original: {CLASSES[labels[i]]}")
-        axes[i, 0].axis("off")
-
-        # Plot enhanced perturbation
-        axes[i, 1].imshow(perturbation_vis[i].permute(1, 2, 0).detach().cpu().numpy())
-        axes[i, 1].set_title(f"Perturbation (Enhanced {enhancement_factor}x)")
-        axes[i, 1].axis("off")
-
-        # Plot adversarial
-        axes[i, 2].imshow(adv_images[i].permute(1, 2, 0).detach().cpu().numpy())
-        if targeted:
-            axes[i, 2].set_title(f"Adversarial (Target: {CLASSES[targets[i]]})")
-        else:
-            axes[i, 2].set_title(f"Adversarial: {CLASSES[adv_predictions[i]]}")
-        axes[i, 2].axis("off")
-
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-
-    # Save the figure if output directory is specified
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        filename = f"{method}_{attack_type.lower()}_analysis.png"
-        plt.savefig(os.path.join(output_dir, filename), dpi=150, bbox_inches="tight")
-
-    plt.show()
-
-
-def visualize_convergence(metrics, method, targeted, output_dir=None):
-    """
-    Visualize the optimization convergence based on loss trajectory.
-
-    Args:
-        metrics: Dictionary containing optimization metrics
-    """
-    if "loss_trajectory" not in metrics or not metrics["loss_trajectory"]:
-        print("Loss trajectory not available in metrics")
-        return
-
-    loss_values = metrics["loss_trajectory"]
-    iterations = range(1, len(loss_values) + 1)
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(iterations, loss_values, "b-", linewidth=2)
-
-    # Format the attack name for the title
-    method_name = method.upper()
-    if method == "cg":
-        method_name = "Conjugate Gradient"
-    elif method == "lbfgs":
-        method_name = "L-BFGS"
-
-    attack_type = "Targeted" if targeted else "Untargeted"
-    plt.title(
-        f"{method_name} {attack_type} Attack Optimization Convergence", fontsize=14
-    )
-    plt.xlabel("Iteration", fontsize=12)
-    plt.ylabel("Loss Value", fontsize=12)
-    plt.yscale("log")  # Use log scale to better visualize the decay
-    plt.grid(True, linestyle="--", alpha=0.7)
-    plt.tight_layout()
-
-    # Save the figure if output directory is specified
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        filename = f"{method}_{attack_type.lower()}_convergence.png"
-        plt.savefig(os.path.join(output_dir, filename), dpi=150)
-
-    plt.show()
-
-
 def main():
     # Parse command line arguments
     args = parse_args()
@@ -532,12 +292,18 @@ def main():
         adv_images,
         labels,
         targets,
+        predictions,
         adv_predictions,
         args.method,
         args.targeted,
         5,
         output_dir,
+        NUM_IMAGES,
     )
+
+    # Show detailed norm comparison if requested
+    if args.show_norms:
+        visualize_norm_comparison(norms, args.method, args.targeted, output_dir)
 
     # Visualize convergence if available (mainly for L-BFGS)
     if "loss_trajectory" in metrics and metrics["loss_trajectory"]:
