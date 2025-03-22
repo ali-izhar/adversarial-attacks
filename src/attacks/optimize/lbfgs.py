@@ -123,23 +123,30 @@ class LBFGSOptimizer:
                 y_i = y_i.expand(batch_size, *y_i.shape[1:])
 
             # Compute alpha_i = rho_i * (s_i^T * q)
-            alpha_i = torch.bmm(
-                s_i.view(batch_size, 1, -1), q.view(batch_size, -1, 1)
-            ).squeeze(-1)
+            # Flatten tensors to 2D for matrix multiplication
+            s_i_flat = s_i.reshape(batch_size, -1)
+            q_flat = q.reshape(batch_size, -1)
+
+            alpha_i = torch.sum(s_i_flat * q_flat, dim=1)
+
             # Adjust rho_i if its shape does not match
             if isinstance(rho_i, torch.Tensor):
                 if rho_i.numel() != batch_size:
                     rho_i = torch.mean(rho_i).expand(batch_size)
                 elif rho_i.dim() == 1 and rho_i.shape[0] != batch_size:
                     rho_i = rho_i[0].expand(batch_size)
+
             alpha_i = rho_i * alpha_i
             alpha_list.append(alpha_i)
 
-            # Update q: subtract the curvature information scaled by y_i.
-            # If alpha_i is 1D, add extra dimensions to match y_i.
-            if alpha_i.dim() == 1:
-                alpha_i = alpha_i.view(batch_size, 1, 1, 1)
-            q = q - alpha_i * y_i
+            # Reshape alpha_i for broadcasting against y_i (which has the same shape as gradient)
+            # We need to add singleton dimensions for proper broadcasting
+            # For images, y_i will have shape [batch, channels, height, width]
+            # So alpha_i needs shape [batch, 1, 1, 1] to properly broadcast
+            alpha_i_reshaped = alpha_i.view(*([batch_size] + [1] * (y_i.dim() - 1)))
+
+            # Update q: subtract the curvature information scaled by y_i
+            q = q - alpha_i_reshaped * y_i
 
         # Scaling of the initial Hessian approximation:
         # H_0 = (s_{last}^T y_{last}) / (y_{last}^T y_{last}) * I
@@ -150,17 +157,21 @@ class LBFGSOptimizer:
                 s_last = s_last.expand(batch_size, *s_last.shape[1:])
             if y_last.shape[0] != batch_size:
                 y_last = y_last.expand(batch_size, *y_last.shape[1:])
-            s_dot_y = torch.bmm(
-                s_last.view(batch_size, 1, -1), y_last.view(batch_size, -1, 1)
-            ).squeeze()
-            y_dot_y = torch.bmm(
-                y_last.view(batch_size, 1, -1), y_last.view(batch_size, -1, 1)
-            ).squeeze()
+
+            # Flatten tensors for dot products
+            s_last_flat = s_last.reshape(batch_size, -1)
+            y_last_flat = y_last.reshape(batch_size, -1)
+
+            s_dot_y = torch.sum(s_last_flat * y_last_flat, dim=1)
+            y_dot_y = torch.sum(y_last_flat * y_last_flat, dim=1)
+
             scale = s_dot_y / (y_dot_y + 1e-10)  # Avoid division by zero.
-            if scale.dim() > 0:
-                scale = scale.view(batch_size, 1, 1, 1)
+
+            # Reshape scale for broadcasting against q
+            scale_reshaped = scale.view(*([batch_size] + [1] * (q.dim() - 1)))
+
             # Multiply q by the scaling factor to form the initial r.
-            r = q * scale
+            r = q * scale_reshaped
         else:
             # If no history, use the negative gradient direction.
             r = q
@@ -184,19 +195,19 @@ class LBFGSOptimizer:
                     rho_i = rho_i[0].expand(batch_size)
 
             # Compute beta_i = rho_i * (y_i^T * r)
-            beta_i = torch.bmm(
-                y_i.view(batch_size, 1, -1), r.view(batch_size, -1, 1)
-            ).squeeze(-1)
+            # Flatten tensors for dot product
+            y_i_flat = y_i.reshape(batch_size, -1)
+            r_flat = r.reshape(batch_size, -1)
+
+            beta_i = torch.sum(y_i_flat * r_flat, dim=1)
             beta_i = rho_i * beta_i
 
-            # Ensure correct shapes before updating r.
-            if alpha_i.dim() == 1:
-                alpha_i = alpha_i.view(batch_size, 1, 1, 1)
-            if beta_i.dim() == 1:
-                beta_i = beta_i.view(batch_size, 1, 1, 1)
+            # Reshape for broadcasting
+            alpha_i_reshaped = alpha_i.view(*([batch_size] + [1] * (s_i.dim() - 1)))
+            beta_i_reshaped = beta_i.view(*([batch_size] + [1] * (s_i.dim() - 1)))
 
             # Update r with the correction term.
-            r = r + (alpha_i - beta_i) * s_i
+            r = r + (alpha_i_reshaped - beta_i_reshaped) * s_i
 
         # The search direction is the negative of the approximated Hessian–gradient product.
         return -r

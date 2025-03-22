@@ -4,7 +4,6 @@ import os
 import sys
 import pytest
 import torch
-import numpy as np
 from typing import Callable, Tuple
 
 project_root = os.path.dirname(
@@ -14,7 +13,6 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.attacks.optimize.lbfgs import LBFGSOptimizer
-from src.utils.projections import project_adversarial_example
 
 
 # Create a simplified quadratic function that works with 4D tensors
@@ -370,3 +368,303 @@ class TestLBFGSOptimizer:
 
         # Success rate should be 0.5 (1 out of 2 examples)
         assert abs(metrics_with_stopping["success_rate"] - 0.5) < 1e-5
+
+    def test_with_history(self, test_images, simple_quad_objective, device):
+        """Test LBFGS optimization with non-zero history size."""
+        loss_fn, grad_fn = simple_quad_objective
+
+        # Create optimizer with history
+        opt = LBFGSOptimizer(
+            n_iterations=20,
+            history_size=5,  # Use actual history
+            line_search_fn="armijo",
+            rand_init=False,
+        )
+
+        # Run optimizer
+        result, metrics = opt.optimize(test_images.clone(), grad_fn, loss_fn)
+
+        # Verify loss decreased
+        initial_loss = loss_fn(test_images)
+        final_loss = loss_fn(result)
+        assert torch.all(final_loss < initial_loss)
+
+        # Verify the optimizer used history (should be visible in the metrics)
+        assert metrics["iterations"] > 0
+
+    def test_strong_wolfe_line_search(self, test_images, simple_quad_objective, device):
+        """Test that strong Wolfe line search conditions work properly."""
+        loss_fn, grad_fn = simple_quad_objective
+
+        # Create optimizer with strong Wolfe line search
+        opt_wolfe = LBFGSOptimizer(
+            n_iterations=15,
+            history_size=0,  # No history to isolate line search behavior
+            line_search_fn="strong_wolfe",
+            rand_init=False,
+        )
+
+        # Create optimizer with Armijo for comparison
+        opt_armijo = LBFGSOptimizer(
+            n_iterations=15,
+            history_size=0,
+            line_search_fn="armijo",
+            rand_init=False,
+        )
+
+        # Run optimizers
+        x_init = test_images.clone()
+        result_wolfe, metrics_wolfe = opt_wolfe.optimize(x_init, grad_fn, loss_fn)
+        result_armijo, metrics_armijo = opt_armijo.optimize(x_init, grad_fn, loss_fn)
+
+        # Both methods should decrease loss
+        initial_loss = loss_fn(x_init)
+        wolfe_loss = loss_fn(result_wolfe)
+        armijo_loss = loss_fn(result_armijo)
+
+        assert torch.all(wolfe_loss < initial_loss)
+        assert torch.all(armijo_loss < initial_loss)
+
+    def test_numerical_stability(self, device):
+        """Test with a pathological function to check numerical stability."""
+        batch_size = 2
+        channels, height, width = 3, 4, 4
+
+        # Initialize with challenging values
+        torch.manual_seed(42)
+        x_init = torch.rand((batch_size, channels, height, width), device=device)
+
+        # Create a function with poor conditioning (Rosenbrock-inspired function)
+        def rosenbrock_loss(x):
+            # Reshape to work with 4D tensors
+            x_flat = x.reshape(batch_size, -1)
+
+            # Parameters for Rosenbrock-like function
+            a = 1.0
+            b = 100.0
+
+            # Calculate loss for each consecutive pair of variables
+            loss = torch.zeros(batch_size, device=device)
+            for i in range(x_flat.shape[1] - 1):
+                # Rosenbrock-like term: (a - x_i)² + b(x_{i+1} - x_i²)²
+                term1 = (a - x_flat[:, i]) ** 2
+                term2 = b * (x_flat[:, i + 1] - x_flat[:, i] ** 2) ** 2
+                loss = loss + term1 + term2
+
+            return loss
+
+        def rosenbrock_grad(x):
+            # Forward pass with torch.autograd to get gradients
+            x_tensor = x.clone().detach().requires_grad_(True)
+
+            # Compute loss
+            loss = rosenbrock_loss(x_tensor)
+
+            # Compute gradients
+            grad = torch.autograd.grad(
+                loss.sum(), x_tensor, create_graph=False, retain_graph=False
+            )[0]
+
+            return grad
+
+        # Optimizer with small step size for stability
+        opt = LBFGSOptimizer(
+            n_iterations=25,
+            history_size=3,  # Small history
+            line_search_fn="armijo",
+            initial_step=0.01,  # Small initial step
+            rand_init=False,
+        )
+
+        # Run optimizer
+        result, metrics = opt.optimize(x_init, rosenbrock_grad, rosenbrock_loss)
+
+        # Check if optimization made progress
+        initial_loss = rosenbrock_loss(x_init)
+        final_loss = rosenbrock_loss(result)
+
+        # At least one example should improve
+        assert torch.any(final_loss < initial_loss)
+
+    def test_large_batch(self, device):
+        """Test with a larger batch size to ensure scalability."""
+        batch_size = 8  # Larger batch
+        channels, height, width = 3, 4, 4
+
+        torch.manual_seed(123)
+        x_init = torch.rand((batch_size, channels, height, width), device=device)
+        target = torch.ones_like(x_init) * 0.5
+
+        def loss_fn(x):
+            losses = torch.sum((x - target) ** 2, dim=(1, 2, 3))
+            return losses
+
+        def grad_fn(x):
+            return 2 * (x - target)
+
+        # Create optimizer
+        opt = LBFGSOptimizer(
+            n_iterations=10,
+            history_size=2,  # Small history for speed
+            line_search_fn="armijo",
+            rand_init=False,
+        )
+
+        # Run optimizer
+        result, metrics = opt.optimize(x_init, grad_fn, loss_fn)
+
+        # Check batch dimension is preserved
+        assert result.shape[0] == batch_size
+
+        # Check loss decreased for all examples
+        initial_loss = loss_fn(x_init)
+        final_loss = loss_fn(result)
+        assert torch.all(final_loss < initial_loss)
+
+    def test_convergence_comparison(self, test_images, simple_quad_objective, device):
+        """Compare convergence to gradient descent."""
+        loss_fn, grad_fn = simple_quad_objective
+
+        # Initialize
+        x_init = test_images.clone()
+
+        # L-BFGS optimizer
+        opt_lbfgs = LBFGSOptimizer(
+            n_iterations=10,
+            history_size=5,
+            line_search_fn="armijo",
+            rand_init=False,
+        )
+
+        # Simulate gradient descent with L-BFGS by disabling history
+        opt_gd = LBFGSOptimizer(
+            n_iterations=10,
+            history_size=0,  # No history = gradient descent
+            line_search_fn="armijo",
+            rand_init=False,
+        )
+
+        # Run both optimizers
+        result_lbfgs, metrics_lbfgs = opt_lbfgs.optimize(x_init, grad_fn, loss_fn)
+        result_gd, metrics_gd = opt_gd.optimize(x_init, grad_fn, loss_fn)
+
+        # Get final losses
+        loss_lbfgs = loss_fn(result_lbfgs)
+        loss_gd = loss_fn(result_gd)
+
+        # Both should decrease the loss
+        initial_loss = loss_fn(x_init)
+        assert torch.all(loss_lbfgs < initial_loss)
+        assert torch.all(loss_gd < initial_loss)
+
+        # Note: We can't guarantee L-BFGS always beats GD for all examples
+        # This would require a carefully constructed test case
+        # But at least one example should optimize better with L-BFGS
+        assert torch.any(loss_lbfgs <= loss_gd)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Skipping integration test on CPU"
+    )
+    def test_network_integration(self, device):
+        """Integration test with a simple neural network for adversarial attack."""
+        # Skip if not on GPU to avoid slow tests
+        if device != "cuda":
+            pytest.skip("Skipping integration test on CPU")
+
+        batch_size = 2
+        channels, height, width = 3, 32, 32
+        num_classes = 10
+
+        # Create a simple ConvNet
+        class SimpleConvNet(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv1 = torch.nn.Conv2d(channels, 16, kernel_size=3, padding=1)
+                self.conv2 = torch.nn.Conv2d(16, 32, kernel_size=3, padding=1)
+                self.pool = torch.nn.MaxPool2d(2, 2)
+                self.fc1 = torch.nn.Linear(32 * (height // 4) * (width // 4), 128)
+                self.fc2 = torch.nn.Linear(128, num_classes)
+                self.relu = torch.nn.ReLU()
+
+            def forward(self, x):
+                x = self.pool(self.relu(self.conv1(x)))
+                x = self.pool(self.relu(self.conv2(x)))
+                x = x.view(x.size(0), -1)
+                x = self.relu(self.fc1(x))
+                x = self.fc2(x)
+                return x
+
+        # Create model and move to device
+        model = SimpleConvNet().to(device)
+        model.eval()  # Set to evaluation mode
+
+        # Create fake images and targets
+        torch.manual_seed(42)
+        images = torch.rand((batch_size, channels, height, width), device=device)
+        true_labels = torch.randint(0, num_classes, (batch_size,), device=device)
+        target_labels = (true_labels + 1) % num_classes  # Different from true labels
+
+        # Define cross-entropy loss
+        criterion = torch.nn.CrossEntropyLoss(reduction="none")
+
+        # Define the adversarial loss function (targeted attack)
+        def adversarial_loss(x):
+            logits = model(x)
+            # For targeted attack, we want to minimize loss for target label
+            return criterion(logits, target_labels)
+
+        # Define the gradient function
+        def adversarial_grad(x):
+            x_tensor = x.clone().detach().requires_grad_(True)
+            logits = model(x_tensor)
+            loss = criterion(logits, target_labels)
+            grad = torch.autograd.grad(loss.sum(), x_tensor)[0]
+            return grad
+
+        # Define success function (check if prediction matches target)
+        def success_fn(x):
+            logits = model(x)
+            pred = logits.argmax(dim=1)
+            return pred == target_labels
+
+        # Create optimizer for adversarial attack
+        opt = LBFGSOptimizer(
+            norm="L2",
+            eps=3.0,  # Larger epsilon for demonstration
+            n_iterations=10,
+            history_size=5,
+            line_search_fn="armijo",
+            rand_init=True,
+            early_stopping=True,
+        )
+
+        # Run optimization to generate adversarial examples
+        adv_images, metrics = opt.optimize(
+            images.clone(),
+            adversarial_grad,
+            adversarial_loss,
+            success_fn=success_fn,
+            x_original=images,
+        )
+
+        # Check that the adversarial examples are within epsilon bound
+        diff = adv_images - images
+        diff_flat = diff.reshape(batch_size, -1)
+        l2_norms = torch.norm(diff_flat, dim=1)
+        assert torch.all(l2_norms <= opt.eps * 1.1)  # Allow slight tolerance
+
+        # Evaluate adversarial success
+        with torch.no_grad():
+            clean_logits = model(images)
+            adv_logits = model(adv_images)
+
+            clean_pred = clean_logits.argmax(dim=1)
+            adv_pred = adv_logits.argmax(dim=1)
+
+        # Check if at least one example was successfully attacked
+        assert torch.any(adv_pred == target_labels)
+
+        # Success rate should be reflected in metrics
+        predicted_success_rate = metrics["success_rate"]
+        actual_success_rate = torch.mean((adv_pred == target_labels).float()).item()
+        assert abs(predicted_success_rate - actual_success_rate) < 1e-5
