@@ -211,10 +211,10 @@ class ConjugateGradient(BaseAttack):
         self.total_gradient_calls = opt_metrics["gradient_calls"]
         self.total_time = time.time() - start_time
 
-        # Compile the final metrics dictionary, converting success rate to percentage.
+        # Compile final metrics and convert the success rate to a percentage.
         metrics = {
             **self.get_metrics(),
-            "success_rate": opt_metrics["success_rate"] * 100,
+            "success_rate": opt_metrics["success_rate"],
         }
 
         return x_adv, metrics

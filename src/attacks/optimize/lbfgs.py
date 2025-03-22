@@ -773,12 +773,14 @@ class LBFGSOptimizer:
             "gradient_calls": gradient_calls,
             "time": total_time,
             "success_rate": (
-                success.float().mean().item() if success_fn is not None else 0.0
+                (success & ~initial_success).float().mean().item() * 100
+                if success_fn is not None
+                else 0.0
             ),
             "initial_success_rate": (
                 initial_success.float().mean().item() if success_fn is not None else 0.0
             ),
-            "loss_trajectory": loss_trajectory,  # Add loss trajectory to metrics
+            "loss_trajectory": loss_trajectory,
         }
 
         return x_adv, metrics

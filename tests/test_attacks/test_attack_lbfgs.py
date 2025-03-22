@@ -147,14 +147,21 @@ class TestLBFGSAttack:
             clean_preds = clean_outputs.argmax(dim=1)
             adv_preds = adv_outputs.argmax(dim=1)
 
-            # Calculate success rate manually
-            success = (adv_preds != true_labels).float().mean().item() * 100
+            # Get initially successful examples (already misclassified)
+            initial_success = clean_preds != true_labels
 
-            # Check that at least some examples were successfully attacked
-            assert success > 0
+            # New successful examples (weren't initially successful but became successful)
+            new_success = (adv_preds != true_labels) & ~initial_success
 
-            # Verify reported success rate matches actual success
-            assert abs(metrics["success_rate"] - success) < 1e-5
+            # Calculate new success rate as a percentage
+            new_success_rate = new_success.float().mean().item() * 100
+
+            # Check that at least some examples were attacked successfully
+            total_success = (adv_preds != true_labels).float().mean().item() * 100
+            assert total_success > 0
+
+            # Verify reported success rate matches actual new success rate
+            assert abs(metrics["success_rate"] - new_success_rate) < 1e-5
 
     def test_targeted_attack(self, model, test_batch, device):
         """Test a targeted attack with Linf norm."""
@@ -185,18 +192,27 @@ class TestLBFGSAttack:
 
         # Verify the adversarial examples match the target labels
         with torch.no_grad():
+            clean_outputs = model(images)
             adv_outputs = model(adv_images)
+
+            clean_preds = clean_outputs.argmax(dim=1)
             adv_preds = adv_outputs.argmax(dim=1)
 
-            # Calculate success rate manually (targeted attack)
-            success = (adv_preds == target_labels).float().mean().item() * 100
+            # Get initially successful examples (already classified as target)
+            initial_success = clean_preds == target_labels
+
+            # New successful examples (weren't initially successful but became successful)
+            new_success = (adv_preds == target_labels) & ~initial_success
+
+            # Calculate new success rate as a percentage
+            new_success_rate = new_success.float().mean().item() * 100
 
             # Check that at least some examples were successfully attacked
-            # Note: Targeted attacks are harder, so the threshold is lower
-            assert success > 0
+            total_success = (adv_preds == target_labels).float().mean().item() * 100
+            assert total_success > 0
 
-            # Verify reported success rate matches actual success
-            assert abs(metrics["success_rate"] - success) < 1e-5
+            # Verify reported success rate matches actual new success rate
+            assert abs(metrics["success_rate"] - new_success_rate) < 1e-5
 
     def test_margin_loss(self, model, test_batch, device):
         """Test attack with margin loss function."""
@@ -226,14 +242,21 @@ class TestLBFGSAttack:
             clean_preds = clean_outputs.argmax(dim=1)
             adv_preds = adv_outputs.argmax(dim=1)
 
-            # Calculate success rate
-            success = (adv_preds != true_labels).float().mean().item() * 100
+            # Get initially successful examples (already misclassified)
+            initial_success = clean_preds != true_labels
+
+            # New successful examples (weren't initially successful but became successful)
+            new_success = (adv_preds != true_labels) & ~initial_success
+
+            # Calculate new success rate as a percentage
+            new_success_rate = new_success.float().mean().item() * 100
 
             # Check that at least some examples were successfully attacked
-            assert success > 0
+            total_success = (adv_preds != true_labels).float().mean().item() * 100
+            assert total_success > 0
 
-            # Verify reported success rate matches actual success
-            assert abs(metrics["success_rate"] - success) < 1e-5
+            # Verify reported success rate matches actual new success rate
+            assert abs(metrics["success_rate"] - new_success_rate) < 1e-5
 
     def test_metrics_tracking(self, model, test_batch, device):
         """Test that the attack correctly tracks and returns metrics."""

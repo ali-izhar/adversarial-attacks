@@ -366,8 +366,9 @@ class TestLBFGSOptimizer:
         # Verify the second example is still unsuccessful
         assert success_fn(result)[1].item() == False
 
-        # Success rate should be 0.5 (1 out of 2 examples)
-        assert abs(metrics_with_stopping["success_rate"] - 0.5) < 1e-5
+        # Success rate should be 0.0 (no new successes because the first example was already successful)
+        # and the second example never became successful
+        assert abs(metrics_with_stopping["success_rate"] - 0.0) < 1e-5
 
     def test_with_history(self, test_images, simple_quad_objective, device):
         """Test LBFGS optimization with non-zero history size."""
@@ -666,5 +667,7 @@ class TestLBFGSOptimizer:
 
         # Success rate should be reflected in metrics
         predicted_success_rate = metrics["success_rate"]
-        actual_success_rate = torch.mean((adv_pred == target_labels).float()).item()
+        actual_success_rate = (
+            torch.mean((adv_pred == target_labels).float()).item() * 100
+        )
         assert abs(predicted_success_rate - actual_success_rate) < 1e-5

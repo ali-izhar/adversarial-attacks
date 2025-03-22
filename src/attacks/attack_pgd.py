@@ -208,7 +208,7 @@ class PGD(BaseAttack):
         # Compile final metrics and convert the success rate to a percentage.
         metrics = {
             **self.get_metrics(),
-            "success_rate": opt_metrics["success_rate"] * 100,
+            "success_rate": opt_metrics["success_rate"],
         }
 
         return x_adv, metrics

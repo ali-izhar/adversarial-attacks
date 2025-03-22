@@ -247,6 +247,9 @@ class ConjugateGradientOptimizer:
         else:
             success = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
+        # Store the initial success state for metrics
+        initial_success = success.clone()
+
         # Compute the initial gradient and set the initial search direction.
         grad = gradient_fn(x_adv)
         gradient_calls += 1
@@ -344,7 +347,12 @@ class ConjugateGradientOptimizer:
             "gradient_calls": gradient_calls,
             "time": total_time,
             "success_rate": (
-                success.float().mean().item() if success_fn is not None else 0.0
+                (success & ~initial_success).float().mean().item() * 100
+                if success_fn is not None
+                else 0.0
+            ),
+            "initial_success_rate": (
+                initial_success.float().mean().item() if success_fn is not None else 0.0
             ),
         }
 

@@ -1,11 +1,11 @@
 """
-Example script for visualizing different adversarial attacks.
+Example script for visualizing adversarial attacks on ImageNet images.
 
 This script demonstrates how to generate adversarial examples using various
-attack methods and visualizes the original and perturbed images side by side.
+attack methods on pretrained models with ImageNet images.
 
 Usage:
-    python attack_example.py --method [cg|pgd|lbfgs] [--targeted] [--eps 0.5]
+    python imagenet_attack_example.py --method [cg|pgd|lbfgs] [--targeted] [--eps 0.5]
 
 Arguments:
     --method: Attack method to use (pgd, cg, lbfgs)
@@ -20,8 +20,8 @@ Arguments:
 import os
 import sys
 import torch
-import torchvision
 import torchvision.transforms as transforms
+import torchvision.models as models
 import argparse
 
 # Add the project root to the path
@@ -32,26 +32,27 @@ if project_root not in sys.path:
 from src.attacks.attack_pgd import PGD
 from src.attacks.attack_cg import ConjugateGradient
 from src.attacks.attack_lbfgs import LBFGS
+from src.datasets.loader import get_dataset, get_dataloader
 from examples.plot import (
     visualize_results,
     visualize_perturbations,
     visualize_convergence,
     visualize_norm_comparison,
     compare_norms,
-    CLASSES,
 )
 
 
 # Configuration
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = "models/resnet18_cifar10.pth"  # Path to a pre-trained model
-DATA_PATH = "data"  # Path to dataset
 NUM_IMAGES = 5  # Number of images to attack
+IMAGENET_DATA_DIR = "data/imagenet"  # Path to ImageNet dataset
 
 
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Adversarial Attack Visualization")
+    parser = argparse.ArgumentParser(
+        description="Adversarial Attack Visualization on ImageNet"
+    )
     parser.add_argument(
         "--method",
         type=str,
@@ -67,7 +68,7 @@ def parse_args():
     parser.add_argument(
         "--eps",
         type=float,
-        default=0.5,
+        default=0.03,
         help="Perturbation budget (epsilon) for the attack",
     )
     parser.add_argument(
@@ -91,49 +92,67 @@ def parse_args():
         action="store_true",
         help="Display detailed norm analysis visualizations",
     )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Maximum number of samples to load from dataset",
+    )
 
     return parser.parse_args()
 
 
 def load_model():
-    """Load a pre-trained model."""
-    # Use a pre-trained ResNet18 model
-    model = torchvision.models.resnet18(pretrained=False)
-    # Modify for CIFAR-10 (10 classes)
-    model.fc = torch.nn.Linear(model.fc.in_features, 10)
-
-    # Load trained weights if available
-    if os.path.exists(MODEL_PATH):
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    else:
-        print(
-            f"Warning: Pre-trained model not found at {MODEL_PATH}. Using untrained model."
-        )
-
+    """Load a pretrained model with ImageNet weights."""
+    # Use a pretrained ResNet50 model
+    model = models.resnet50(pretrained=True)
     model = model.to(DEVICE)
-    model.eval()
+    model.eval()  # Set to evaluation mode
     return model
 
 
-def load_data():
-    """Load a few sample images from CIFAR-10 for testing."""
+def load_imagenet_data(max_samples=None):
+    """Load ImageNet sample images."""
+    # Define normalization for pretrained models
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+    )
+
+    # Create transform pipeline
     transform = transforms.Compose(
         [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
             transforms.ToTensor(),
-            # Don't normalize as it complicates visualization
+            normalize,
         ]
     )
 
-    dataset = torchvision.datasets.CIFAR10(
-        root=DATA_PATH, train=False, download=True, transform=transform
-    )
+    # Create dataset and dataloader
+    try:
+        dataset = get_dataset(
+            dataset_name="imagenet",
+            data_dir="data",
+            transform=transform,
+            max_samples=max_samples,
+        )
 
-    # Take a few samples
-    loader = torch.utils.data.DataLoader(dataset, batch_size=NUM_IMAGES, shuffle=True)
+        # Load just a few samples for visualization
+        dataloader = get_dataloader(
+            dataset=dataset, batch_size=NUM_IMAGES, shuffle=True
+        )
 
-    # Get a single batch
-    images, labels = next(iter(loader))
-    return images.to(DEVICE), labels.to(DEVICE)
+        # Get a single batch
+        images, labels = next(iter(dataloader))
+
+        # Load class names for display
+        with open(os.path.join(IMAGENET_DATA_DIR, "imagenet_classes.txt"), "r") as f:
+            class_names = [line.strip() for line in f.readlines()]
+
+        return images.to(DEVICE), labels.to(DEVICE), class_names
+    except Exception as e:
+        print(f"Error loading ImageNet data: {e}")
+        raise
 
 
 def create_attack(model, method, args):
@@ -151,7 +170,7 @@ def create_attack(model, method, args):
         # PGD-specific parameters
         attack_params = {
             **common_params,
-            "alpha_init": 0.1,
+            "alpha_init": 0.01,  # Smaller step size for ImageNet
             "alpha_type": "diminishing",
             "rand_init": True,
             "init_std": 0.01,
@@ -189,26 +208,59 @@ def create_attack(model, method, args):
     return attack, attack_params
 
 
-def prepare_targets(labels, targeted=False):
+def prepare_targets(labels, class_names, targeted=False):
     """Prepare target labels for the attack."""
+    num_classes = len(class_names)
+
     if targeted:
-        # For targeted attacks, choose targets different from original labels
-        targets = (labels + 1) % 10
+        # For targeted attacks, choose a random but consistent target different from original
+        targets = (
+            labels + torch.randint(1, num_classes - 1, labels.shape).to(DEVICE)
+        ) % num_classes
         return targets
     else:
         # For untargeted attacks, use the true labels
         return labels
 
 
-def generate_adversarial_examples(model, images, labels, attack, targeted=False):
+def generate_adversarial_examples(
+    model, images, labels, attack, class_names, targeted=False
+):
     """Generate adversarial examples using the specified attack."""
     # Prepare target labels
-    targets = prepare_targets(labels, targeted)
+    targets = prepare_targets(labels, class_names, targeted)
 
     # Generate adversarial examples
     adv_images, metrics = attack.generate(images, targets)
 
     return adv_images, metrics, targets
+
+
+def reverse_normalization(
+    images, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+):
+    """
+    Reverse the normalization for visualization.
+
+    Args:
+        images: Normalized images
+        mean: Normalization mean
+        std: Normalization standard deviation
+
+    Returns:
+        Denormalized images suitable for visualization
+    """
+    # Create clones to avoid modifying originals
+    denorm_images = images.clone().detach()
+
+    # Reverse normalization
+    for i in range(3):  # For each channel
+        denorm_images[:, i, :, :] = denorm_images[:, i, :, :] * std[i] + mean[i]
+
+    # Ensure values are in valid range [0, 1]
+    denorm_images = torch.clamp(denorm_images, 0, 1)
+
+    return denorm_images
 
 
 def main():
@@ -219,12 +271,12 @@ def main():
     output_dir = args.output
 
     # Load model
-    print(f"Loading model...")
+    print(f"Loading pretrained model...")
     model = load_model()
 
     # Load data
-    print(f"Loading data...")
-    images, labels = load_data()
+    print(f"Loading ImageNet data...")
+    images, labels, class_names = load_imagenet_data(args.max_samples)
 
     # Get original predictions
     with torch.no_grad():
@@ -238,7 +290,7 @@ def main():
     # Generate adversarial examples
     print(f"Generating adversarial examples...")
     adv_images, metrics, targets = generate_adversarial_examples(
-        model, images, labels, attack, args.targeted
+        model, images, labels, attack, class_names, args.targeted
     )
 
     # Get adversarial predictions
@@ -246,35 +298,65 @@ def main():
         adv_outputs = model(adv_images)
         adv_predictions = adv_outputs.argmax(dim=1)
 
-    # Calculate perturbation norms
+    # Unnormalize images for visualization
+    orig_images_viz = reverse_normalization(images)
+    adv_images_viz = reverse_normalization(adv_images)
+
+    # Calculate perturbation norms (on normalized images)
     norms = compare_norms(images, adv_images)
 
     # Print results
     print("\nResults:")
     print(f"Attack method: {args.method.upper()}")
     print(f"Attack type: {'Targeted' if args.targeted else 'Untargeted'}")
-    print(f"Success Rate: {metrics['success_rate']:.1f}%")
+    print(f"Reported Success Rate: {metrics['success_rate']:.1f}%")
     print(f"Average L2 Norm: {norms['L2'].mean().item():.4f}")
     print(f"Average Linf Norm: {norms['Linf'].mean().item():.4f}")
 
+    # Calculate actual success rate from individual results
+    successful_attacks = 0
+    total_attacks = len(images)
+
     # Show which images were successfully attacked
-    for i in range(len(images)):
+    for i in range(total_attacks):
         if args.targeted:
-            success = "✓" if adv_predictions[i] == targets[i] else "✗"
+            is_success = adv_predictions[i] == targets[i]
+            success_marker = "✓" if is_success else "✗"
             print(
-                f"Image {i+1}: {CLASSES[labels[i]]} → {CLASSES[adv_predictions[i]]} (Target: {CLASSES[targets[i]]}) (L2: {norms['L2'][i]:.4f}, Linf: {norms['Linf'][i]:.4f}) {success}"
+                f"Image {i+1}: {class_names[labels[i]]} → {class_names[adv_predictions[i]]} "
+                f"(Target: {class_names[targets[i]]}) "
+                f"(L2: {norms['L2'][i]:.4f}, Linf: {norms['Linf'][i]:.4f}) {success_marker}"
             )
+            if is_success:
+                successful_attacks += 1
         else:
-            success = "✓" if predictions[i] != adv_predictions[i] else "✗"
+            is_success = predictions[i] != adv_predictions[i]
+            success_marker = "✓" if is_success else "✗"
             print(
-                f"Image {i+1}: {CLASSES[labels[i]]} → {CLASSES[adv_predictions[i]]} (L2: {norms['L2'][i]:.4f}, Linf: {norms['Linf'][i]:.4f}) {success}"
+                f"Image {i+1}: {class_names[labels[i]]} → {class_names[adv_predictions[i]]} "
+                f"(L2: {norms['L2'][i]:.4f}, Linf: {norms['Linf'][i]:.4f}) {success_marker}"
             )
+            if is_success:
+                successful_attacks += 1
+
+    # Calculate and display actual success rate
+    actual_success_rate = (successful_attacks / total_attacks) * 100
+    print(
+        f"\nActual Success Rate: {actual_success_rate:.1f}% ({successful_attacks}/{total_attacks})"
+    )
+
+    # If there's a discrepancy, warn the user
+    if abs(actual_success_rate - metrics["success_rate"]) > 1.0:
+        print(f"\nWARNING: Discrepancy between reported and actual success rates!")
+        print(
+            f"This may indicate that the attack is counting initially successful examples incorrectly."
+        )
 
     # Visualize the results
     print("\nVisualizing results...")
     visualize_results(
-        images,
-        adv_images,
+        orig_images_viz,
+        adv_images_viz,
         labels,
         targets,
         predictions,
@@ -284,21 +366,23 @@ def main():
         args.method,
         args.targeted,
         output_dir,
+        class_names,
     )
 
     # Visualize perturbations
     visualize_perturbations(
-        images,
-        adv_images,
+        orig_images_viz,
+        adv_images_viz,
         labels,
         targets,
         predictions,
         adv_predictions,
         args.method,
         args.targeted,
-        5,
+        5,  # Enhancement factor
         output_dir,
         NUM_IMAGES,
+        class_names,
     )
 
     # Show detailed norm comparison if requested

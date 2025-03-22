@@ -92,6 +92,7 @@ def visualize_results(
     method,
     targeted,
     output_dir=None,
+    class_names=None,
 ):
     """
     Create an enhanced side-by-side visualization of original and adversarial images.
@@ -108,8 +109,13 @@ def visualize_results(
         method: Attack method name ("pgd", "cg", or "lbfgs")
         targeted: Whether the attack is targeted
         output_dir: Directory to save visualization (optional)
+        class_names: List of class names (if None, uses the default CIFAR-10 CLASSES)
     """
     n = len(images)
+
+    # Use default CIFAR-10 classes if no class_names provided
+    if class_names is None:
+        class_names = CLASSES
 
     # Set up a nice color palette
     colors = sns.color_palette(PALETTE, n_colors=3)
@@ -173,7 +179,7 @@ def visualize_results(
             # Original image
             ax1.imshow(denormalize(images[i]))
             ax1.set_title(
-                f"Original: {CLASSES[labels[i]]}\nPredicted: {CLASSES[predictions[i]]}",
+                f"Original: {class_names[labels[i]]}\nPredicted: {class_names[predictions[i]]}",
                 fontweight="bold",
                 color=colors[0],
             )
@@ -189,13 +195,13 @@ def visualize_results(
             ax2.imshow(denormalize(adv_images[i]))
             if targeted:
                 ax2.set_title(
-                    f"Adversarial (Target: {CLASSES[targets[i]]})\nPredicted: {CLASSES[adv_predictions[i]]}",
+                    f"Adversarial (Target: {class_names[targets[i]]})\nPredicted: {class_names[adv_predictions[i]]}",
                     fontweight="bold",
                     color=colors[2],
                 )
             else:
                 ax2.set_title(
-                    f"Adversarial\nPredicted: {CLASSES[adv_predictions[i]]}",
+                    f"Adversarial\nPredicted: {class_names[adv_predictions[i]]}",
                     fontweight="bold",
                     color=colors[2],
                 )
@@ -261,6 +267,7 @@ def visualize_perturbations(
     enhancement_factor=5,
     output_dir=None,
     num_images=5,
+    class_names=None,
 ):
     """
     Create an enhanced visualization showing original, perturbation, and adversarial images.
@@ -277,7 +284,12 @@ def visualize_perturbations(
         enhancement_factor: Factor to enhance perturbation visibility
         output_dir: Directory to save visualization (optional)
         num_images: Number of images to display
+        class_names: List of class names (if None, uses the default CIFAR-10 CLASSES)
     """
+    # Use default CIFAR-10 classes if no class_names provided
+    if class_names is None:
+        class_names = CLASSES
+
     # Create an enhanced visualization with perturbations
     perturbation_vis = compute_perturbation_visualization(
         images, adv_images, enhancement_factor
@@ -325,7 +337,7 @@ def visualize_perturbations(
             # Original image
             axes[i, 0].imshow(images[i].permute(1, 2, 0).detach().cpu().numpy())
             axes[i, 0].set_title(
-                f"Original: {CLASSES[labels[i]]}", fontsize=12, color=colors[0]
+                f"Original: {class_names[labels[i]]}", fontsize=12, color=colors[0]
             )
             axes[i, 0].axis("off")
             for spine in axes[i, 0].spines.values():
@@ -366,11 +378,11 @@ def visualize_perturbations(
             axes[i, 3].imshow(adv_images[i].permute(1, 2, 0).detach().cpu().numpy())
             if targeted:
                 axes[i, 3].set_title(
-                    f"Target: {CLASSES[targets[i]]}", fontsize=12, color=colors[3]
+                    f"Target: {class_names[targets[i]]}", fontsize=12, color=colors[3]
                 )
             else:
                 axes[i, 3].set_title(
-                    f"Classified as: {CLASSES[adv_predictions[i]]}",
+                    f"Classified as: {class_names[adv_predictions[i]]}",
                     fontsize=12,
                     color=colors[3],
                 )
