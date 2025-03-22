@@ -1,4 +1,29 @@
-"""Projected Gradient Descent (PGD) optimization method implementation."""
+"""Projected Gradient Descent (PGD) optimization method implementation.
+
+This file implements the PGD optimizer for generating adversarial examples against
+neural networks. PGD is a first-order iterative method that applies a gradient step
+followed by a projection operation to ensure the perturbation remains within
+a specified constraint set.
+
+Key features:
+- Simple yet effective first-order optimization
+- Configurable step size schedules (constant or diminishing)
+- Constraint handling for both L2 and Linf perturbation norms
+- Batch processing for simultaneous optimization of multiple examples
+- Optional random initialization within the allowed perturbation space
+- Early stopping capability when adversarial criteria are met
+
+Expected inputs:
+- Initial images (usually clean images to be perturbed)
+- Gradient function that computes gradients of the adversarial loss
+- Loss function that returns per-example losses (optional)
+- Success function that determines if adversarial criteria are met (optional)
+- Original images (for projection constraints)
+
+Expected outputs:
+- Optimized adversarial examples
+- Optimization metrics (iterations, gradient calls, time, success rate)
+"""
 
 import torch
 import time
@@ -28,12 +53,14 @@ class PGDOptimizer:
         init_std: float = 0.01,
         early_stopping: bool = True,
         verbose: bool = False,
+        maximize: bool = False,  # Default to minimization for standard optimization
     ):
         """
         Initialize the PGD optimizer with parameters controlling:
           - the perturbation norm and maximum allowed perturbation (eps)
           - the maximum number of iterations and the step size schedule
           - whether to start with random perturbation and early stopping behavior
+          - whether to maximize or minimize the objective function
         """
         self.norm = norm
         self.eps = eps
@@ -44,6 +71,7 @@ class PGDOptimizer:
         self.init_std = init_std
         self.early_stopping = early_stopping
         self.verbose = verbose
+        self.maximize = maximize  # For adversarial attacks, typically True
 
     def _get_step_size(self, t: int) -> float:
         """
@@ -80,7 +108,7 @@ class PGDOptimizer:
         The algorithm follows these steps:
           1. (Optionally) initialize the adversarial example with random noise.
           2. For each iteration, compute the gradient of the loss with respect to the input.
-          3. Update the input by taking a step in the direction of the gradient.
+          3. Update the input by taking a step in the direction of the gradient (or negative gradient).
           4. Project the updated input back onto the allowed perturbation set (eps-ball) and clamp
              values to valid ranges (e.g., [0, 1] for image pixels).
           5. Optionally stop early if the adversarial success condition is met.
@@ -122,8 +150,14 @@ class PGDOptimizer:
         # Check initial adversarial success.
         if success_fn is not None:
             success = success_fn(x_adv)
+            if self.verbose:
+                success_rate = success.float().mean().item() * 100
+                print(f"Initial success rate: {success_rate:.2f}%")
         else:
             success = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        # Store initial success rate
+        initial_success = success.clone()
 
         # Main optimization loop.
         for t in range(self.n_iterations):
@@ -131,6 +165,8 @@ class PGDOptimizer:
 
             # Early stopping: if all examples are already adversarial, break.
             if self.early_stopping and success.all():
+                if self.verbose:
+                    print(f"Early stopping at iteration {t}: all examples successful")
                 break
 
             # Step 2: Compute the gradient for unsolved examples.
@@ -140,19 +176,42 @@ class PGDOptimizer:
                 if working_examples.sum() == 0:
                     break
 
-                grad_full = torch.zeros_like(x_adv)
-                grad_working = gradient_fn(x_adv[working_examples])
-                grad_full[working_examples] = grad_working
-                grad = grad_full
+                # When only a subset of examples need processing
+                if working_examples.sum() < batch_size:
+                    # Create a subset of the current batch for examples still being optimized
+                    x_working = x_adv[working_examples]
+
+                    # Calculate gradient only for working examples
+                    grad_working = gradient_fn(x_working)
+
+                    # Count only the gradient computations for working examples
+                    gradient_calls += working_examples.sum().item()
+
+                    # Create full gradient tensor
+                    grad = torch.zeros_like(x_adv)
+
+                    # Update only the working examples
+                    grad[working_examples] = grad_working
+                else:
+                    # If all examples are being processed, compute gradient for all
+                    grad = gradient_fn(x_adv)
+                    # Count gradient calls for all examples in the batch
+                    gradient_calls += batch_size
             else:
                 grad = gradient_fn(x_adv)
-            gradient_calls += 1
+                # Count gradient calls for all examples in the batch
+                gradient_calls += batch_size
 
             # Step 3: Determine the step size for the current iteration.
             alpha = self._get_step_size(t)
-            # PGD update: take a step in the gradient direction.
-            # (Note: Depending on the loss formulation, the gradient direction may be ascent or descent.)
-            x_adv = x_adv + alpha * grad
+
+            # PGD update: take a step in the gradient direction or opposite direction
+            # Maximize: move in gradient direction (increase loss)
+            # Minimize: move in negative gradient direction (decrease loss)
+            if self.maximize:
+                x_adv = x_adv + alpha * grad
+            else:
+                x_adv = x_adv - alpha * grad
 
             # Step 4: Project the updated example back onto the eps-ball (and ensure valid pixel range).
             if x_original is not None:
@@ -163,7 +222,13 @@ class PGDOptimizer:
 
             # Step 5: Check for adversarial success.
             if success_fn is not None:
-                success = success_fn(x_adv)
+                new_success = success_fn(x_adv)
+                # Only update for examples that were not already successful
+                if self.early_stopping:
+                    success = success | new_success
+                else:
+                    success = new_success
+
                 if self.verbose and (t + 1) % 10 == 0:
                     success_rate = success.float().mean().item() * 100
                     print(
@@ -178,6 +243,9 @@ class PGDOptimizer:
             "time": total_time,
             "success_rate": (
                 success.float().mean().item() if success_fn is not None else 0.0
+            ),
+            "initial_success_rate": (
+                initial_success.float().mean().item() if success_fn is not None else 0.0
             ),
         }
 
