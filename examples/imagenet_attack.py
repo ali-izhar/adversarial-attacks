@@ -5,10 +5,29 @@ This script demonstrates how to generate adversarial examples using various
 attack methods on pretrained models with ImageNet images.
 
 Usage:
-    python imagenet_attack.py --method [cg|pgd|lbfgs] [--targeted] [--eps 1e-8] [--model resnet50]
+    # L2 norm attack with epsilon=1.0 (effective but imperceptible)
+    python imagenet_attack.py --model vgg16 --eps 1.0
+
+    # Linf norm attack with epsilon=0.05 (usually very effective)
+    python imagenet_attack.py --model vgg16 --norm Linf --eps 0.05
+
+    # Using margin loss (often more effective than cross-entropy)
+    python imagenet_attack.py --model vgg16 --loss_fn margin --eps 1.0
+
+    # Targeted attack (specify a target class instead of just any misclassification)
+    python imagenet_attack.py --model vgg16 --eps 1.0 --targeted
+
+    # FGSM attack (fast, single-step method)
+    python imagenet_attack.py --method fgsm --model vgg16 --norm Linf --eps 0.01
+
+    # DeepFool attack (produces minimal perturbations)
+    python imagenet_attack.py --method deepfool --model vgg16
+
+    # C&W attack (very effective but slower)
+    python imagenet_attack.py --method cw --model vgg16 --confidence 0.5
 
 Arguments:
-    --method: Attack method to use (pgd, cg, lbfgs)
+    --method: Attack method to use (pgd, cg, lbfgs, fgsm, deepfool, cw)
     --targeted: Use targeted attack (default: untargeted)
     --eps: Perturbation budget (epsilon) for the attack
     --norm: Norm to use for constraining perturbations (L2, Linf)
@@ -18,6 +37,11 @@ Arguments:
     --model: Model architecture to use (e.g., resnet50, vgg16, efficientnet_b0)
     --num-test-images: Number of images to search through for correctly classified ones
     --num-attack-images: Number of correctly classified images to attack
+    --loss_fn: Loss function to use for the attack
+    --alpha_init: Initial step size for PGD attack (default: 0.1 for Linf, eps/10 for L2)
+    --alpha_type: Step size schedule type (constant, diminishing)
+    --confidence: Confidence parameter for C&W attack (higher = stronger adversarial examples)
+    --enhancement-factor: Factor to enhance perturbations for visualization
 """
 
 import os
@@ -25,7 +49,6 @@ import sys
 import torch
 import torchvision.transforms as transforms
 import argparse
-import random
 
 # Add the project root to the path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,6 +58,9 @@ if project_root not in sys.path:
 from src.attacks.attack_pgd import PGD
 from src.attacks.attack_cg import ConjugateGradient
 from src.attacks.attack_lbfgs import LBFGS
+from src.attacks.attack_fgsm import FGSM
+from src.attacks.attack_deepfool import DeepFool
+from src.attacks.attack_cw import CW
 from src.datasets.imagenet import get_dataset, get_dataloader
 from src.models.wrappers import get_model
 from examples.plot import (
@@ -59,9 +85,9 @@ def parse_args():
     parser.add_argument(
         "--method",
         type=str,
-        choices=["pgd", "cg", "lbfgs"],
+        choices=["pgd", "cg", "lbfgs", "fgsm", "deepfool", "cw"],
         default="pgd",
-        help="Attack method to use (pgd, cg, lbfgs)",
+        help="Attack method to use (pgd, cg, lbfgs, fgsm, deepfool, cw)",
     )
     parser.add_argument(
         "--targeted",
@@ -71,7 +97,7 @@ def parse_args():
     parser.add_argument(
         "--eps",
         type=float,
-        default=1e-8,  # Extremely small epsilon for truly imperceptible perturbations
+        default=1.0,  # Much higher epsilon for effective attack
         help="Perturbation budget (epsilon) for the attack",
     )
     parser.add_argument(
@@ -79,7 +105,7 @@ def parse_args():
         type=str,
         choices=["L2", "Linf"],
         default="L2",
-        help="Norm to use for constraining perturbations",
+        help="Norm to use for constraining perturbations (L2: 0.5-5.0 recommended, Linf: 0.01-0.1 recommended)",
     )
     parser.add_argument(
         "--iterations", type=int, default=100, help="Number of optimization iterations"
@@ -104,7 +130,7 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        default="mobilenet_v3_large",
+        default="resnet50",
         help="Model architecture to use (e.g., resnet50, vgg16, efficientnet_b0)",
     )
     parser.add_argument(
@@ -118,6 +144,38 @@ def parse_args():
         type=int,
         default=5,
         help="Number of correctly classified images to attack",
+    )
+    parser.add_argument(
+        "--loss_fn",
+        type=str,
+        choices=["cross_entropy", "margin"],
+        default="cross_entropy",
+        help="Loss function to use for the attack",
+    )
+    parser.add_argument(
+        "--alpha_init",
+        type=float,
+        default=None,  # Will be set based on epsilon if None
+        help="Initial step size for PGD attack (default: 0.1 for Linf, eps/10 for L2)",
+    )
+    parser.add_argument(
+        "--alpha_type",
+        type=str,
+        choices=["constant", "diminishing"],
+        default="constant",
+        help="Step size schedule type",
+    )
+    parser.add_argument(
+        "--confidence",
+        type=float,
+        default=0.0,
+        help="Confidence parameter for C&W attack (higher = stronger adversarial examples)",
+    )
+    parser.add_argument(
+        "--enhancement-factor",
+        type=int,
+        default=10,
+        help="Factor to enhance perturbations for visualization (lower = more realistic)",
     )
 
     return parser.parse_args()
@@ -230,19 +288,29 @@ def create_attack(model, method, args):
         "norm": args.norm,
         "eps": args.eps,
         "targeted": args.targeted,
-        "n_iterations": args.iterations,
+        "loss_fn": args.loss_fn,
         "verbose": True,
+        "device": DEVICE,
     }
 
     if method == "pgd":
+        # Set default alpha_init based on norm if not specified
+        alpha_init = args.alpha_init
+        if alpha_init is None:
+            if args.norm == "Linf":
+                alpha_init = 0.01  # Default step size for Linf
+            else:
+                alpha_init = args.eps / 10  # Default step size for L2
+
         # PGD-specific parameters
         attack_params = {
             **common_params,
-            "alpha_init": args.eps / 10,  # Step size based on epsilon
-            "alpha_type": "diminishing",
+            "alpha_init": alpha_init,
+            "alpha_type": args.alpha_type,
             "rand_init": True,
-            "init_std": args.eps / 100,  # Even smaller init noise
+            "init_std": args.eps / 20,  # Bigger initialization
             "early_stopping": True,
+            "n_iterations": args.iterations,
         }
         attack = PGD(**attack_params)
 
@@ -255,6 +323,7 @@ def create_attack(model, method, args):
             "backtracking_factor": 0.7,
             "sufficient_decrease": 1e-4,
             "early_stopping": True,
+            "n_iterations": args.iterations,
         }
         attack = ConjugateGradient(**attack_params)
 
@@ -267,8 +336,49 @@ def create_attack(model, method, args):
             "initial_step": 0.1,
             "rand_init": False,
             "early_stopping": True,
+            "n_iterations": args.iterations,
         }
         attack = LBFGS(**attack_params)
+
+    elif method == "fgsm":
+        # FGSM-specific parameters (simple, only needs epsilon)
+        attack_params = {
+            **common_params,
+            "clip_min": 0.0,
+            "clip_max": 1.0,
+        }
+        attack = FGSM(**attack_params)
+
+    elif method == "deepfool":
+        # DeepFool-specific parameters
+        attack_params = {
+            "model": model,
+            "norm": args.norm,
+            "num_classes": 1000,  # ImageNet has 1000 classes
+            "overshoot": 0.02,
+            "max_iter": 50,
+            "verbose": True,
+            "device": DEVICE,
+        }
+        attack = DeepFool(**attack_params)
+
+    elif method == "cw":
+        # C&W-specific parameters
+        attack_params = {
+            "model": model,
+            "confidence": args.confidence,
+            "c_init": 0.1,
+            "max_iter": 500,
+            "binary_search_steps": 5,
+            "learning_rate": 0.01,
+            "targeted": args.targeted,
+            "abort_early": True,
+            "clip_min": 0.0,
+            "clip_max": 1.0,
+            "verbose": True,
+            "device": DEVICE,
+        }
+        attack = CW(**attack_params)
 
     else:
         raise ValueError(f"Unknown attack method: {method}")
@@ -499,7 +609,7 @@ def main():
         adv_predictions,
         args.method,
         args.targeted,
-        10,  # Higher enhancement factor for very small perturbations
+        args.enhancement_factor,
         output_dir,
         len(images),
         class_names,
