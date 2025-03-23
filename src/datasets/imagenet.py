@@ -19,7 +19,7 @@ from typing import Tuple, Optional, List, Callable
 import torch
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 
 class ImageNetDataset(Dataset):
@@ -46,6 +46,11 @@ class ImageNetDataset(Dataset):
             data_dir: Base directory for the dataset (e.g., 'data/imagenet/').
             transform: Transformation to apply to images (if None, a default transform is used).
             max_samples: Maximum number of samples to load (useful for quick tests).
+
+        Raises:
+            FileNotFoundError: If required files/directories are not found.
+            IndexError: If the class names file is empty.
+            ValueError: If other validation issues occur.
         """
         self.data_dir = data_dir
         self.transform = transform
@@ -67,13 +72,26 @@ class ImageNetDataset(Dataset):
             )
 
     def load_class_names(self):
-        """Load class names from a file 'imagenet_classes.txt' located in the data directory."""
+        """
+        Load class names from a file 'imagenet_classes.txt' located in the data directory.
+
+        Raises:
+            FileNotFoundError: If the class file doesn't exist.
+            IndexError: If the class file is empty.
+        """
         class_file = os.path.join(self.data_dir, "imagenet_classes.txt")
 
         if os.path.exists(class_file):
             with open(class_file, "r") as f:
                 # Each line is expected to contain one class name.
-                self.class_names = [line.strip() for line in f.readlines()]
+                self.class_names = [
+                    line.strip() for line in f.readlines() if line.strip()
+                ]
+
+            # Check if the class file is empty
+            if not self.class_names:
+                raise IndexError(f"Class names file '{class_file}' is empty.")
+
             # Create a mapping from class name to index for later use.
             self.class_to_idx = {name: i for i, name in enumerate(self.class_names)}
         else:
@@ -96,6 +114,9 @@ class ImageNetDataset(Dataset):
             A list of tuples where each tuple contains:
               - image_path (str): The path to the image file.
               - label (int): The associated class label.
+
+        Raises:
+            FileNotFoundError: If the image directory doesn't exist.
         """
         # Assume images are stored under a 'sample_images' subdirectory.
         img_dir = os.path.join(self.data_dir, "sample_images")
@@ -141,6 +162,10 @@ class ImageNetDataset(Dataset):
                     label = 0
 
                 image_paths.append((img_path, label))
+
+            # Validate there's at least one image
+            if not image_paths:
+                print(f"Warning: No images found in directory {img_dir}")
         else:
             raise FileNotFoundError(f"Image directory not found at {img_dir}")
 
@@ -165,6 +190,10 @@ class ImageNetDataset(Dataset):
             A tuple (image, label) where:
               - image is a transformed tensor.
               - label is an integer representing the class.
+
+        Note:
+            For corrupt images, we return a black tensor with the top-left
+            pixel set to a special value (-1,-1,-1) to mark it as corrupt.
         """
         img_path, label = self.image_paths[idx]
         try:
@@ -174,10 +203,33 @@ class ImageNetDataset(Dataset):
             if self.transform:
                 img = self.transform(img)
             return img, label
-        except Exception as e:
+        except (UnidentifiedImageError, OSError, IOError) as e:
+            # More specific handling of image loading failures
             print(f"Error loading image {img_path}: {e}")
+            # Create a black image with the correct dimensions based on the transform
+            if self.transform:
+                # Use a simple black PIL image that will work with our transforms
+                temp_img = Image.new("RGB", (224, 224), color=0)
+                img_tensor = self.transform(temp_img)
+                # Mark this as corrupt by setting a special pixel pattern
+                # Set the top-left pixel to a special value (-1,-1,-1)
+                if img_tensor.shape[1] > 0 and img_tensor.shape[2] > 0:
+                    img_tensor[:, 0, 0] = -1.0
+                return img_tensor, label
+            else:
+                # Default size if no transform is specified
+                img_tensor = torch.zeros((3, 224, 224))
+                # Mark as corrupt with special pixel
+                img_tensor[:, 0, 0] = -1.0
+                return img_tensor, label
+        except Exception as e:
+            # Catch any other exceptions
+            print(f"Unexpected error loading image {img_path}: {e}")
             # Return a placeholder image (black image) if loading fails.
-            return torch.zeros((3, 224, 224)), label
+            img_tensor = torch.zeros((3, 224, 224))
+            # Mark as corrupt with special pixel
+            img_tensor[:, 0, 0] = -1.0
+            return img_tensor, label
 
 
 def get_dataset(
@@ -205,6 +257,7 @@ def get_dataset(
 
     Raises:
         ValueError: If the requested dataset is not supported.
+        FileNotFoundError: If the dataset directory cannot be found.
     """
     dataset_dir = os.path.join(data_dir, dataset_name)
 

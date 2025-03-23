@@ -32,7 +32,7 @@ if project_root not in sys.path:
 from src.attacks.attack_pgd import PGD
 from src.attacks.attack_cg import ConjugateGradient
 from src.attacks.attack_lbfgs import LBFGS
-from src.datasets.loader import get_dataset, get_dataloader
+from src.datasets.imagenet import get_dataset, get_dataloader
 from examples.plot import (
     visualize_results,
     visualize_perturbations,
