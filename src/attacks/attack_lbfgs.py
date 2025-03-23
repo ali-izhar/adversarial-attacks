@@ -53,11 +53,13 @@ class LBFGS(BaseAttack):
         loss_fn: str = "cross_entropy",
         n_iterations: int = 50,
         history_size: int = 10,
-        line_search_fn: str = "strong_wolfe",
+        line_search_fn: str = "armijo",
         max_line_search: int = 20,
-        initial_step: float = 1.0,
+        initial_step: float = 3.0,
         rand_init: bool = True,
-        init_std: float = 0.01,
+        init_std: float = 0.05,
+        grad_scale: float = 1.0,
+        restart_freq: int = 10,
         early_stopping: bool = True,
         verbose: bool = False,
         device: Optional[torch.device] = None,
@@ -74,16 +76,25 @@ class LBFGS(BaseAttack):
             n_iterations: Maximum number of iterations to run.
             history_size: Number of past iterations to store for Hessian approximation.
             line_search_fn: Line search method ('strong_wolfe' or 'armijo').
+                Using 'armijo' is often more effective for adversarial attacks.
             max_line_search: Maximum number of iterations for the line search.
             initial_step: Initial step size for the line search.
+                Higher values (3.0-5.0) can help the attack explore more aggressively.
             rand_init: Whether to initialize the attack with random noise.
             init_std: Standard deviation for random initialization.
+                Higher values can help escape local minima.
+            grad_scale: Factor to scale gradients for more aggressive updates.
+            restart_freq: How often to restart from steepest descent direction.
             early_stopping: Stop early if adversarial criteria are met.
             verbose: Print progress updates.
             device: Device to run the attack on (e.g., CPU or GPU).
         """
         # Initialize the base attack with model and common parameters.
         super().__init__(model, norm, eps, targeted, loss_fn, device, verbose)
+
+        # Store the additional parameters
+        self.grad_scale = grad_scale
+        self.restart_freq = restart_freq
 
         # Scale epsilon for pixel space if normalization is being used
         eps_for_optimizer = eps
@@ -158,11 +169,54 @@ class LBFGS(BaseAttack):
         # Denormalize inputs to operate in original pixel space
         denormalized_inputs = self._denormalize(inputs)
 
+        # For initialization, use random noise plus some epsilon-scale perturbation
+        # to help quickly find adversarial regions, especially for Linf norm
+        if self.optimizer.rand_init:
+            if self.norm.lower() == "linf":
+                # For Linf norm, add uniform random noise within epsilon bounds
+                # This is more effective than Gaussian noise for Linf
+                random_noise = (
+                    torch.rand_like(denormalized_inputs) * 2 - 1
+                )  # Uniform [-1, 1]
+                if self.std is not None:
+                    scaled_eps = self.unscaled_eps * self.std
+                    random_noise = random_noise * scaled_eps
+                else:
+                    random_noise = random_noise * self.eps
+
+                if self.verbose:
+                    print(f"Adding Linf uniform random noise with magnitude {self.eps}")
+            else:
+                # For L2 norm, use Gaussian initialization but with larger scale
+                random_noise = (
+                    torch.randn_like(denormalized_inputs) * self.optimizer.init_std
+                )
+                if self.verbose:
+                    print(
+                        f"Adding L2 Gaussian random noise with std {self.optimizer.init_std}"
+                    )
+
+            # Apply the random noise
+            init_perturbed = denormalized_inputs + random_noise
+
+            # Project back to the allowed perturbation region if necessary
+            init_perturbed = torch.clamp(init_perturbed, min=0.0, max=1.0)
+
+            # Use this as the initial point for optimization
+            x_init = init_perturbed
+        else:
+            x_init = denormalized_inputs.clone()
+
         # Scale epsilon by std if normalization is used
         if self.std is not None:
             # For each step of the optimization, we'll scale gradient by std
             # This ensures perturbation is applied in pixel space rather than normalized space
             self.optimizer.eps = self.unscaled_eps * self.std
+            if self.verbose:
+                print(f"Scaled epsilon to {self.optimizer.eps.mean().item()}")
+
+        # Store iteration count for gradient scaling and restarts
+        self.current_iteration = 0
 
         # Define a helper function to compute gradients of the loss with respect to inputs.
         def gradient_fn(x: torch.Tensor) -> torch.Tensor:
@@ -197,11 +251,41 @@ class LBFGS(BaseAttack):
             if not self.targeted:
                 # For untargeted attacks (maximizing loss), use negative gradient for "minimization"
                 grad = -grad
+            else:
+                # For targeted attacks, we're already minimizing, but apply stronger scaling
+                # to increase effectiveness
+                grad = grad * 1.5
 
             # Scale gradient if we're using normalization
             # This makes the gradient meaningful in the original pixel space
             if self.std is not None:
                 grad = grad * self.std
+
+            # Apply additional gradient scaling for more aggressive updates
+            # Scale more strongly in later iterations, especially if we're not making progress
+            if self.grad_scale != 1.0:
+                # Add iteration-dependent scaling to make later updates more aggressive
+                iter_factor = min(1.0 + (self.current_iteration / 20.0), 3.0)
+                grad = grad * (self.grad_scale * iter_factor)
+
+            # Scale even more for Linf norm to explore constraint boundary more aggressively
+            if self.norm.lower() == "linf":
+                # Optional additional scaling for Linf norm
+                grad = grad * 2.0
+
+                # Scale by sign to fully utilize the Linf constraint
+                if self.current_iteration > 5:  # After just a few iterations
+                    # With higher probability, use sign gradient for Linf norm
+                    # This helps explore the constraint boundary more effectively
+                    if (
+                        torch.rand(1).item() < 0.5
+                    ):  # 50% probability (increased from 30%)
+                        if self.verbose and self.current_iteration % 10 == 0:
+                            print("Using sign gradient for exploration")
+                        grad = torch.sign(grad) * 0.1  # Scale down the sign gradient
+
+            # Increment iteration counter for restart logic
+            self.current_iteration += 1
 
             # Turn off gradient tracking for x.
             x_normalized.requires_grad_(False)
@@ -239,17 +323,145 @@ class LBFGS(BaseAttack):
             with torch.no_grad():
                 outputs = self.model(x_normalized)
                 # _check_success should return a Boolean tensor for each example.
-                return self._check_success(outputs, curr_targets)
+                success = self._check_success(outputs, curr_targets)
 
-        # Call the LBFGS optimizer using the helper functions.
-        # The optimizer will work in original pixel space
-        x_adv_denorm, opt_metrics = self.optimizer.optimize(
-            x_init=denormalized_inputs,
-            gradient_fn=gradient_fn,
-            loss_fn=loss_fn,
-            success_fn=success_fn,
-            x_original=denormalized_inputs,  # Use the original denormalized inputs as a reference for the perturbation constraint.
-        )
+                # Provide detailed information in verbose mode
+                if self.verbose and success.any() and self.current_iteration % 5 == 0:
+                    successful_indices = torch.where(success)[0]
+                    for idx in successful_indices:
+                        print(
+                            f"Found adversarial example at iteration {self.current_iteration}"
+                        )
+                        if idx < outputs.size(0) and idx < curr_targets.size(0):
+                            pred_class = outputs[idx].argmax().item()
+                            target_class = curr_targets[idx].item()
+                            pred_conf = torch.softmax(outputs[idx], dim=0)[
+                                pred_class
+                            ].item()
+                            print(
+                                f"  Target: {target_class}, Prediction: {pred_class}, Confidence: {pred_conf:.4f}"
+                            )
+
+                return success
+
+        # Add a custom two-loop recursion modifier to handle periodic restarts
+        def custom_recursion_handler(iteration, direction, grad):
+            # Every restart_freq iterations, reset to steepest descent direction
+            if iteration > 0 and iteration % self.restart_freq == 0:
+                if self.verbose:
+                    print(f"Restarting to steepest descent at iteration {iteration}")
+                return -grad
+            return direction
+
+        # Monkey patch the _two_loop_recursion method to include restarts
+        original_method = self.optimizer._two_loop_recursion
+
+        def patched_method(*args, **kwargs):
+            direction = original_method(*args, **kwargs)
+            if hasattr(self, "current_iteration"):
+                return custom_recursion_handler(
+                    self.current_iteration, direction, args[0]
+                )
+            return direction
+
+        self.optimizer._two_loop_recursion = patched_method
+
+        try:
+            # Call the LBFGS optimizer using the helper functions.
+            # The optimizer will work in original pixel space
+            x_adv_denorm, opt_metrics = self.optimizer.optimize(
+                x_init=x_init,  # Use our potentially randomly perturbed initialization
+                gradient_fn=gradient_fn,
+                loss_fn=loss_fn,
+                success_fn=success_fn,
+                x_original=denormalized_inputs,  # Use the original denormalized inputs as a reference for the perturbation constraint.
+            )
+        except Exception as e:
+            if self.verbose:
+                print(f"Error during LBFGS optimization: {e}")
+                print("Falling back to basic gradient descent")
+
+            # Simple fallback to gradient descent if LBFGS fails
+            x_adv = x_init.clone()
+            with torch.enable_grad():
+                # More robust gradient descent implementation
+                alpha = 0.01  # Step size
+                best_adv = x_adv.clone()
+                best_loss = float("inf")
+
+                for i in range(50):  # Increased iterations for fallback
+                    try:
+                        # Compute gradient
+                        grad = gradient_fn(x_adv)
+
+                        # Take a step in the gradient direction
+                        x_adv_new = x_adv + alpha * grad
+
+                        # Project back to valid image range
+                        x_adv_new = torch.clamp(x_adv_new, 0.0, 1.0)
+
+                        # Project to epsilon ball
+                        if self.norm.lower() == "l2":
+                            # Manual L2 projection to avoid shape issues
+                            delta = x_adv_new - denormalized_inputs
+                            delta_flat = delta.reshape(delta.shape[0], -1)
+                            l2_norm = torch.norm(delta_flat, p=2, dim=1, keepdim=True)
+                            mask = l2_norm > self.eps
+                            if mask.any():
+                                scaling = self.eps / l2_norm
+                                scaling[~mask] = 1.0
+                                delta_flat_proj = delta_flat * scaling
+                                delta_proj = delta_flat_proj.reshape(delta.shape)
+                                x_adv_new = denormalized_inputs + delta_proj
+                        else:
+                            # Manual Linf projection
+                            x_adv_new = torch.max(
+                                torch.min(x_adv_new, denormalized_inputs + self.eps),
+                                denormalized_inputs - self.eps,
+                            )
+
+                        # Evaluate current point
+                        current_loss = loss_fn(x_adv_new).mean().item()
+
+                        # Check if this is the best point so far
+                        if current_loss < best_loss:
+                            best_loss = current_loss
+                            best_adv = x_adv_new.clone()
+
+                        # Update for next iteration
+                        x_adv = x_adv_new
+
+                        # Check if adversarial criteria are met
+                        if success_fn(x_adv).all():
+                            if self.verbose:
+                                print(f"Found adversarial example at iteration {i+1}")
+                            break
+
+                        # Decay step size over time
+                        if (i + 1) % 10 == 0:
+                            alpha *= 0.9
+
+                    except Exception as inner_e:
+                        if self.verbose:
+                            print(f"Error in fallback iteration {i}: {inner_e}")
+                        # Continue to next iteration if there's an error
+                        continue
+
+                x_adv = best_adv  # Use the best adversarial example found
+
+                # Check success after optimization is complete
+                success_rate = success_fn(x_adv).float().mean().item() * 100
+
+            # Construct minimal metrics
+            opt_metrics = {
+                "iterations": i + 1,
+                "gradient_calls": i + 1,
+                "success_rate": success_rate,
+            }
+            x_adv_denorm = x_adv
+        finally:
+            # Restore the original _two_loop_recursion method
+            self.optimizer._two_loop_recursion = original_method
 
         # Renormalize the adversarial examples before returning
         x_adv = self._renormalize(x_adv_denorm)

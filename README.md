@@ -10,6 +10,30 @@ Adversarial examples are carefully crafted perturbations that, when added to an 
 2. Conjugate Gradient Method (CG)
 3. Limited-memory BFGS (L-BFGS)
 
+## Recommended Attack Methods
+
+Based on extensive testing, the following attack methods are recommended:
+
+1. **C&W (Carlini & Wagner)**: Most reliable attack with high success rates. Use with increased confidence parameter (10.0) and learning rate (0.05) for best results.
+   ```bash
+   python demo.py --method cw --confidence 10 --learning-rate 0.05 --c-init 0.1 --steps 500
+   ```
+
+2. **PGD (Projected Gradient Descent)**: Good balance between efficiency and effectiveness. Works well with both L2 and Linf norms.
+   ```bash
+   python demo.py --method pgd --epsilon 0.05 --norm Linf --steps 100
+   ```
+
+3. **L-BFGS**: More effective with L2 norm than Linf. Consider using strong_wolfe line search and higher initial step size.
+   ```bash
+   python demo.py --method lbfgs --epsilon 0.3 --norm L2 --line-search-fn strong_wolfe
+   ```
+
+4. **FGSM/FFGSM**: Fastest but least effective. Good for quick testing.
+   ```bash
+   python demo.py --method ffgsm --epsilon 0.1
+   ```
+
 ## Repository Structure
 
 ```

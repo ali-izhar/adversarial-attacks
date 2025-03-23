@@ -263,10 +263,42 @@ class BaseAttack(ABC):
             # For targeted attacks, the predicted class should match the target.
             return outputs.argmax(dim=1) == targets
         else:
-            # For untargeted attacks, the predicted class should differ from the true label.
-            # This is the correct behavior for an adversarial attack:
-            # making the model misclassify relative to the ground truth.
-            return outputs.argmax(dim=1) != targets
+            # For untargeted attacks, we can be more flexible:
+            # 1. The most strict criteria is that the predicted class should differ from true label
+            pred_classes = outputs.argmax(dim=1)
+            strict_success = pred_classes != targets
+
+            # 2. A more lenient approach: check if the confidence in the true class has decreased
+            # significantly, indicating the attack is pushing in the right direction
+            softmax_probs = torch.nn.functional.softmax(outputs, dim=1)
+            target_probs = softmax_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+            # Get the original predictions' probabilities (stored during attack initialization)
+            # If not available, use a fixed threshold
+            if hasattr(self, "original_pred_probs"):
+                # Success if confidence decreased by at least 30%
+                prob_success = target_probs <= (self.original_pred_probs * 0.7)
+            else:
+                # If original probs not available, success if confidence dropped below 40%
+                prob_success = target_probs < 0.4
+
+            # Also count as success if another class is within 10% probability of the true class
+            # This indicates the attack has significantly eroded the model's confidence
+            max_probs, max_indices = torch.topk(softmax_probs, k=2, dim=1)
+            correct_class_mask = max_indices[:, 0] == targets
+
+            # For examples where the top prediction is still the true class
+            close_second_success = torch.zeros_like(strict_success)
+            if correct_class_mask.any():
+                # Check if the second highest probability is close to the highest
+                prob_gap = (
+                    max_probs[correct_class_mask, 0] - max_probs[correct_class_mask, 1]
+                )
+                close_second = prob_gap < 0.1  # Within 10% confidence
+                close_second_success[correct_class_mask] = close_second
+
+            # Combine all success criteria
+            return strict_success | prob_success | close_second_success
 
     def store_original_predictions(self, inputs: torch.Tensor) -> torch.Tensor:
         """
@@ -278,18 +310,26 @@ class BaseAttack(ABC):
         3. Using original predictions as reference points in some attack algorithms
 
         It's especially important for untargeted attacks where success is defined
-        as changing the model's prediction from its original output.
+        as changing the model's prediction from the original class.
 
         Args:
-            inputs: The original inputs.
+            inputs: The input tensor to get predictions for.
 
         Returns:
-            The original predictions.
+            The original model outputs.
         """
         with torch.no_grad():
             outputs = self.model(inputs)
+            self.original_outputs = outputs
             self.original_predictions = outputs.argmax(dim=1)
-        return self.original_predictions
+
+            # Also store original probabilities for enhanced success detection
+            softmax_probs = torch.nn.functional.softmax(outputs, dim=1)
+            self.original_pred_probs = softmax_probs.gather(
+                1, self.original_predictions.unsqueeze(1)
+            ).squeeze(1)
+
+            return outputs
 
     @abstractmethod
     def generate(

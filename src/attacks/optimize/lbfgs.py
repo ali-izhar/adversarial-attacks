@@ -723,10 +723,15 @@ class LBFGSOptimizer:
             if success_fn is not None:
                 # Update success status for all examples
                 new_success = success_fn(x_adv)
-                # Only update for examples that were not already successful
-                if self.early_stopping:
+
+                # More conservative early stopping approach:
+                # For stronger L-BFGS attack, we don't stop immediately at first success
+                # We continue optimizing for at least 10 iterations even after success
+                # This allows potentially finding more robust adversarial examples
+                if self.early_stopping and iterations > 10:
                     success = success | new_success
                 else:
+                    # During initial iterations, just track success without stopping
                     success = new_success
 
                 if self.verbose and (t + 1) % 5 == 0:

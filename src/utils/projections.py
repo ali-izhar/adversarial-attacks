@@ -31,8 +31,11 @@ def project_l2_ball(delta: torch.Tensor, epsilon: float) -> torch.Tensor:
     Returns:
         Projected perturbation tensor
     """
+    # Store original shape for proper reshaping
+    original_shape = delta.shape
+
     # Flatten the tensor for norm calculation
-    flat_delta = delta.view(delta.shape[0], -1)
+    flat_delta = delta.reshape(delta.shape[0], -1)
 
     # Calculate the L2 norm of each perturbation
     l2_norm = torch.norm(flat_delta, p=2, dim=1, keepdim=True)
@@ -46,8 +49,8 @@ def project_l2_ball(delta: torch.Tensor, epsilon: float) -> torch.Tensor:
         scaling[~mask] = 1.0  # Only scale perturbations that exceed epsilon
         scaled_delta = flat_delta * scaling
 
-        # Reshape back to original shape
-        return scaled_delta.view(delta.shape)
+        # Reshape back to original shape using stored shape
+        return scaled_delta.reshape(original_shape)
 
     return delta
 

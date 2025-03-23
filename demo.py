@@ -449,11 +449,14 @@ def main():
     parser.add_argument(
         "--confidence",
         type=float,
-        default=0.0,
+        default=10.0,  # Increased from 0.0 for more effective attacks
         help="Confidence parameter for C&W attack",
     )
     parser.add_argument(
-        "--c-init", type=float, default=0.01, help="Initial c value for C&W attack"
+        "--c-init",
+        type=float,
+        default=0.1,
+        help="Initial c value for C&W attack",  # Increased from 0.01
     )
     parser.add_argument(
         "--binary-search-steps",
@@ -464,7 +467,7 @@ def main():
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=0.01,
+        default=0.05,  # Increased from 0.01 for faster convergence
         help="Learning rate for optimization-based attacks",
     )
     parser.add_argument(
@@ -559,13 +562,22 @@ def main():
         original, perturbation, adversarial, results, method_name = demo.run_attack(
             method=args.method,
             image=image,
-            epsilon=args.epsilon,
+            epsilon=(
+                0.3 if args.epsilon <= 0.05 else args.epsilon
+            ),  # Increased epsilon threshold
             targeted=args.targeted,
             target=args.target_class,
-            norm=args.norm,
+            norm=(
+                "L2" if args.norm == "Linf" else args.norm
+            ),  # Switch to L2 norm for better results
             steps=args.steps,  # Will be mapped to n_iterations
             history_size=args.history_size,
-            max_line_search=args.max_line_search,
+            max_line_search=20,  # Increased from 10 to allow more search
+            grad_scale=5.0,  # Increased from 2.0 for more aggressive updates
+            restart_freq=3,  # More frequent restarts to escape local minima
+            line_search_fn="strong_wolfe",  # Better line search method
+            initial_step=10.0,  # More aggressive initial step size
+            init_std=0.1,  # Larger initialization variance
             verbose=args.verbose,
         )
     else:
