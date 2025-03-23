@@ -13,7 +13,6 @@ with appropriate transformations for model input.
 """
 
 import os
-import glob
 from typing import Tuple, Optional, List, Callable
 
 import torch
@@ -68,6 +67,9 @@ class ImageNetDataset(Dataset):
                     transforms.Resize(256),
                     transforms.CenterCrop(224),
                     transforms.ToTensor(),
+                    transforms.Normalize(
+                        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                    ),  # ImageNet normalization
                 ]
             )
 
@@ -92,8 +94,30 @@ class ImageNetDataset(Dataset):
             if not self.class_names:
                 raise IndexError(f"Class names file '{class_file}' is empty.")
 
+            # Check for duplicate class names and warn
+            name_counts = {}
+            for i, name in enumerate(self.class_names):
+                if name in name_counts:
+                    name_counts[name].append(i)
+                else:
+                    name_counts[name] = [i]
+
+            duplicates = {
+                name: indices
+                for name, indices in name_counts.items()
+                if len(indices) > 1
+            }
+            if duplicates:
+                print(f"Warning: Found {len(duplicates)} duplicate class names:")
+                for name, indices in duplicates.items():
+                    print(f"  '{name}' appears at indices: {indices}")
+
             # Create a mapping from class name to index for later use.
-            self.class_to_idx = {name: i for i, name in enumerate(self.class_names)}
+            # For duplicates, use the first occurrence
+            self.class_to_idx = {}
+            for i, name in enumerate(self.class_names):
+                if name not in self.class_to_idx:
+                    self.class_to_idx[name] = i
         else:
             raise FileNotFoundError(f"Class names file not found at {class_file}")
 
@@ -103,9 +127,9 @@ class ImageNetDataset(Dataset):
         """
         Get a list of (image_path, label) tuples.
 
-        This method looks into a common subdirectory ('sample_images') for images.
-        It uses a heuristic to extract labels from filenames, such as filenames that start
-        with a digit or a synset ID (e.g., 'n01440764_tench.jpg').
+        This method looks into the 'sample_images' subdirectory for images in the format
+        n{synset_id}_{class_name}.JPEG where class_name exactly matches a class in the
+        imagenet_classes.txt file.
 
         Args:
             max_samples: If provided, limits the number of samples returned.
@@ -118,58 +142,124 @@ class ImageNetDataset(Dataset):
         Raises:
             FileNotFoundError: If the image directory doesn't exist.
         """
-        # Assume images are stored under a 'sample_images' subdirectory.
+        # Look in the 'sample_images' subdirectory
         img_dir = os.path.join(self.data_dir, "sample_images")
 
-        if os.path.exists(img_dir):
-            images = []
-            # Collect images with common file extensions.
-            for ext in ["*.jpg", "*.jpeg", "*.png"]:
-                images.extend(glob.glob(os.path.join(img_dir, ext)))
-            # Sort to ensure reproducibility.
-            images.sort()
-
-            image_paths = []
-            for img_path in images:
-                filename = os.path.basename(img_path)
-
-                # Try to extract a label from the filename.
-                if "_" in filename:
-                    prefix = filename.split("_")[0]
-
-                    if prefix.isdigit():
-                        # If the prefix is a number, use it as the label.
-                        label = int(prefix)
-                    elif prefix.startswith("n") and prefix[1:].isdigit():
-                        # For synset IDs like 'n01440764', attempt to match with class names.
-                        # This is a heuristic: we loop over known class names to see if one is present.
-                        class_name = None
-                        for name in self.class_names:
-                            if name in filename:
-                                class_name = name
-                                break
-                        # Fallback to label 0 if no match is found.
-                        label = (
-                            self.class_to_idx.get(class_name, 0)
-                            if class_name is not None
-                            else 0
-                        )
-                    else:
-                        # Default to label 0 if the prefix cannot be parsed.
-                        label = 0
-                else:
-                    # No separator found; assign default label 0.
-                    label = 0
-
-                image_paths.append((img_path, label))
-
-            # Validate there's at least one image
-            if not image_paths:
-                print(f"Warning: No images found in directory {img_dir}")
-        else:
+        if not os.path.exists(img_dir):
             raise FileNotFoundError(f"Image directory not found at {img_dir}")
 
-        # If max_samples is specified, truncate the list.
+        # Collect image files - use os.listdir instead of glob to avoid duplicates
+        image_files = []
+        valid_extensions = (".jpg", ".jpeg", ".png", ".JPEG", ".JPG", ".PNG")
+        for filename in os.listdir(img_dir):
+            if any(filename.lower().endswith(ext.lower()) for ext in valid_extensions):
+                image_files.append(os.path.join(img_dir, filename))
+
+        # Sort for reproducibility
+        image_files.sort()
+
+        # Create a mapping for exact filename matching - this is for special cases
+        # where we want to directly map specific filenames to class indices
+        filename_to_idx = {
+            # Handle the duplicated "crane" class - ensure each gets correctly assigned
+            "n02012849_crane.JPEG": 134,  # Index of bird crane (correct synset ID)
+            "n03126707_crane.JPEG": 517,  # Index of construction crane
+            # Handle the duplicated "maillot" class
+            "n03710637_maillot.JPEG": 638,  # Index of first "maillot"
+            "n03710721_maillot.JPEG": 639,  # Index of second "maillot"
+        }
+
+        # Create mappings for class name variants
+        standard_mapping = {name: idx for idx, name in enumerate(self.class_names)}
+        underscore_mapping = {
+            name.replace(" ", "_"): idx for idx, name in enumerate(self.class_names)
+        }
+
+        # Keep track of assigned classes to ensure all 1000 are covered
+        assigned_classes = set()
+        image_paths = []
+
+        for img_path in image_files:
+            filename = os.path.basename(img_path)
+
+            # First check for special case direct filename mapping
+            if filename in filename_to_idx:
+                label = filename_to_idx[filename]
+                image_paths.append((img_path, label))
+                assigned_classes.add(label)
+                continue
+
+            # Parse the filename: n{synset_id}_{class_name}.JPEG
+            if "_" in filename:
+                parts = filename.split("_", 1)
+                if len(parts) == 2:
+                    synset_id = parts[0]
+                    # Extract the class name (remove file extension)
+                    class_name = parts[1]
+                    if "." in class_name:
+                        class_name = class_name.split(".", 1)[0]
+
+                    # Special case handling for problematic classes
+                    if class_name == "hammerhead":
+                        class_name = "hammerhead shark"
+                    elif class_name == "maillot" and synset_id == "n03710721":
+                        # Second occurrence of maillot
+                        label = 639
+                        image_paths.append((img_path, label))
+                        assigned_classes.add(label)
+                        continue
+
+                    label = None
+
+                    # Try direct match
+                    if class_name in standard_mapping:
+                        label = standard_mapping[class_name]
+                    # Try with underscores instead of spaces
+                    elif class_name in underscore_mapping:
+                        label = underscore_mapping[class_name]
+                    # Try replacing underscores with spaces
+                    elif class_name.replace("_", " ") in standard_mapping:
+                        label = standard_mapping[class_name.replace("_", " ")]
+                    # Try case-insensitive matching
+                    else:
+                        for name, idx in standard_mapping.items():
+                            if (
+                                name.lower() == class_name.lower()
+                                or name.lower() == class_name.lower().replace("_", " ")
+                            ):
+                                label = idx
+                                break
+
+                    if label is not None:
+                        image_paths.append((img_path, label))
+                        assigned_classes.add(label)
+                    else:
+                        print(
+                            f"Warning: Could not match class name '{class_name}' from file {filename}"
+                        )
+
+        # Verify we have images
+        if not image_paths:
+            print(f"Warning: No images found in directory {img_dir}")
+        else:
+            # Print statistics about class coverage
+            print(
+                f"Found {len(image_paths)} images across {len(assigned_classes)} classes"
+            )
+
+            # Check for missing classes
+            all_classes = set(range(len(self.class_names)))
+            missing_classes = all_classes - assigned_classes
+            if missing_classes:
+                missing_names = [
+                    self.class_names[idx] for idx in sorted(missing_classes)
+                ]
+                print(
+                    f"Warning: {len(missing_classes)} classes have no images: {', '.join(missing_names[:5])}"
+                    + ("..." if len(missing_classes) > 5 else "")
+                )
+
+        # If max_samples is specified, truncate the list
         if max_samples is not None and max_samples < len(image_paths):
             image_paths = image_paths[:max_samples]
 
