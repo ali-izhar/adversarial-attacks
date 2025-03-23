@@ -42,19 +42,41 @@ def compare_norms(images, adv_images):
     # Reshape to (batch_size, -1) for norm calculations
     perturbation_flat = perturbation.reshape(batch_size, -1)
 
+    # Get total dimensions for proper scaling
+    total_dims = perturbation_flat.shape[1]  # For ImageNet, this is ~150K dimensions
+
     # Calculate L0 norm (number of changed pixels)
     l0_norm = (perturbation_flat.abs() > 1e-5).float().sum(dim=1)
+
+    # Calculate percentage of pixels changed
+    l0_percent = l0_norm / total_dims * 100
 
     # Calculate L1 norm (sum of absolute values)
     l1_norm = perturbation_flat.abs().sum(dim=1)
 
+    # Calculate average L1 per dimension
+    l1_avg = l1_norm / total_dims
+
     # Calculate L2 norm (Euclidean distance)
     l2_norm = torch.norm(perturbation_flat, dim=1, p=2)
+
+    # Calculate average L2 per dimension (root mean square)
+    l2_avg = l2_norm / torch.sqrt(
+        torch.tensor(total_dims, dtype=torch.float, device=l2_norm.device)
+    )
 
     # Calculate Linf norm (maximum absolute value)
     linf_norm = perturbation_flat.abs().max(dim=1)[0]
 
-    return {"L0": l0_norm, "L1": l1_norm, "L2": l2_norm, "Linf": linf_norm}
+    return {
+        "L0": l0_norm,
+        "L0_percent": l0_percent,
+        "L1": l1_norm,
+        "L1_avg": l1_avg,
+        "L2": l2_norm,
+        "L2_avg": l2_avg,
+        "Linf": linf_norm,
+    }
 
 
 def compute_perturbation_visualization(images, adv_images, factor=5):
@@ -227,9 +249,14 @@ def visualize_results(
                 # For targeted attacks, success is prediction = target class
                 success = adv_predictions[i] == targets[i]
             else:
-                # For untargeted attacks, success is original prediction ≠ adversarial prediction
-                # This checks if the prediction has changed, which is the goal
-                success = predictions[i] != adv_predictions[i]
+                # For untargeted attacks, success is based on the adversarial example being misclassified
+                # relative to the ground truth label (not the original prediction)
+                if predictions[i] == labels[i]:
+                    # If originally correct, success means now misclassified
+                    success = adv_predictions[i] != labels[i]
+                else:
+                    # If originally misclassified, success means changed prediction
+                    success = adv_predictions[i] != predictions[i]
 
             success_text = "Success" if success else "Failure"
             success_color = "green" if success else "red"
@@ -409,9 +436,14 @@ def visualize_perturbations(
                 # For targeted attacks, success is prediction = target class
                 success = adv_predictions[i] == targets[i]
             else:
-                # For untargeted attacks, success is original prediction ≠ adversarial prediction
-                # This checks if the prediction has changed, which is the goal
-                success = predictions[i] != adv_predictions[i]
+                # For untargeted attacks, success is based on the adversarial example being misclassified
+                # relative to the ground truth label (not the original prediction)
+                if predictions[i] == labels[i]:
+                    # If originally correct, success means now misclassified
+                    success = adv_predictions[i] != labels[i]
+                else:
+                    # If originally misclassified, success means changed prediction
+                    success = adv_predictions[i] != predictions[i]
 
             success_text = "Success" if success else "Failure"
             success_color = "green" if success else "red"

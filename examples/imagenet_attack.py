@@ -5,7 +5,7 @@ This script demonstrates how to generate adversarial examples using various
 attack methods on pretrained models with ImageNet images.
 
 Usage:
-    python imagenet_attack_example.py --method [cg|pgd|lbfgs] [--targeted] [--eps 0.5]
+    python imagenet_attack.py --method [cg|pgd|lbfgs] [--targeted] [--eps 1e-8] [--model resnet50]
 
 Arguments:
     --method: Attack method to use (pgd, cg, lbfgs)
@@ -15,14 +15,17 @@ Arguments:
     --iterations: Number of optimization iterations
     --output: Output directory for saving visualizations
     --show-norms: Display detailed norm analysis visualizations
+    --model: Model architecture to use (e.g., resnet50, vgg16, efficientnet_b0)
+    --num-test-images: Number of images to search through for correctly classified ones
+    --num-attack-images: Number of correctly classified images to attack
 """
 
 import os
 import sys
 import torch
 import torchvision.transforms as transforms
-import torchvision.models as models
 import argparse
+import random
 
 # Add the project root to the path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -33,6 +36,7 @@ from src.attacks.attack_pgd import PGD
 from src.attacks.attack_cg import ConjugateGradient
 from src.attacks.attack_lbfgs import LBFGS
 from src.datasets.imagenet import get_dataset, get_dataloader
+from src.models.wrappers import get_model
 from examples.plot import (
     visualize_results,
     visualize_perturbations,
@@ -44,7 +48,6 @@ from examples.plot import (
 
 # Configuration
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NUM_IMAGES = 5  # Number of images to attack
 IMAGENET_DATA_DIR = "data/imagenet"  # Path to ImageNet dataset
 
 
@@ -68,7 +71,7 @@ def parse_args():
     parser.add_argument(
         "--eps",
         type=float,
-        default=0.03,
+        default=1e-8,  # Extremely small epsilon for truly imperceptible perturbations
         help="Perturbation budget (epsilon) for the attack",
     )
     parser.add_argument(
@@ -79,7 +82,7 @@ def parse_args():
         help="Norm to use for constraining perturbations",
     )
     parser.add_argument(
-        "--iterations", type=int, default=40, help="Number of optimization iterations"
+        "--iterations", type=int, default=100, help="Number of optimization iterations"
     )
     parser.add_argument(
         "--output",
@@ -98,33 +101,59 @@ def parse_args():
         default=None,
         help="Maximum number of samples to load from dataset",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="mobilenet_v3_large",
+        help="Model architecture to use (e.g., resnet50, vgg16, efficientnet_b0)",
+    )
+    parser.add_argument(
+        "--num-test-images",
+        type=int,
+        default=50,
+        help="Number of images to search through for correctly classified ones",
+    )
+    parser.add_argument(
+        "--num-attack-images",
+        type=int,
+        default=5,
+        help="Number of correctly classified images to attack",
+    )
 
     return parser.parse_args()
 
 
-def load_model():
-    """Load a pretrained model with ImageNet weights."""
-    # Use a pretrained ResNet50 model
-    model = models.resnet50(pretrained=True)
-    model = model.to(DEVICE)
-    model.eval()  # Set to evaluation mode
-    return model
+def load_model(model_name):
+    """Load a model using the wrappers."""
+    try:
+        # Use the get_model factory function to create the specified model
+        model = get_model(model_name)
+        model.to(DEVICE)
+        model.eval()  # Set to evaluation mode
+        return model
+    except ValueError as e:
+        print(f"Error loading model: {e}")
+        print("Available models:")
+        print("  - ResNet: resnet18, resnet34, resnet50, resnet101, resnet152")
+        print("  - VGG: vgg11, vgg13, vgg16, vgg19")
+        print("  - EfficientNet: efficientnet_b0 through efficientnet_b7")
+        print("  - MobileNet: mobilenet_v3_large, mobilenet_v3_small")
+        sys.exit(1)
 
 
-def load_imagenet_data(max_samples=None):
+def load_imagenet_data(model, batch_size=1, shuffle=True, max_samples=None):
     """Load ImageNet sample images."""
-    # Define normalization for pretrained models
-    normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-    )
+    # Use the model's normalization parameters
+    mean = model.mean
+    std = model.std
 
-    # Create transform pipeline
+    # Create transform pipeline with model-specific normalization
     transform = transforms.Compose(
         [
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
-            normalize,
+            transforms.Normalize(mean=mean, std=std),
         ]
     )
 
@@ -137,22 +166,61 @@ def load_imagenet_data(max_samples=None):
             max_samples=max_samples,
         )
 
-        # Load just a few samples for visualization
+        # Load samples
         dataloader = get_dataloader(
-            dataset=dataset, batch_size=NUM_IMAGES, shuffle=True
+            dataset=dataset, batch_size=batch_size, shuffle=shuffle
         )
-
-        # Get a single batch
-        images, labels = next(iter(dataloader))
 
         # Load class names for display
         with open(os.path.join(IMAGENET_DATA_DIR, "imagenet_classes.txt"), "r") as f:
             class_names = [line.strip() for line in f.readlines()]
 
-        return images.to(DEVICE), labels.to(DEVICE), class_names
+        return dataloader, class_names
     except Exception as e:
         print(f"Error loading ImageNet data: {e}")
         raise
+
+
+def find_correctly_classified_images(model, dataloader, num_images, class_names):
+    """Find images that are correctly classified by the model."""
+    correctly_classified = []
+    tested_images = 0
+
+    print("Searching for correctly classified images...")
+
+    for images, labels in dataloader:
+        with torch.no_grad():
+            images = images.to(DEVICE)
+            labels = labels.to(DEVICE)
+            outputs = model(images)
+            predictions = outputs.argmax(dim=1)
+
+            # Check which images are correctly classified
+            correct_mask = predictions == labels
+
+            # For each correct image in this batch
+            for i in range(len(images)):
+                if correct_mask[i]:
+                    correctly_classified.append(
+                        (images[i].unsqueeze(0), labels[i].unsqueeze(0))
+                    )
+                    print(
+                        f"Found correctly classified image {len(correctly_classified)}: {class_names[labels[i]]}"
+                    )
+
+                    if len(correctly_classified) >= num_images:
+                        # Return the required number of images
+                        return correctly_classified
+
+        tested_images += len(images)
+        print(
+            f"Tested {tested_images} images, found {len(correctly_classified)} correctly classified"
+        )
+
+    print(
+        f"Warning: Only found {len(correctly_classified)} correctly classified images after testing {tested_images} images"
+    )
+    return correctly_classified
 
 
 def create_attack(model, method, args):
@@ -170,10 +238,10 @@ def create_attack(model, method, args):
         # PGD-specific parameters
         attack_params = {
             **common_params,
-            "alpha_init": 0.01,  # Smaller step size for ImageNet
+            "alpha_init": args.eps / 10,  # Step size based on epsilon
             "alpha_type": "diminishing",
             "rand_init": True,
-            "init_std": 0.01,
+            "init_std": args.eps / 100,  # Even smaller init noise
             "early_stopping": True,
         }
         attack = PGD(**attack_params)
@@ -236,9 +304,7 @@ def generate_adversarial_examples(
     return adv_images, metrics, targets
 
 
-def reverse_normalization(
-    images, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-):
+def reverse_normalization(images, mean, std):
     """
     Reverse the normalization for visualization.
 
@@ -271,17 +337,44 @@ def main():
     output_dir = args.output
 
     # Load model
-    print(f"Loading pretrained model...")
-    model = load_model()
+    print(f"Loading pretrained model: {args.model}...")
+    model = load_model(args.model)
 
-    # Load data
+    # Load data with model-specific normalization
     print(f"Loading ImageNet data...")
-    images, labels, class_names = load_imagenet_data(args.max_samples)
+    dataloader, class_names = load_imagenet_data(
+        model,
+        batch_size=args.num_test_images,
+        shuffle=True,
+        max_samples=args.max_samples,
+    )
 
-    # Get original predictions
+    # Find correctly classified images
+    correctly_classified = find_correctly_classified_images(
+        model, dataloader, args.num_attack_images, class_names
+    )
+
+    if not correctly_classified:
+        print("No correctly classified images found. Exiting.")
+        return
+
+    # Select the requested number of images
+    if len(correctly_classified) > args.num_attack_images:
+        correctly_classified = correctly_classified[: args.num_attack_images]
+
+    # Combine into batches
+    images = torch.cat([img for img, _ in correctly_classified], dim=0)
+    labels = torch.cat([lbl for _, lbl in correctly_classified], dim=0)
+
+    # Get original predictions (to verify they're correctly classified)
     with torch.no_grad():
         outputs = model(images)
         predictions = outputs.argmax(dim=1)
+
+    # Check that all selected images are correctly classified
+    assert torch.all(
+        predictions == labels
+    ), "Not all selected images are correctly classified!"
 
     # Create the attack
     print(f"Creating {args.method.upper()} attack...")
@@ -299,25 +392,18 @@ def main():
         adv_predictions = adv_outputs.argmax(dim=1)
 
     # Unnormalize images for visualization
-    orig_images_viz = reverse_normalization(images)
-    adv_images_viz = reverse_normalization(adv_images)
+    orig_images_viz = reverse_normalization(images, model.mean, model.std)
+    adv_images_viz = reverse_normalization(adv_images, model.mean, model.std)
 
     # Calculate perturbation norms (on normalized images)
     norms = compare_norms(images, adv_images)
 
     # Print results
     print("\nResults:")
+    print(f"Model: {args.model}")
     print(f"Attack method: {args.method.upper()}")
     print(f"Attack type: {'Targeted' if args.targeted else 'Untargeted'}")
-
-    # Get initial predictions to check which examples were already successful
-    initial_success = []
-    if args.targeted:
-        initial_success = [predictions[i] == targets[i] for i in range(len(images))]
-    else:
-        # For untargeted attacks, an example is initially successful if the model already misclassifies it
-        # That means prediction ≠ true label
-        initial_success = [predictions[i] != labels[i] for i in range(len(images))]
+    print(f"Epsilon (perturbation budget): {args.eps}")
 
     # Print individual results for diagnosis
     print("\nOriginal predictions vs true labels:")
@@ -327,86 +413,64 @@ def main():
             + ("(misclassified)" if predictions[i] != labels[i] else "(correct)")
         )
 
-    # Print how many samples were already successful initially
-    initial_success_count = sum(initial_success)
+    # Print information about the norms (in a more human-readable way)
+    print(f"\nPerturbation statistics:")
+    print(f"Average L2 Norm: {norms['L2'].mean().item():.6f}")
+    print(f"Average L2 per dimension (RMS): {norms['L2_avg'].mean().item():.8f}")
+    print(f"Average Linf Norm: {norms['Linf'].mean().item():.8f}")
     print(
-        f"Initially Successful Examples: {initial_success_count}/{len(images)} ({initial_success_count*100/len(images):.1f}%)"
+        f"Average percentage of pixels changed: {norms['L0_percent'].mean().item():.4f}%"
     )
 
-    # Print the "new" success rate (examples that weren't initially successful)
-    print(f"New Success Rate: {metrics['success_rate']:.1f}%")
-
-    # Add additional explanation for new success rate calculation
-    new_successes = 0
-    for i in range(len(images)):
-        if args.targeted:
-            if adv_predictions[i] == targets[i] and not initial_success[i]:
-                new_successes += 1
-        else:
-            if predictions[i] != adv_predictions[i] and not initial_success[i]:
-                new_successes += 1
-
-    # Calculate new success rate manually for verification
-    verified_new_success_rate = new_successes * 100.0 / len(images)
-    print(
-        f"Verified New Success Rate: {verified_new_success_rate:.1f}% ({new_successes}/{len(images)} examples)"
-    )
-
-    print(f"Average L2 Norm: {norms['L2'].mean().item():.4f}")
-    print(f"Average Linf Norm: {norms['Linf'].mean().item():.4f}")
-
-    # Calculate actual success rate from individual results
+    # Calculate actual success rate
     successful_attacks = 0
     total_attacks = len(images)
 
     # Show which images were successfully attacked
+    print("\nAttack results:")
     for i in range(total_attacks):
         if args.targeted:
             is_success = adv_predictions[i] == targets[i]
-            was_initial_success = initial_success[i]
             success_marker = "✓" if is_success else "✗"
-            success_type = ""
-            if is_success:
-                success_type = (
-                    " (initially successful)"
-                    if was_initial_success
-                    else " (NEW SUCCESS)"
-                )
+            success_type = " (SUCCESSFUL ATTACK)" if is_success else " (failed)"
 
             print(
                 f"Image {i+1}: {class_names[labels[i]]} → {class_names[adv_predictions[i]]} "
                 f"(Target: {class_names[targets[i]]}) "
-                f"(L2: {norms['L2'][i]:.4f}, Linf: {norms['Linf'][i]:.4f}) {success_marker}{success_type}"
+                f"(L2: {norms['L2'][i]:.6f}, RMS: {norms['L2_avg'][i]:.8f}, Linf: {norms['Linf'][i]:.6f}) {success_marker}{success_type}"
             )
             if is_success:
                 successful_attacks += 1
         else:
-            is_success = predictions[i] != adv_predictions[i]
-            was_initial_success = initial_success[i]
+            # For untargeted attacks on correctly classified images
+            is_success = (
+                adv_predictions[i] != labels[i]
+            )  # Success = misclassified after attack
             success_marker = "✓" if is_success else "✗"
-            success_type = ""
-            if is_success:
-                success_type = (
-                    " (initially successful)"
-                    if was_initial_success
-                    else " (NEW SUCCESS)"
-                )
+            success_type = (
+                " (SUCCESSFUL ATTACK)" if is_success else " (failed to misclassify)"
+            )
 
             print(
                 f"Image {i+1}: {class_names[labels[i]]} → {class_names[adv_predictions[i]]} "
-                f"(L2: {norms['L2'][i]:.4f}, Linf: {norms['Linf'][i]:.4f}) {success_marker}{success_type}"
+                f"(L2: {norms['L2'][i]:.6f}, RMS: {norms['L2_avg'][i]:.8f}, Linf: {norms['Linf'][i]:.6f}) {success_marker}{success_type}"
             )
+
             if is_success:
                 successful_attacks += 1
 
-    # Calculate and display actual success rate
-    actual_success_rate = (successful_attacks / total_attacks) * 100
+    # Calculate and display success rate
+    success_rate = (successful_attacks / total_attacks) * 100
     print(
-        f"\nTotal Success Rate: {actual_success_rate:.1f}% ({successful_attacks}/{total_attacks})"
+        f"\nAdversarial Attack Success Rate: {success_rate:.1f}% ({successful_attacks}/{total_attacks})"
     )
 
     # Create a metrics dictionary that includes both metrics for visualization
-    vis_metrics = {**metrics, "total_success_rate": actual_success_rate}
+    vis_metrics = {
+        **metrics,
+        "total_success_rate": success_rate,
+        "model": args.model,
+    }
 
     # Visualize the results
     print("\nVisualizing results...")
@@ -435,9 +499,9 @@ def main():
         adv_predictions,
         args.method,
         args.targeted,
-        5,  # Enhancement factor
+        10,  # Higher enhancement factor for very small perturbations
         output_dir,
-        NUM_IMAGES,
+        len(images),
         class_names,
     )
 

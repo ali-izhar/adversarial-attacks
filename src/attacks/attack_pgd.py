@@ -80,6 +80,10 @@ class PGD(BaseAttack):
         # Initialize the base attack with model and common parameters.
         super().__init__(model, norm, eps, targeted, loss_fn, device, verbose)
 
+        # For untargeted attacks, we want to maximize the loss to make predictions different from true labels
+        # For targeted attacks, we want to minimize the loss to make predictions equal to target labels
+        maximize = not targeted
+
         # Instantiate the PGD optimizer with the specified configuration.
         self.optimizer = PGDOptimizer(
             norm=norm,
@@ -91,6 +95,7 @@ class PGD(BaseAttack):
             init_std=init_std,
             early_stopping=early_stopping,
             verbose=verbose,
+            maximize=maximize,
         )
 
     def generate(

@@ -53,7 +53,7 @@ class PGDOptimizer:
         init_std: float = 0.01,
         early_stopping: bool = True,
         verbose: bool = False,
-        maximize: bool = False,  # Default to minimization for standard optimization
+        maximize: bool = True,  # Default to maximization for adversarial attacks
     ):
         """
         Initialize the PGD optimizer with parameters controlling:

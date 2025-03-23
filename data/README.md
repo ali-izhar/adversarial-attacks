@@ -15,6 +15,8 @@ data/
 
 The `imagenet_classes.txt` file is sourced from [PyTorch's GitHub repository](https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt) and contains the 1000 class labels used in ImageNet.
 
+The sample images are sourced from [EliSchwartz's imagenet-sample-images repository](https://github.com/EliSchwartz/imagenet-sample-images), which provides one sample image per ImageNet class for easy visualization and testing.
+
 This sample setup is sufficient for quick testing and development of adversarial attacks.
 
 ## Obtaining Full ImageNet
@@ -28,11 +30,3 @@ If full ImageNet is too large, the following can be used:
 
 1. **ImageNette**: A 10-class subset of ImageNet available from [FastAI](https://github.com/fastai/imagenette)
 2. **CIFAR-10**: A smaller dataset that can be automatically downloaded through `torchvision`
-
-## Configuration
-
-Modify `--data-dir` in `experiments/compare.py` to point to your dataset location:
-
-```bash
-python experiments/compare.py --data-dir=/path/to/data --dataset=imagenet
-```

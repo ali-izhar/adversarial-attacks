@@ -148,7 +148,7 @@ class BaseAttack(ABC):
 
         For targeted attacks, success means the model's prediction matches the target label.
         For untargeted attacks, success is when the model misclassifies the input compared to
-        the original prediction (not the true label).
+        the true label.
 
         Args:
             outputs: The model outputs (logits).
@@ -161,13 +161,10 @@ class BaseAttack(ABC):
             # For targeted attacks, the predicted class should match the target.
             return outputs.argmax(dim=1) == targets
         else:
-            # For untargeted attacks, the predicted class should differ from the original prediction.
-            if hasattr(self, "original_predictions"):
-                # If we have stored original predictions, check against those
-                return outputs.argmax(dim=1) != self.original_predictions
-            else:
-                # Fallback to checking against true labels if original predictions aren't available
-                return outputs.argmax(dim=1) != targets
+            # For untargeted attacks, the predicted class should differ from the true label.
+            # This is the correct behavior for an adversarial attack:
+            # making the model misclassify relative to the ground truth.
+            return outputs.argmax(dim=1) != targets
 
     def store_original_predictions(self, inputs: torch.Tensor) -> torch.Tensor:
         """
