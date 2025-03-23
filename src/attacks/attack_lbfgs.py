@@ -67,22 +67,22 @@ class LBFGS(BaseAttack):
 
         Args:
             model: The model to attack.
-            norm: Norm used for the perturbation constraint ('L2' or 'Linf').
-            eps: Maximum perturbation size.
+            norm: Norm for the perturbation constraint ('L2' or 'Linf').
+            eps: Maximum allowed perturbation magnitude.
             targeted: Whether to perform a targeted attack.
             loss_fn: Loss function to use ('cross_entropy' or 'margin').
-            n_iterations: Maximum number of optimization iterations.
-            history_size: Number of previous iterations to store for Hessian approximation.
+            n_iterations: Maximum number of iterations to run.
+            history_size: Number of past iterations to store for Hessian approximation.
             line_search_fn: Line search method ('strong_wolfe' or 'armijo').
-            max_line_search: Maximum number of line search iterations.
-            initial_step: Initial step size for line search.
-            rand_init: Whether to initialize with random perturbation.
+            max_line_search: Maximum number of iterations for the line search.
+            initial_step: Initial step size for the line search.
+            rand_init: Whether to initialize the attack with random noise.
             init_std: Standard deviation for random initialization.
-            early_stopping: Whether to stop early when attack succeeds.
-            verbose: Whether to print progress information.
-            device: The device to use (CPU or GPU).
+            early_stopping: Stop early if adversarial criteria are met.
+            verbose: Print progress updates.
+            device: Device to run the attack on (e.g., CPU or GPU).
         """
-        # Initialize the base attack with the provided model and parameters.
+        # Initialize the base attack with model and common parameters.
         super().__init__(model, norm, eps, targeted, loss_fn, device, verbose)
 
         # Scale epsilon for pixel space if normalization is being used
@@ -96,7 +96,7 @@ class LBFGS(BaseAttack):
                     f"Using normalized epsilon: {eps} (will be scaled during optimization)"
                 )
 
-        # Instantiate the LBFGS optimizer with the desired configuration.
+        # Instantiate the L-BFGS optimizer with the specified parameters.
         self.optimizer = LBFGSOptimizer(
             norm=norm,
             eps=eps_for_optimizer,
@@ -190,6 +190,13 @@ class LBFGS(BaseAttack):
 
             # Clone the computed gradient.
             grad = x_normalized.grad.clone()
+
+            # The LBFGS optimizer assumes we're minimizing, so we need to adjust the gradient:
+            # For untargeted attacks, we want to maximize the loss, so negate the gradient
+            # For targeted attacks, we want to minimize the loss, so keep the gradient as is
+            if not self.targeted:
+                # For untargeted attacks (maximizing loss), use negative gradient for "minimization"
+                grad = -grad
 
             # Scale gradient if we're using normalization
             # This makes the gradient meaningful in the original pixel space

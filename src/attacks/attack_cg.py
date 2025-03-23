@@ -65,24 +65,24 @@ class ConjugateGradient(BaseAttack):
         Initialize the Conjugate Gradient attack.
 
         Args:
-            model: The neural network to attack.
-            norm: The perturbation norm ('L2' or 'Linf').
-            eps: Maximum perturbation allowed.
-            targeted: Whether the attack is targeted (aiming for a specific target label).
+            model: The model to attack.
+            norm: Norm for the perturbation constraint ('L2' or 'Linf').
+            eps: Maximum allowed perturbation magnitude.
+            targeted: Whether to perform a targeted attack.
             loss_fn: Loss function to use ('cross_entropy' or 'margin').
-            n_iterations: Maximum number of optimization iterations.
-            fletcher_reeves: Use Fletcher-Reeves (True) or Polak-Ribière (False) for conjugate update.
-            restart_interval: Restart conjugate directions every N iterations.
-            backtracking_factor: Factor to decrease step size in line search.
-            sufficient_decrease: Armijo condition parameter for sufficient loss decrease.
-            line_search_max_iter: Maximum iterations for the line search procedure.
-            rand_init: Whether to start with random perturbation.
+            n_iterations: Maximum number of iterations to run.
+            fletcher_reeves: Whether to use the Fletcher-Reeves formula (True) or Polak-Ribière formula (False).
+            restart_interval: How often to reset the conjugate direction (e.g., every 20 iterations).
+            backtracking_factor: Factor to reduce step size in backtracking line search.
+            sufficient_decrease: Parameter controlling sufficient decrease condition in line search.
+            line_search_max_iter: Maximum number of iterations for the line search.
+            rand_init: Whether to initialize the attack with random noise.
             init_std: Standard deviation for random initialization.
-            early_stopping: Stop early if the adversarial criterion is met.
+            early_stopping: Stop early if adversarial criteria are met.
             verbose: Print progress updates.
-            device: Device to run the attack on (CPU or GPU).
+            device: Device to run the attack on (e.g., CPU or GPU).
         """
-        # Initialize the base attack with the provided model and parameters.
+        # Initialize the base attack with model and common parameters.
         super().__init__(model, norm, eps, targeted, loss_fn, device, verbose)
 
         # Scale epsilon for pixel space if normalization is being used
@@ -96,7 +96,7 @@ class ConjugateGradient(BaseAttack):
                     f"Using normalized epsilon: {eps} (will be scaled during optimization)"
                 )
 
-        # Instantiate the Conjugate Gradient optimizer with the provided configuration.
+        # Instantiate the Conjugate Gradient optimizer with the specified parameters.
         self.optimizer = ConjugateGradientOptimizer(
             norm=norm,
             eps=eps_for_optimizer,
@@ -191,6 +191,13 @@ class ConjugateGradient(BaseAttack):
 
             # Clone the gradient from x.
             grad = x_normalized.grad.clone()
+
+            # The CG optimizer assumes we're minimizing, so we need to adjust the gradient:
+            # For untargeted attacks, we want to maximize the loss, so negate the gradient
+            # For targeted attacks, we want to minimize the loss, so keep the gradient as is
+            if not self.targeted:
+                # For untargeted attacks (maximizing loss), use negative gradient for "minimization"
+                grad = -grad
 
             # Scale gradient if we're using normalization
             # This makes the gradient meaningful in the original pixel space

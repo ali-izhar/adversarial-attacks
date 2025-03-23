@@ -1,26 +1,19 @@
 """DeepFool adversarial attack implementation.
 
-This file implements the DeepFool attack, which is an iterative method that efficiently
-finds the minimal perturbation needed to cross the decision boundary. The algorithm
-works by approximating the classifier with a linear model at each iteration and finding
-the closest decision boundary to move the input across.
+Implementation of the DeepFool attack from the paper:
+'DeepFool: A Simple and Accurate Method to Fool Deep Neural Networks'
+[https://arxiv.org/abs/1511.04599]
+
+The attack iteratively finds the nearest decision boundary and perturbs the input
+to cross that boundary. DeepFool works by linearizing the classifier around the
+current point and finding the minimal perturbation to cross the linearized boundary.
 
 Key features:
-- Produces minimal perturbations compared to simple gradient methods
+- Produces smaller perturbations compared to gradient-based methods
 - Iteratively approximates the decision boundary
 - Naturally produces more imperceptible adversarial examples
 - Supports both L2 and Linf norms
-- Focuses on finding the closest decision boundary
-
-Expected inputs:
-- A neural network model to attack
-- Input samples (images) to perturb
-- Number of classes for the classification task
-- Maximum number of iterations
-
-Expected outputs:
-- Adversarial examples that aim to fool the model
-- Performance metrics including success rate
+- Does not require specifying an epsilon constraint (finds minimal perturbation automatically)
 """
 
 import torch
@@ -32,12 +25,50 @@ from .base import BaseAttack
 
 
 class DeepFool(BaseAttack):
-    """
+    r"""
     DeepFool adversarial attack.
 
-    This attack iteratively finds the nearest decision boundary and pushes the
-    input just enough to cross that boundary. It produces more minimal perturbations
-    compared to simpler methods like FGSM or PGD.
+    This attack implements the algorithm from the paper:
+    "DeepFool: A Simple and Accurate Method to Fool Deep Neural Networks"
+    [https://arxiv.org/abs/1511.04599]
+
+    The attack finds adversarial examples by iteratively projecting the input onto the
+    nearest decision boundary. For a classifier :math:`f`, DeepFool approximates the
+    decision boundary as a hyperplane and computes the minimal perturbation to cross
+    this linearized boundary.
+
+    For a binary classifier, the algorithm computes:
+
+    .. math::
+        \min_{\delta} \|\delta\|_2 \quad \text{subject to} \quad f(x+\delta) \neq f(x)
+
+    By linearizing f at each iteration:
+
+    .. math::
+        \delta_i = -\frac{f(x_i)}{||\nabla f(x_i)||_2^2} \nabla f(x_i)
+
+    For multi-class classifiers, it finds the closest decision boundary by examining
+    each class and selecting the perturbation with minimum distance.
+
+    Args:
+        model: The neural network model to attack.
+        norm: Norm for the perturbation constraint ('L2' or 'Linf').
+        num_classes: Number of classes in the model's output.
+        overshoot: Parameter that controls how far beyond the decision boundary to perturb.
+            Higher values (e.g., 0.02) make the attack more robust but increase perturbation size.
+        max_iter: Maximum number of iterations to run.
+        verbose: Print progress updates.
+        device: Device to run the attack on (e.g., CPU or GPU).
+
+    Shape:
+        - inputs: :math:`(N, C, H, W)` where `N = batch size`, `C = channels`, `H = height`, `W = width`.
+          Input values should be in range [0, 1] or normalized according to model requirements.
+        - targets: :math:`(N)` where each value is the class index (not used directly by DeepFool).
+        - output: :math:`(N, C, H, W)` containing adversarial examples.
+
+    Example:
+        >>> attack = DeepFool(model, norm='L2', overshoot=0.02, max_iter=50)
+        >>> adv_images, metrics = attack.generate(images)
     """
 
     def __init__(
@@ -57,7 +88,8 @@ class DeepFool(BaseAttack):
             model: The model to attack.
             norm: Norm for the perturbation constraint ('L2' or 'Linf').
             num_classes: Number of classes in the model's output.
-            overshoot: Parameter to overshoot the decision boundary.
+            overshoot: Parameter to overshoot the decision boundary (typically 0.02).
+                Higher values make the attack more robust but increase perturbation size.
             max_iter: Maximum number of iterations to run.
             verbose: Print progress updates.
             device: Device to run the attack on (e.g., CPU or GPU).
@@ -84,20 +116,22 @@ class DeepFool(BaseAttack):
         """
         Generate adversarial examples using DeepFool.
 
-        The attack performs the following steps for each input image:
-          1. For each iteration:
-             a. Compute the gradient of each output class with respect to the input.
-             b. Find the closest decision boundary.
-             c. Move the input towards that boundary with minimal perturbation.
-          2. Apply the perturbation with a small overshoot to ensure crossing the boundary.
-          3. Return the adversarial examples along with metrics.
+        The algorithm works by:
+        1. Linearizing the decision boundary around the current point
+        2. Finding the closest hyperplane (minimum distance to decision boundary)
+        3. Moving the point just beyond this hyperplane (controlled by overshoot)
+        4. Repeating until misclassification or max iterations reached
+
+        This implementation applies the attack separately to each sample in the batch.
 
         Args:
-            inputs: Input images (clean samples) to perturb.
-            targets: Not used by DeepFool (can be None).
+            inputs: Input images (clean samples) to perturb, of shape (N, C, H, W)
+            targets: Not used directly by DeepFool (can be None).
 
         Returns:
-            A tuple (adversarial_examples, metrics).
+            A tuple (adversarial_examples, metrics):
+            - adversarial_examples: Tensor of same shape as inputs containing the adversarial examples
+            - metrics: Dictionary with performance metrics including success rate, iterations, perturbation norm
         """
         # Reset metrics from previous runs
         self.reset_metrics()
@@ -133,16 +167,19 @@ class DeepFool(BaseAttack):
         # For each input in the batch, perform DeepFool attack separately
         for idx in range(batch_size):
             # We'll work with normalized inputs with the model
-            x = inputs[idx : idx + 1].clone().detach().requires_grad_(True)
+            x = inputs[idx : idx + 1].clone().detach()
 
             # Also track the adversarial example in normalized space initially
-            adv_x = x.clone()
+            adv_x = x.clone().detach().requires_grad_(True)
 
             # Original prediction for this sample
             with torch.no_grad():
                 f_x = self.model(x)
                 orig_pred = f_x.argmax(dim=1).item()
                 current_pred = orig_pred
+
+            if self.verbose:
+                print(f"Sample {idx}: Original prediction class {orig_pred}")
 
             # Initialize perturbation
             total_perturbation = torch.zeros_like(x)
@@ -163,8 +200,32 @@ class DeepFool(BaseAttack):
                     break
 
                 # Get all classes except the original prediction
-                other_classes = list(range(self.num_classes))
-                other_classes.remove(orig_pred)
+                try:
+                    other_classes = list(range(self.num_classes))
+                    # Handle the case where orig_pred is outside our range of classes
+                    if orig_pred < self.num_classes:
+                        other_classes.remove(orig_pred)
+                    else:
+                        # If original prediction is outside our subset, we need to use all classes
+                        if self.verbose:
+                            print(
+                                f"Warning: Original prediction {orig_pred} is outside class range 0-{self.num_classes-1}"
+                            )
+                            print("Consider using a larger num_classes parameter")
+                except ValueError as e:
+                    # This shouldn't happen after the above check, but just in case
+                    if self.verbose:
+                        print(
+                            f"Error removing class {orig_pred} from {other_classes}: {e}"
+                        )
+                    # Just continue with all other classes
+                    other_classes = [
+                        c for c in range(self.num_classes) if c != orig_pred
+                    ]
+
+                # Ensure adv_x requires gradients for backward pass
+                if not adv_x.requires_grad:
+                    adv_x = adv_x.detach().requires_grad_(True)
 
                 # For limited number of classes, use all; otherwise sample subset
                 if self.num_classes <= 10:
@@ -197,21 +258,52 @@ class DeepFool(BaseAttack):
                     if adv_x.grad is not None:
                         adv_x.grad.zero_()
 
+                    # Make sure adv_x requires gradients for this backward pass
+                    if not adv_x.requires_grad:
+                        adv_x = adv_x.detach().requires_grad_(True)
+
                     # Get score for class k
                     score_k = logits[0, k]
 
                     # Compute gradient of score_k with respect to input
-                    score_k.backward(retain_graph=True)
-                    grad_k = adv_x.grad.clone()
+                    try:
+                        score_k.backward(retain_graph=True)
+                        if adv_x.grad is None:
+                            # If gradient is still None, there's a problem
+                            if self.verbose:
+                                print(
+                                    f"Warning: Gradient is None after backward pass for class {k}"
+                                )
+                            continue
+                        grad_k = adv_x.grad.clone()
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"Error during backward pass for class {k}: {e}")
+                        continue
+
+                    # Zero gradients for next computation
+                    self.model.zero_grad()
+                    if adv_x.grad is not None:
+                        adv_x.grad.zero_()
 
                     # Get score for original class
                     score_orig = logits[0, orig_pred]
 
                     # Compute gradient of score_orig with respect to input
-                    self.model.zero_grad()
-                    adv_x.grad.zero_()
-                    score_orig.backward(retain_graph=True)
-                    grad_orig = adv_x.grad.clone()
+                    try:
+                        score_orig.backward(retain_graph=True)
+                        if adv_x.grad is None:
+                            # If gradient is still None, there's a problem
+                            if self.verbose:
+                                print(
+                                    f"Warning: Gradient is None after backward pass for original class"
+                                )
+                            continue
+                        grad_orig = adv_x.grad.clone()
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"Error during backward pass for original class: {e}")
+                        continue
 
                     # Compute difference in gradients
                     grad_diff = grad_orig - grad_k

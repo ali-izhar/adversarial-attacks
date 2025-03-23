@@ -1,4 +1,10 @@
-"""Base class for adversarial attacks."""
+"""Base class for adversarial attacks.
+
+This module defines the abstract base class for implementing optimization-based
+adversarial attacks against neural networks. The class provides common
+functionality including loss computation, gradient calculation, projection
+operations, and performance tracking.
+"""
 
 import torch
 from abc import ABC, abstractmethod
@@ -12,6 +18,19 @@ class BaseAttack(ABC):
     This class defines the common interface and utility functions that
     all optimization-based attacks should implement, including loss and
     gradient computations, performance tracking, and success checking.
+
+    The optimization problem for generating adversarial examples can be formulated as:
+
+    minimize ||δ||_p subject to:
+        1. f(x + δ) ≠ f(x) (untargeted) or f(x + δ) = t (targeted)
+        2. x + δ ∈ [0,1]^n (valid image constraint)
+
+    where:
+        - δ is the perturbation
+        - f is the model
+        - x is the original input
+        - t is the target class (for targeted attacks)
+        - ||·||_p is the p-norm (typically L2 or Linf)
     """
 
     def __init__(
@@ -30,9 +49,15 @@ class BaseAttack(ABC):
         Args:
             model: The neural network model to attack.
             norm: The norm used for the perturbation constraint ('L2' or 'Linf').
-            eps: Maximum allowed perturbation magnitude.
+                  L2 norm measures Euclidean distance: ||x||_2 = sqrt(sum(x_i^2))
+                  Linf norm measures maximum absolute value: ||x||_∞ = max(|x_i|)
+            eps: Maximum allowed perturbation magnitude (ε in the constraint ||δ||_p ≤ ε).
             targeted: Whether the attack is targeted (aim for a specific target) or untargeted.
+                      For targeted attacks, we minimize L(f(x+δ), t) where t is the target.
+                      For untargeted attacks, we maximize L(f(x+δ), y) where y is the true label.
             loss_fn: The loss function to use ('cross_entropy' or 'margin').
+                     - cross_entropy: standard classification loss
+                     - margin: difference between target logit and highest other logit
             device: The device to run the attack on (CPU or GPU).
             verbose: Whether to print progress and debug information.
         """
@@ -55,6 +80,7 @@ class BaseAttack(ABC):
         self.total_time = 0
 
         # Extract normalization parameters from the model if available
+        # These are important for correctly computing perturbations in the original input space
         try:
             self.mean = (
                 torch.tensor(model.mean).view(1, -1, 1, 1).to(self.device)
@@ -73,11 +99,17 @@ class BaseAttack(ABC):
                 print("Could not extract normalization parameters from model.")
 
         # Ensure the model is in evaluation mode (important for consistency in attacks).
+        # This prevents batch normalization and dropout from affecting attack performance.
         self.model.eval()
 
     def _denormalize(self, x: torch.Tensor) -> torch.Tensor:
         """
         Denormalize the input tensor if normalization parameters are available.
+
+        This converts from normalized space (as used by the model) back to image space [0,1].
+        Denormalization follows: x_denorm = x_norm * std + mean
+
+        This is important for visualizing and constraining perturbations in the original image space.
 
         Args:
             x: Normalized input tensor
@@ -93,6 +125,11 @@ class BaseAttack(ABC):
         """
         Renormalize the input tensor if normalization parameters are available.
 
+        This converts from image space [0,1] to normalized space as used by the model.
+        Normalization follows: x_norm = (x_denorm - mean) / std
+
+        This is necessary after modifying inputs in image space before passing to the model.
+
         Args:
             x: Denormalized input tensor
 
@@ -107,11 +144,17 @@ class BaseAttack(ABC):
         self, outputs: torch.Tensor, targets: torch.Tensor, reduction: str = "mean"
     ) -> torch.Tensor:
         """
-        Compute the loss function.
+        Compute the loss function for optimization.
 
-        This method computes the loss used in the attack. It supports both cross-entropy loss,
-        which is standard for classification, and margin loss, which is useful for certain attack
-        objectives.
+        This method computes the loss used to guide the optimization process. It supports:
+        1. Cross-entropy loss: standard for classification problems, defined as
+           L(y, t) = -∑ t_i * log(y_i), where t is one-hot encoded target
+
+        2. Margin loss: measures the difference between target logit and highest other logit:
+           - For targeted attacks: margin = max_{i≠t} z_i - z_t  (minimize this)
+           - For untargeted attacks: margin = z_t - max_{i≠t} z_i  (maximize this)
+
+           where z_i are the logits (pre-softmax outputs) and z_t is the target logit
 
         Args:
             outputs: The model outputs (logits).
@@ -130,12 +173,14 @@ class BaseAttack(ABC):
             # Margin loss aims to maximize the difference between the target class and the next highest logit.
             if self.targeted:
                 # For targeted attacks, the goal is to maximize the target class logit
+                # relative to all other logits
                 target_logits = outputs.gather(1, targets.unsqueeze(1)).squeeze(1)
                 other_logits = outputs.clone()
                 # Exclude the target class from the max search
                 other_logits.scatter_(1, targets.unsqueeze(1), float("-inf"))
                 other_logits = other_logits.max(1)[0]
                 # Loss per example: difference between the highest non-target and target logits
+                # We want to minimize this value to make the target class most probable
                 batch_loss = other_logits - target_logits
             else:
                 # For untargeted attacks, the goal is to minimize the true class logit relative to others.
@@ -144,6 +189,7 @@ class BaseAttack(ABC):
                 other_logits.scatter_(1, targets.unsqueeze(1), float("-inf"))
                 other_logits = other_logits.max(1)[0]
                 # Loss per example: difference between true class and the highest non-true logit.
+                # We want to maximize this value to make the true class less probable than some other class
                 batch_loss = true_logits - other_logits
 
             # Apply the requested reduction.
@@ -164,8 +210,15 @@ class BaseAttack(ABC):
         """
         Compute the gradient of the loss with respect to the inputs.
 
-        This is a convenience method that computes the gradient by enabling gradient tracking on the input,
-        performing a forward pass, computing the loss, and backpropagating.
+        This is a key component of gradient-based optimization for adversarial examples.
+        The gradient ∇L(f(x), y) indicates the direction to modify the input x
+        to increase the loss, which guides the perturbation generation.
+
+        For targeted attacks with cross-entropy loss, we want to minimize L(f(x+δ), t)
+        so we move in the negative gradient direction.
+
+        For untargeted attacks, we want to maximize L(f(x+δ), y_true) or equivalently
+        minimize -L(f(x+δ), y_true), so we move in the gradient direction.
 
         Args:
             inputs: The input data for which the gradient is computed.
@@ -192,9 +245,12 @@ class BaseAttack(ABC):
         """
         Check if the attack was successful.
 
-        For targeted attacks, success means the model's prediction matches the target label.
-        For untargeted attacks, success is when the model misclassifies the input compared to
-        the true label.
+        An adversarial attack is successful when:
+        - For targeted attacks: f(x+δ) = target_label (model classifies as the target)
+        - For untargeted attacks: f(x+δ) ≠ true_label (model misclassifies the input)
+
+        This function is used to determine when to stop the optimization process
+        and as part of the evaluation metrics.
 
         Args:
             outputs: The model outputs (logits).
@@ -216,8 +272,13 @@ class BaseAttack(ABC):
         """
         Store the original model predictions for the inputs.
 
-        This helps correctly determine attack success for untargeted attacks
-        by comparing against the original predictions rather than true labels.
+        This function is useful for:
+        1. Determining the initial classification before attack
+        2. Measuring attack success relative to original predictions
+        3. Using original predictions as reference points in some attack algorithms
+
+        It's especially important for untargeted attacks where success is defined
+        as changing the model's prediction from its original output.
 
         Args:
             inputs: The original inputs.
@@ -238,7 +299,17 @@ class BaseAttack(ABC):
         Generate adversarial examples.
 
         This abstract method should be implemented by subclasses to generate adversarial
-        examples using a specific optimization method.
+        examples using a specific optimization method. The optimization problem is:
+
+        min ||δ||_p subject to f(x+δ) ≠ f(x) [untargeted] or f(x+δ) = t [targeted]
+
+        Different optimization algorithms (PGD, CG, L-BFGS, etc.) will implement different
+        strategies for solving this problem. The common components are:
+
+        1. Computing gradients of the loss w.r.t. inputs (∇_x L)
+        2. Updating the perturbation based on these gradients
+        3. Projecting perturbations to satisfy constraints
+        4. Checking for attack success and termination conditions
 
         Args:
             inputs: The input data.
@@ -251,13 +322,33 @@ class BaseAttack(ABC):
         raise NotImplementedError("Subclasses must implement generate()")
 
     def reset_metrics(self) -> None:
-        """Reset the performance tracking metrics."""
+        """
+        Reset the performance tracking metrics.
+
+        This should be called before conducting a new batch of attacks or when
+        starting a new evaluation to ensure metrics are properly measured.
+        """
         self.total_iterations = 0
         self.total_gradient_calls = 0
         self.total_time = 0
 
     def get_metrics(self) -> Dict[str, Union[int, float]]:
-        """Get the performance metrics."""
+        """
+        Get the performance metrics.
+
+        Performance metrics are important for comparing different optimization methods
+        as described in the paper. Key metrics include:
+
+        1. iterations: Number of optimization steps taken
+        2. gradient_calls: Number of gradient computations (backpropagation)
+        3. time: Total computation time
+
+        These metrics help evaluate computational efficiency alongside
+        attack success rate and perturbation magnitude.
+
+        Returns:
+            Dictionary containing performance metrics for the attack.
+        """
         return {
             "iterations": self.total_iterations,
             "gradient_calls": self.total_gradient_calls,

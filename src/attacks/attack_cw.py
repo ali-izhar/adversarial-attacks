@@ -1,26 +1,24 @@
 """Carlini & Wagner (C&W) L2 adversarial attack implementation.
 
-This file implements the C&W L2 attack, which is an optimization-based method that
-explicitly finds the minimal L2 perturbation needed to misclassify an input. It uses
-a carefully designed loss function with box constraints and produces perturbations
-that are minimal in L2 norm while being highly effective.
+This implements the C&W L2 attack from the paper 'Towards Evaluating the Robustness of Neural Networks'
+[https://arxiv.org/abs/1608.04644]
+
+The attack finds adversarial examples by solving the optimization problem:
+    minimize ||δ||_2 subject to f(x+δ) ≠ f(x) (untargeted) or f(x+δ) = t (targeted)
+
+By transforming it into an unconstrained form:
+    minimize ||x' - x||_2 + c·f(x')
+
+where:
+    - x' = 1/2(tanh(w) + 1) is the adversarial example (ensured to be in [0,1])
+    - f(x') measures how successfully the adversarial example fools the classifier
+    - c is a hyperparameter that controls the tradeoff between distortion and attack success
 
 Key features:
 - Produces minimal L2 perturbation for misclassification
 - Uses binary search to find optimal tradeoff between perturbation size and attack success
 - Incorporates a confidence parameter to control robustness of adversarial examples
 - Very effective but computationally more expensive than simpler methods
-- Often produces state-of-the-art imperceptible adversarial examples
-
-Expected inputs:
-- A neural network model to attack
-- Input samples (images) to perturb
-- Target labels (for targeted attacks) or true labels (for untargeted attacks)
-- Confidence parameter to control attack strength
-
-Expected outputs:
-- Adversarial examples that aim to fool the model
-- Performance metrics including success rate and perturbation magnitude
 """
 
 import torch
@@ -31,13 +29,60 @@ from .base import BaseAttack
 
 
 class CW(BaseAttack):
-    """
+    r"""
     Carlini & Wagner (C&W) L2 adversarial attack.
 
-    This attack uses an optimization-based approach to find minimal perturbations
-    that fool the target model. It's considered one of the most effective attacks
-    for generating imperceptible adversarial examples, but is computationally more
-    expensive than simpler gradient-based methods.
+    This attack solves the optimization problem:
+
+    .. math::
+        \min_{\delta} \|\delta\|_2 \quad \text{subject to} \quad f(x+\delta) \neq y \text{ (untargeted) or } f(x+\delta) = t \text{ (targeted)}
+
+    Using the change of variables :math:`x' = \frac{1}{2}(\tanh(w)+1)` to ensure valid pixel range [0,1],
+    the problem becomes:
+
+    .. math::
+        \min_{w} \left\|\frac{1}{2}(\tanh(w)+1) - x\right\|_2^2 + c \cdot f\left(\frac{1}{2}(\tanh(w)+1)\right)
+
+    where :math:`f(x')` is defined as:
+
+    .. math::
+        f(x') = \max(\max\{Z(x')_i: i \neq t\} - Z(x')_t, -\kappa) \quad \text{(targeted)}
+
+    or:
+
+    .. math::
+        f(x') = \max(Z(x')_t - \max\{Z(x')_i: i \neq t\}, -\kappa) \quad \text{(untargeted)}
+
+    This implementation includes binary search for the optimal c value as described in the original paper.
+
+    Args:
+        model: The neural network model to attack.
+        confidence: Confidence parameter κ that controls the boundary between decision regions.
+            Higher values produce more robust adversarial examples that transfer better.
+        c_init: Initial value of the constant c that balances perturbation size and attack success.
+        max_iter: Maximum number of optimization iterations.
+        binary_search_steps: Number of binary search steps to find optimal c.
+        learning_rate: Learning rate for the Adam optimizer.
+        targeted: Whether to perform a targeted attack.
+        abort_early: Whether to abort early if no improvement is found.
+        clip_min: Minimum value for pixel clipping (default: 0.0).
+        clip_max: Maximum value for pixel clipping (default: 1.0).
+        verbose: Print progress updates.
+        device: Device to run the attack on (e.g., CPU or GPU).
+
+    Shape:
+        - inputs: :math:`(N, C, H, W)` where `N = batch size`, `C = channels`, `H = height`, `W = width`.
+          Input values should be in range [0, 1] or normalized according to model requirements.
+        - targets: :math:`(N)` where each value is the target class index.
+        - output: :math:`(N, C, H, W)` containing adversarial examples.
+
+    Example:
+        >>> attack = CW(model, confidence=0.0, c_init=0.01, max_iter=1000)
+        >>> adv_images, metrics = attack.generate(images, labels)
+
+    .. warning::
+        Setting c_init too low might result in failed attacks. The binary search will adjust it,
+        but starting with a reasonable value (like 0.1 or 1.0) may speed up convergence.
     """
 
     def __init__(
@@ -60,8 +105,10 @@ class CW(BaseAttack):
 
         Args:
             model: The model to attack.
-            confidence: Confidence parameter for adversarial examples.
-            c_init: Initial value of the constant c.
+            confidence: Confidence parameter κ (kappa) for the attack.
+                Higher values produce more robust adversarial examples.
+            c_init: Initial value of the constant c that balances the importance of
+                perturbation size vs attack success.
             max_iter: Maximum number of optimization iterations.
             binary_search_steps: Number of binary search steps to find optimal c.
             learning_rate: Learning rate for the Adam optimizer.
@@ -100,7 +147,21 @@ class CW(BaseAttack):
         self.boxmul = (clip_max + clip_min) / 2
 
     def _to_tanh_space(self, x: torch.Tensor) -> torch.Tensor:
-        """Convert from image space to tanh space for optimization."""
+        """
+        Convert from image space to tanh space for optimization.
+
+        This applies the inverse of the tanh transformation:
+        w = atanh((x - boxmul) / boxplus)
+
+        The tanh space allows unconstrained optimization while ensuring
+        the resulting image stays within valid pixel range.
+
+        Args:
+            x: Input tensor in image space [clip_min, clip_max]
+
+        Returns:
+            Tensor in tanh space
+        """
         # If normalized, convert to original pixel space first
         if self.mean is not None and self.std is not None:
             x_denorm = self._denormalize(x)
@@ -113,7 +174,20 @@ class CW(BaseAttack):
         return torch.atanh(torch.clamp(x_tanh, -0.99999, 0.99999))
 
     def _to_image_space(self, x_tanh: torch.Tensor) -> torch.Tensor:
-        """Convert from tanh space back to image space."""
+        """
+        Convert from tanh space back to image space.
+
+        This applies the tanh transformation:
+        x = tanh(w) * boxplus + boxmul
+
+        This ensures pixel values remain within [clip_min, clip_max].
+
+        Args:
+            x_tanh: Tensor in tanh space
+
+        Returns:
+            Tensor in image space [clip_min, clip_max], normalized if needed
+        """
         # Apply tanh to ensure range [-1, 1]
         x_t = torch.tanh(x_tanh)
         # Scale back to image space
@@ -136,9 +210,15 @@ class CW(BaseAttack):
         """
         Compute the C&W loss function.
 
-        The loss combines two terms:
-        1. The classification loss that encourages misclassification
-        2. The distance loss that minimizes the L2 perturbation
+        The loss has two components:
+        1. Classification loss (f) that encourages misclassification:
+           f(x') = max(max{Z(x')_i: i≠t} - Z(x')_t, -κ) for targeted attacks
+           f(x') = max(Z(x')_t - max{Z(x')_i: i≠t}, -κ) for untargeted attacks
+
+        2. Distance loss (L2 norm) that minimizes the perturbation:
+           d(x,x') = ||x - x'||_2^2
+
+        The total loss is: L = d(x,x') + c·f(x')
 
         Args:
             logits: The model's output logits
@@ -201,17 +281,20 @@ class CW(BaseAttack):
         """
         Generate adversarial examples using C&W attack.
 
-        The attack performs the following steps:
-          1. Use binary search to find the optimal c value (balancing attack success and perturbation size).
-          2. For each c, optimize the adversarial example using Adam over the tanh-transformed space.
-          3. Return the adversarial example with the smallest perturbation that successfully fools the model.
+        The attack algorithm works as follows:
+        1. Transform the problem to the tanh space to ensure valid pixel range
+        2. Perform binary search to find optimal c value that balances attack success and distortion
+        3. For each c, optimize the adversarial example using Adam over max_iter iterations
+        4. Return the adversarial example with the smallest perturbation that successfully fools the model
 
         Args:
-            inputs: Input images (clean samples) to perturb.
-            targets: Target labels (for targeted attacks) or true labels (for untargeted attacks).
+            inputs: Input images (clean samples) to perturb, of shape (N, C, H, W)
+            targets: Target labels (for targeted attacks) or true labels (for untargeted attacks), of shape (N)
 
         Returns:
-            A tuple (adversarial_examples, metrics).
+            A tuple (adversarial_examples, metrics):
+            - adversarial_examples: Tensor of same shape as inputs containing the adversarial examples
+            - metrics: Dictionary with performance metrics including success rate, L2 norm, iterations, etc.
         """
         # Reset metrics from previous runs
         self.reset_metrics()
@@ -315,6 +398,9 @@ class CW(BaseAttack):
                 (loss.sum()).backward()
                 optimizer.step()
 
+                # Count iterations for metrics
+                self.total_iterations += 1
+
             # Update c for the next binary search iteration
             for i in range(batch_size):
                 if found[i]:
@@ -337,7 +423,6 @@ class CW(BaseAttack):
 
         # Update timing metrics
         self.total_time = time.time() - start_time
-        self.total_iterations = self.max_iter * self.binary_search_steps
 
         # Calculate L2 perturbation in denormalized space for proper reporting
         if self.mean is not None and self.std is not None:
