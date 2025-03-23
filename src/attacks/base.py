@@ -54,8 +54,54 @@ class BaseAttack(ABC):
         self.total_gradient_calls = 0
         self.total_time = 0
 
+        # Extract normalization parameters from the model if available
+        try:
+            self.mean = (
+                torch.tensor(model.mean).view(1, -1, 1, 1).to(self.device)
+                if hasattr(model, "mean")
+                else None
+            )
+            self.std = (
+                torch.tensor(model.std).view(1, -1, 1, 1).to(self.device)
+                if hasattr(model, "std")
+                else None
+            )
+        except:
+            self.mean = None
+            self.std = None
+            if self.verbose:
+                print("Could not extract normalization parameters from model.")
+
         # Ensure the model is in evaluation mode (important for consistency in attacks).
         self.model.eval()
+
+    def _denormalize(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Denormalize the input tensor if normalization parameters are available.
+
+        Args:
+            x: Normalized input tensor
+
+        Returns:
+            Denormalized tensor
+        """
+        if self.mean is not None and self.std is not None:
+            return x * self.std + self.mean
+        return x
+
+    def _renormalize(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Renormalize the input tensor if normalization parameters are available.
+
+        Args:
+            x: Denormalized input tensor
+
+        Returns:
+            Normalized tensor
+        """
+        if self.mean is not None and self.std is not None:
+            return (x - self.mean) / self.std
+        return x
 
     def _compute_loss(
         self, outputs: torch.Tensor, targets: torch.Tensor, reduction: str = "mean"

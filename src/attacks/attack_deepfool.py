@@ -132,7 +132,10 @@ class DeepFool(BaseAttack):
 
         # For each input in the batch, perform DeepFool attack separately
         for idx in range(batch_size):
+            # We'll work with normalized inputs with the model
             x = inputs[idx : idx + 1].clone().detach().requires_grad_(True)
+
+            # Also track the adversarial example in normalized space initially
             adv_x = x.clone()
 
             # Original prediction for this sample
@@ -250,8 +253,19 @@ class DeepFool(BaseAttack):
                     adv_x = adv_x + perturbation
                     total_perturbation += perturbation
 
-                    # Ensure valid image range
-                    adv_x = torch.clamp(adv_x, 0.0, 1.0)
+                    # Ensure valid image range - this needs to happen in normalized space
+                    # to ensure the model can process it correctly
+                    if self.mean is not None and self.std is not None:
+                        # In normalized space, we need to ensure values remain reasonable
+                        # We can approximate by keeping the perturbation conservative
+                        mean_val = self.mean.mean().item()
+                        std_val = self.std.mean().item()
+                        norm_min = (0.0 - mean_val) / std_val
+                        norm_max = (1.0 - mean_val) / std_val
+                        adv_x = torch.clamp(adv_x, norm_min, norm_max)
+                    else:
+                        # Without normalization, just use 0-1 range
+                        adv_x = torch.clamp(adv_x, 0.0, 1.0)
 
                     # Detach and require gradients again
                     adv_x = adv_x.detach().requires_grad_(True)
@@ -261,17 +275,19 @@ class DeepFool(BaseAttack):
 
             # Apply overshoot to ensure crossing the boundary
             total_perturbation = (1 + self.overshoot) * total_perturbation
-            adv_x = torch.clamp(x + total_perturbation, 0.0, 1.0)
 
-            # Record the final adversarial example
-            adv_inputs[idx] = adv_x.detach()
+            # Apply the final perturbation to the normalized input
+            adv_x_final = torch.clamp(x + total_perturbation, 0.0, 1.0)
+
+            # Record the final adversarial example in the normalized space
+            adv_inputs[idx] = adv_x_final.detach()
 
             # Record metrics for this sample
             iterations_per_sample[idx] = iteration
 
             # Check if attack was successful
             with torch.no_grad():
-                final_pred = self.model(adv_x).argmax(dim=1).item()
+                final_pred = self.model(adv_x_final).argmax(dim=1).item()
                 successful[idx] = final_pred != orig_pred
 
             # Record perturbation norm

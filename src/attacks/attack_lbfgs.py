@@ -85,10 +85,21 @@ class LBFGS(BaseAttack):
         # Initialize the base attack with the provided model and parameters.
         super().__init__(model, norm, eps, targeted, loss_fn, device, verbose)
 
+        # Scale epsilon for pixel space if normalization is being used
+        eps_for_optimizer = eps
+        if self.std is not None:
+            # Store the unscaled epsilon for proper scaling during optimization
+            self.unscaled_eps = eps
+            # Will be used with proper scaling in the optimization loop
+            if self.verbose:
+                print(
+                    f"Using normalized epsilon: {eps} (will be scaled during optimization)"
+                )
+
         # Instantiate the LBFGS optimizer with the desired configuration.
         self.optimizer = LBFGSOptimizer(
             norm=norm,
-            eps=eps,
+            eps=eps_for_optimizer,
             n_iterations=n_iterations,
             history_size=history_size,
             line_search_fn=line_search_fn,
@@ -144,20 +155,32 @@ class LBFGS(BaseAttack):
         # Store the targets to avoid passing them repeatedly in helper functions.
         self.original_targets = targets
 
+        # Denormalize inputs to operate in original pixel space
+        denormalized_inputs = self._denormalize(inputs)
+
+        # Scale epsilon by std if normalization is used
+        if self.std is not None:
+            # For each step of the optimization, we'll scale gradient by std
+            # This ensures perturbation is applied in pixel space rather than normalized space
+            self.optimizer.eps = self.unscaled_eps * self.std
+
         # Define a helper function to compute gradients of the loss with respect to inputs.
         def gradient_fn(x: torch.Tensor) -> torch.Tensor:
+            # x is in the original pixel space, so we need to normalize it
+            x_normalized = self._renormalize(x)
+
             # Use corresponding targets if x is a subset of the original inputs.
-            if x.size(0) != self.original_targets.size(0):
-                curr_targets = self.original_targets[: x.size(0)]
+            if x_normalized.size(0) != self.original_targets.size(0):
+                curr_targets = self.original_targets[: x_normalized.size(0)]
             else:
                 curr_targets = self.original_targets
 
             # Detach x to avoid modifying the original input and enable gradient computation.
-            x = x.detach().clone()
-            x.requires_grad_(True)
+            x_normalized = x_normalized.detach().clone()
+            x_normalized.requires_grad_(True)
 
             # Forward pass through the model.
-            outputs = self.model(x)
+            outputs = self.model(x_normalized)
             # Compute the loss (using mean reduction for a single scalar per batch).
             loss = self._compute_loss(outputs, curr_targets, reduction="mean")
 
@@ -166,48 +189,63 @@ class LBFGS(BaseAttack):
             loss.backward()
 
             # Clone the computed gradient.
-            grad = x.grad.clone()
+            grad = x_normalized.grad.clone()
+
+            # Scale gradient if we're using normalization
+            # This makes the gradient meaningful in the original pixel space
+            if self.std is not None:
+                grad = grad * self.std
 
             # Turn off gradient tracking for x.
-            x.requires_grad_(False)
+            x_normalized.requires_grad_(False)
             return grad
 
         # Define a helper function to compute per-example losses for the optimizer.
         def loss_fn(x: torch.Tensor) -> torch.Tensor:
+            # x is in the original pixel space, so we need to normalize it
+            x_normalized = self._renormalize(x)
+
             # Use the appropriate targets for x.
-            if x.size(0) != self.original_targets.size(0):
-                curr_targets = self.original_targets[: x.size(0)]
+            if x_normalized.size(0) != self.original_targets.size(0):
+                curr_targets = self.original_targets[: x_normalized.size(0)]
             else:
                 curr_targets = self.original_targets
 
             # Evaluate the loss without tracking gradients.
             with torch.no_grad():
-                outputs = self.model(x)
+                outputs = self.model(x_normalized)
                 # Use 'none' reduction to obtain individual losses for each example.
                 loss = self._compute_loss(outputs, curr_targets, reduction="none")
             return loss
 
         # Define a helper function to check if the adversarial example is successful.
         def success_fn(x: torch.Tensor) -> torch.Tensor:
+            # x is in the original pixel space, so we need to normalize it
+            x_normalized = self._renormalize(x)
+
             # Retrieve the correct targets if x is a subset.
-            if x.size(0) != self.original_targets.size(0):
-                curr_targets = self.original_targets[: x.size(0)]
+            if x_normalized.size(0) != self.original_targets.size(0):
+                curr_targets = self.original_targets[: x_normalized.size(0)]
             else:
                 curr_targets = self.original_targets
 
             with torch.no_grad():
-                outputs = self.model(x)
+                outputs = self.model(x_normalized)
                 # _check_success should return a Boolean tensor for each example.
                 return self._check_success(outputs, curr_targets)
 
         # Call the LBFGS optimizer using the helper functions.
-        x_adv, opt_metrics = self.optimizer.optimize(
-            x_init=inputs,
+        # The optimizer will work in original pixel space
+        x_adv_denorm, opt_metrics = self.optimizer.optimize(
+            x_init=denormalized_inputs,
             gradient_fn=gradient_fn,
             loss_fn=loss_fn,
             success_fn=success_fn,
-            x_original=inputs,  # Use the original inputs as a reference for the perturbation constraint.
+            x_original=denormalized_inputs,  # Use the original denormalized inputs as a reference for the perturbation constraint.
         )
+
+        # Renormalize the adversarial examples before returning
+        x_adv = self._renormalize(x_adv_denorm)
 
         # Update internal metrics with those returned by the optimizer.
         self.total_iterations = opt_metrics["iterations"]

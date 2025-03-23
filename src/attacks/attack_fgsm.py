@@ -34,10 +34,18 @@ class FGSM(BaseAttack):
     """
     Fast Gradient Sign Method (FGSM) adversarial attack.
 
-    This attack performs a single-step update in the direction of the gradient
-    to create adversarial examples quickly. It's simpler and faster than iterative
-    methods like PGD, but often creates more visible perturbations for the same
-    perturbation budget.
+    As described in the paper "Explaining and Harnessing Adversarial Examples"
+    (Goodfellow et al., 2014), this attack performs a single-step update in the
+    direction of the gradient to create adversarial examples quickly.
+
+    The attack formula is:
+        x_adv = x + epsilon * sign(∇J(x, y))
+
+    Where:
+        x is the original input
+        y is the target (true label for untargeted, target label for targeted)
+        J is the loss function
+        epsilon is the perturbation magnitude
     """
 
     def __init__(
@@ -78,13 +86,6 @@ class FGSM(BaseAttack):
         """
         Generate adversarial examples using FGSM.
 
-        The attack performs the following steps:
-          1. Moves inputs and targets to the appropriate device.
-          2. Computes the gradient of the loss with respect to the inputs.
-          3. Takes a single step in the direction of the gradient.
-          4. Clips the perturbation to ensure it's within the epsilon constraint.
-          5. Returns the adversarial examples along with metrics.
-
         Args:
             inputs: Input images (clean samples) to perturb.
             targets: Target labels (for targeted attacks) or true labels (for untargeted attacks).
@@ -102,77 +103,87 @@ class FGSM(BaseAttack):
         targets = targets.to(self.device)
 
         # Get and store original predictions for evaluation
-        self.store_original_predictions(inputs)
+        original_predictions = self.store_original_predictions(inputs)
 
-        # Prepare for gradient computation
+        # Create a copy of inputs that requires gradient
         inputs_with_grad = inputs.clone().detach().requires_grad_(True)
 
-        # Forward pass
+        # Forward pass through the model
         outputs = self.model(inputs_with_grad)
 
-        # Compute loss (depends on whether this is a targeted or untargeted attack)
-        # For targeted attacks, we minimize the loss
-        # For untargeted attacks, we maximize the loss
+        # Compute loss
         loss = self._compute_loss(outputs, targets)
 
-        # Compute gradients with respect to inputs
+        # Backpropagate to get gradients
         self.model.zero_grad()
         loss.backward()
 
-        # Extract gradients
-        gradients = inputs_with_grad.grad.detach()
+        # Get the gradients
+        data_grad = inputs_with_grad.grad.data
 
-        # For untargeted attacks, we want to maximize the loss,
-        # For targeted attacks, we want to minimize the loss
-        if not self.targeted:
-            # Maximize the loss (move in direction of gradient)
-            gradient_direction = gradients
-        else:
-            # Minimize the loss (move opposite of gradient)
-            gradient_direction = -gradients
+        # Determine direction based on attack type
+        # For untargeted attacks, we maximize the loss (follow gradient)
+        # For targeted attacks, we minimize the loss (go opposite of gradient)
+        if self.targeted:
+            data_grad = -data_grad
 
-        # Apply perturbation based on the norm
+        # First denormalize the input to apply perturbation in original pixel space
+        # (this matches PyTorch tutorial's approach)
+        denormalized_inputs = self._denormalize(inputs)
+
+        # Apply perturbation based on norm constraint (in original pixel space)
         if self.norm.lower() == "linf":
-            # For Linf norm, take the sign of the gradient
-            perturbation = self.eps * torch.sign(gradient_direction)
+            # FGSM original formulation: x_adv = x + epsilon * sign(grad)
+            # We need to scale epsilon by std if normalization is used
+            if self.std is not None:
+                # Scale epsilon by the standard deviation for each channel
+                scaled_eps = self.eps * self.std
+                perturbation = scaled_eps * torch.sign(data_grad)
+            else:
+                perturbation = self.eps * torch.sign(data_grad)
         else:  # L2 norm
-            # For L2 norm, normalize the gradient and scale by epsilon
-            # Add small constant to avoid division by zero
-            l2_norm = torch.norm(
-                gradient_direction.view(gradients.shape[0], -1), p=2, dim=1
-            )
-            l2_norm = torch.clamp(l2_norm, min=1e-12)
+            # Normalize the gradient to have unit L2 norm
+            grad_norms = torch.norm(data_grad.view(data_grad.shape[0], -1), p=2, dim=1)
+            # Avoid division by zero
+            grad_norms = torch.clamp(grad_norms, min=1e-12)
+            # Normalize and scale by epsilon
+            normalized_grad = data_grad / grad_norms.view(-1, 1, 1, 1)
 
-            # Normalize gradient to have unit L2 norm
-            gradient_direction_norm = gradient_direction / l2_norm.view(-1, 1, 1, 1)
+            # Scale epsilon by std if normalization is used
+            if self.std is not None:
+                scaled_eps = self.eps * self.std
+                perturbation = scaled_eps * normalized_grad
+            else:
+                perturbation = self.eps * normalized_grad
 
-            # Scale by epsilon
-            perturbation = self.eps * gradient_direction_norm
+        # Apply perturbation to create adversarial examples in original pixel space
+        denorm_adv_inputs = denormalized_inputs + perturbation
 
-        # Create adversarial examples by applying the perturbation
-        adv_inputs = inputs + perturbation
+        # Clip to ensure valid image range in original pixel space
+        denorm_adv_inputs = torch.clamp(
+            denorm_adv_inputs, min=self.clip_min, max=self.clip_max
+        )
 
-        # Clip the adversarial examples to ensure they're valid images
-        adv_inputs = torch.clamp(adv_inputs, min=self.clip_min, max=self.clip_max)
+        # Renormalize to feed back into the model
+        adv_inputs = self._renormalize(denorm_adv_inputs)
 
-        # Get predictions on adversarial examples
+        # Evaluate attack success
         with torch.no_grad():
             adv_outputs = self.model(adv_inputs)
-            adv_predictions = adv_outputs.argmax(dim=1)
+            success_mask = self._check_success(adv_outputs, targets)
+            success_rate = success_mask.float().mean().item() * 100
 
-        # Calculate success rate
-        if self.targeted:
-            # For targeted attacks, success is when the model predicts the target class
-            success = (adv_predictions == targets).float().mean().item() * 100
-        else:
-            # For untargeted attacks, success is when the model's prediction changes
-            success = (adv_predictions != targets).float().mean().item() * 100
-
-        # Calculate time taken
+        # Update metrics
         self.total_time = time.time() - start_time
         self.total_gradient_calls = 1  # FGSM uses a single gradient call
+        self.total_iterations = 1  # FGSM is a single-step attack
 
         # Compile metrics
-        metrics = {**self.get_metrics(), "success_rate": success}
+        metrics = {**self.get_metrics(), "success_rate": success_rate}
+
+        if self.verbose:
+            print(
+                f"FGSM Attack: Epsilon = {self.eps}, Success Rate = {success_rate:.2f}%"
+            )
 
         return adv_inputs, metrics

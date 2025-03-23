@@ -101,8 +101,14 @@ class CW(BaseAttack):
 
     def _to_tanh_space(self, x: torch.Tensor) -> torch.Tensor:
         """Convert from image space to tanh space for optimization."""
+        # If normalized, convert to original pixel space first
+        if self.mean is not None and self.std is not None:
+            x_denorm = self._denormalize(x)
+        else:
+            x_denorm = x
+
         # Normalize to [-1, 1]
-        x_tanh = (x - self.boxmul) / self.boxplus
+        x_tanh = (x_denorm - self.boxmul) / self.boxplus
         # Apply arctanh (with clipping for numerical stability)
         return torch.atanh(torch.clamp(x_tanh, -0.99999, 0.99999))
 
@@ -111,7 +117,13 @@ class CW(BaseAttack):
         # Apply tanh to ensure range [-1, 1]
         x_t = torch.tanh(x_tanh)
         # Scale back to image space
-        return self.boxplus * x_t + self.boxmul
+        x_denorm = self.boxplus * x_t + self.boxmul
+
+        # If normalized, convert back to normalized space for the model
+        if self.mean is not None and self.std is not None:
+            return self._renormalize(x_denorm)
+        else:
+            return x_denorm
 
     def _cw_loss(
         self,
@@ -138,11 +150,21 @@ class CW(BaseAttack):
         Returns:
             A tuple (total_loss, classification_loss, distance_loss)
         """
-        # Convert adversarial examples from tanh space to image space
+        # Convert adversarial examples from tanh space to image space (normalized if needed)
         x_adv = self._to_image_space(x_adv_tanh)
 
-        # Compute L2 distance between original and adversarial examples
-        l2_dist = torch.norm((x_adv - x_origin).view(x_origin.shape[0], -1), p=2, dim=1)
+        # For L2 distance, we need to compute in denormalized space
+        if self.mean is not None and self.std is not None:
+            x_adv_denorm = self._denormalize(x_adv)
+            x_origin_denorm = self._denormalize(x_origin)
+            l2_dist = torch.norm(
+                (x_adv_denorm - x_origin_denorm).view(x_origin.shape[0], -1), p=2, dim=1
+            )
+        else:
+            # If not normalized, compute L2 distance directly
+            l2_dist = torch.norm(
+                (x_adv - x_origin).view(x_origin.shape[0], -1), p=2, dim=1
+            )
 
         # Get the logits for the target class
         target_logits = torch.gather(logits, 1, target_labels.unsqueeze(1)).squeeze(1)
@@ -200,7 +222,7 @@ class CW(BaseAttack):
         targets = targets.to(self.device)
 
         # Get and store original predictions for evaluation
-        self.store_original_predictions(inputs)
+        original_predictions = self.store_original_predictions(inputs)
 
         batch_size = inputs.shape[0]
 
@@ -208,7 +230,8 @@ class CW(BaseAttack):
         if not self.targeted:
             with torch.no_grad():
                 # Get true labels to use as targets for untargeted attack
-                targets = self.model(inputs).argmax(dim=1)
+                if targets is None or targets.shape[0] != inputs.shape[0]:
+                    targets = self.model(inputs).argmax(dim=1)
 
         # Initialize variables for binary search
         c_lower = torch.zeros(batch_size, device=self.device)
@@ -244,7 +267,7 @@ class CW(BaseAttack):
 
             # Main optimization loop for this binary search step
             for iteration in range(self.max_iter):
-                # Forward pass
+                # Forward pass - convert from tanh space to normalized image space for the model
                 x_adv = self._to_image_space(x_adv_tanh)
                 logits = self.model(x_adv)
 
@@ -316,12 +339,33 @@ class CW(BaseAttack):
         self.total_time = time.time() - start_time
         self.total_iterations = self.max_iter * self.binary_search_steps
 
-        # Compile metrics
-        metrics = {
-            **self.get_metrics(),
-            "success_rate": success_rate,
-            "avg_l2_norm": avg_l2,
-            "best_c": best_c.mean().item(),
-        }
+        # Calculate L2 perturbation in denormalized space for proper reporting
+        if self.mean is not None and self.std is not None:
+            inputs_denorm = self._denormalize(inputs)
+            best_adv_denorm = self._denormalize(best_adv)
+            l2_norms = torch.norm(
+                (best_adv_denorm - inputs_denorm).view(batch_size, -1), p=2, dim=1
+            )
+            avg_l2_denorm = (
+                l2_norms[attack_success].mean().item()
+                if attack_success.any()
+                else float("inf")
+            )
+
+            # Add this to metrics
+            metrics = {
+                **self.get_metrics(),
+                "success_rate": success_rate,
+                "avg_l2_norm": avg_l2,
+                "avg_l2_norm_denorm": avg_l2_denorm,
+                "best_c": best_c.mean().item(),
+            }
+        else:
+            metrics = {
+                **self.get_metrics(),
+                "success_rate": success_rate,
+                "avg_l2_norm": avg_l2,
+                "best_c": best_c.mean().item(),
+            }
 
         return best_adv, metrics
