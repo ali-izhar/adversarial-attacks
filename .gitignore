@@ -179,3 +179,5 @@ paper/
 # imagenet
 data/
 
+# results
+results/
