@@ -28,7 +28,7 @@ import torch
 import time
 from typing import Tuple, Dict, Any, Optional, Callable
 
-from src.utils.projections import project_adversarial_example
+from ..projections import project_adversarial_example
 
 
 class ConjugateGradientOptimizer:

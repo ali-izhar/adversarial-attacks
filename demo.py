@@ -1,7 +1,4 @@
-"""
-Script to test a single adversarial attack method at a time.
-Supports multiple adversarial attack methods with visualization.
-"""
+"""Demo script to test an adversarial attack method."""
 
 import os
 import torch
@@ -11,13 +8,9 @@ from PIL import Image
 import argparse
 
 from src.attacks.attack_cg import ConjugateGradient
-from src.attacks.attack_cw import CW
-from src.attacks.attack_deepfool import DeepFool
-from src.attacks.attack_ffgsm import FFGSM
-from src.attacks.attack_fgsm import FGSM
 from src.attacks.attack_lbfgs import LBFGS
 from src.attacks.attack_pgd import PGD
-
+from src.attacks.baseline import CW, DeepFool, FFGSM, FGSM
 from src.plot.compare import visualize_attack
 
 

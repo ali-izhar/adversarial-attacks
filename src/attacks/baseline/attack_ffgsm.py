@@ -20,7 +20,7 @@ import torch
 import time
 from typing import Tuple, Dict, Any, Optional
 
-from .base import BaseAttack
+from ..base import BaseAttack
 
 
 class FFGSM(BaseAttack):

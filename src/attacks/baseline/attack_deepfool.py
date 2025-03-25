@@ -21,7 +21,7 @@ import time
 import numpy as np
 from typing import Tuple, Dict, Any, Optional
 
-from .base import BaseAttack
+from ..base import BaseAttack
 
 
 class DeepFool(BaseAttack):
