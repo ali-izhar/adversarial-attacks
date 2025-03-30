@@ -329,6 +329,10 @@ class CW(BaseAttack):
         # Track attack success for each sample
         attack_success = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
 
+        # Track total iterations and gradient calls
+        total_iterations = 0
+        total_grad_calls = 0
+
         # Binary search to find the optimal c value
         for binary_step in range(self.binary_search_steps):
             if self.verbose:
@@ -353,6 +357,9 @@ class CW(BaseAttack):
                 # Forward pass - convert from tanh space to normalized image space for the model
                 x_adv = self._to_image_space(x_adv_tanh)
                 logits = self.model(x_adv)
+
+                # Count this as a gradient call
+                total_grad_calls += 1
 
                 # Compute C&W loss
                 loss, cls_loss, l2_dist = self._cw_loss(
@@ -398,8 +405,8 @@ class CW(BaseAttack):
                 (loss.sum()).backward()
                 optimizer.step()
 
-                # Count iterations for metrics
-                self.total_iterations += 1
+                # Count this iteration
+                total_iterations += 1
 
             # Update c for the next binary search iteration
             for i in range(batch_size):
@@ -423,6 +430,8 @@ class CW(BaseAttack):
 
         # Update timing metrics
         self.total_time = time.time() - start_time
+        self.total_iterations = total_iterations
+        self.total_gradient_calls = total_grad_calls
 
         # Calculate L2 perturbation in denormalized space for proper reporting
         if self.mean is not None and self.std is not None:
@@ -444,6 +453,8 @@ class CW(BaseAttack):
                 "avg_l2_norm": avg_l2,
                 "avg_l2_norm_denorm": avg_l2_denorm,
                 "best_c": best_c.mean().item(),
+                "iterations": total_iterations,
+                "gradient_calls": total_grad_calls,
             }
         else:
             metrics = {
@@ -451,6 +462,8 @@ class CW(BaseAttack):
                 "success_rate": success_rate,
                 "avg_l2_norm": avg_l2,
                 "best_c": best_c.mean().item(),
+                "iterations": total_iterations,
+                "gradient_calls": total_grad_calls,
             }
 
         return best_adv, metrics
