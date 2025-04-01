@@ -164,6 +164,10 @@ class DeepFool(BaseAttack):
             batch_size, dtype=torch.int, device=self.device
         )
 
+        # Validate number of classes early on
+        if self.num_classes <= 0:
+            raise ValueError(f"Invalid number of classes: {self.num_classes}")
+
         # For each input in the batch, perform DeepFool attack separately
         for idx in range(batch_size):
             # We'll work with normalized inputs with the model
@@ -199,117 +203,80 @@ class DeepFool(BaseAttack):
                 if current_pred != orig_pred:
                     break
 
-                # Get all classes except the original prediction
-                try:
-                    other_classes = list(range(self.num_classes))
-                    # Handle the case where orig_pred is outside our range of classes
-                    if orig_pred < self.num_classes:
-                        other_classes.remove(orig_pred)
-                    else:
-                        # If original prediction is outside our subset, we need to use all classes
-                        if self.verbose:
-                            print(
-                                f"Warning: Original prediction {orig_pred} is outside class range 0-{self.num_classes-1}"
-                            )
-                            print("Consider using a larger num_classes parameter")
-                except ValueError as e:
-                    # This shouldn't happen after the above check, but just in case
+                # Handling out-of-range predictions more gracefully
+                if orig_pred >= self.num_classes:
                     if self.verbose:
                         print(
-                            f"Error removing class {orig_pred} from {other_classes}: {e}"
+                            f"Original prediction {orig_pred} exceeds specified num_classes {self.num_classes}"
                         )
-                    # Just continue with all other classes
-                    other_classes = [
-                        c for c in range(self.num_classes) if c != orig_pred
+                    # Use actual model output size instead
+                    actual_class_count = logits.shape[1]
+                    target_classes = [
+                        i for i in range(actual_class_count) if i != orig_pred
                     ]
+
+                # Always consider all classes or use a smarter selection strategy
+                target_classes = [i for i in range(self.num_classes) if i != orig_pred]
+
+                # For very large number of classes, use dynamic selection based on model confidence
+                if self.num_classes > 100:
+                    values, indices = torch.topk(
+                        logits[0], k=min(20, self.num_classes - 1)
+                    )
+                    high_conf_classes = [
+                        i.item() for i in indices if i.item() != orig_pred
+                    ]
+                    # Add some low confidence classes to avoid missing important boundaries
+                    low_conf_indices = torch.topk(
+                        logits[0], k=self.num_classes, largest=False
+                    )[1]
+                    low_conf_classes = [
+                        i.item() for i in low_conf_indices[:5] if i.item() != orig_pred
+                    ]
+                    target_classes = list(set(high_conf_classes + low_conf_classes))
 
                 # Ensure adv_x requires gradients for backward pass
                 if not adv_x.requires_grad:
                     adv_x = adv_x.detach().requires_grad_(True)
-
-                # For limited number of classes, use all; otherwise sample subset
-                if self.num_classes <= 10:
-                    target_classes = other_classes
-                else:
-                    # Choose the top k classes (closest decision boundaries)
-                    # that are not the original class
-                    values, indices = torch.topk(logits[0], k=10)
-                    target_classes = [
-                        i.item() for i in indices if i.item() != orig_pred
-                    ]
-                    # If we have fewer than 9 classes, add some random ones
-                    if len(target_classes) < 9:
-                        additional = np.random.choice(
-                            other_classes,
-                            size=min(9 - len(target_classes), len(other_classes)),
-                            replace=False,
-                        )
-                        target_classes.extend(additional)
 
                 # Initialize variables for finding closest boundary
                 min_dist = float("inf")
                 closest_class = None
                 grad_closest = None
 
-                # For each target class
+                # Reuse the same tensor for gradient computation to avoid memory fragmentation
+                grad_placeholder = torch.zeros_like(adv_x)
+
+                # For each target class:
                 for k in target_classes:
-                    # Zero gradient
-                    self.model.zero_grad()
-                    if adv_x.grad is not None:
-                        adv_x.grad.zero_()
+                    # Create copies with gradient tracking
+                    adv_x_k = adv_x.detach().clone().requires_grad_(True)
+                    adv_x_orig = adv_x.detach().clone().requires_grad_(True)
 
-                    # Make sure adv_x requires gradients for this backward pass
-                    if not adv_x.requires_grad:
-                        adv_x = adv_x.detach().requires_grad_(True)
+                    # Forward passes
+                    logits_k = self.model(adv_x_k)
+                    logits_orig = self.model(adv_x_orig)
 
-                    # Get score for class k
-                    score_k = logits[0, k]
+                    # Backward passes
+                    score_k = logits_k[0, k]
+                    score_k.backward()
 
-                    # Compute gradient of score_k with respect to input
-                    try:
-                        score_k.backward(retain_graph=True)
-                        if adv_x.grad is None:
-                            # If gradient is still None, there's a problem
-                            if self.verbose:
-                                print(
-                                    f"Warning: Gradient is None after backward pass for class {k}"
-                                )
-                            continue
-                        grad_k = adv_x.grad.clone()
-                    except Exception as e:
-                        if self.verbose:
-                            print(f"Error during backward pass for class {k}: {e}")
+                    score_orig = logits_orig[0, orig_pred]
+                    score_orig.backward()
+
+                    # Get gradients
+                    grad_k = adv_x_k.grad
+                    grad_orig = adv_x_orig.grad
+
+                    # Make sure gradients have correct shape
+                    if grad_k is None or grad_orig is None:
                         continue
 
-                    # Zero gradients for next computation
-                    self.model.zero_grad()
-                    if adv_x.grad is not None:
-                        adv_x.grad.zero_()
-
-                    # Get score for original class
-                    score_orig = logits[0, orig_pred]
-
-                    # Compute gradient of score_orig with respect to input
-                    try:
-                        score_orig.backward(retain_graph=True)
-                        if adv_x.grad is None:
-                            # If gradient is still None, there's a problem
-                            if self.verbose:
-                                print(
-                                    f"Warning: Gradient is None after backward pass for original class"
-                                )
-                            continue
-                        grad_orig = adv_x.grad.clone()
-                    except Exception as e:
-                        if self.verbose:
-                            print(f"Error during backward pass for original class: {e}")
-                        continue
-
-                    # Compute difference in gradients
+                    # Compute gradient difference - ensure correct shape
                     grad_diff = grad_orig - grad_k
 
-                    # Compute difference in scores
-                    score_diff = score_orig - score_k
+                    # Compute score difference - use scalar values
+                    score_diff = float(logits_orig[0, orig_pred] - logits_k[0, k])
 
                     # Compute distance to boundary for this class
                     if self.norm.lower() == "l2":
@@ -334,12 +301,17 @@ class DeepFool(BaseAttack):
 
                 # If we found a class to perturb toward
                 if closest_class is not None:
-                    # Compute perturbation direction
+                    # Compute perturbation direction (ensure correct shape)
                     if self.norm.lower() == "l2":
                         grad_norm = torch.norm(grad_closest.flatten(), p=2)
-                        perturbation = (min_dist / grad_norm) * grad_closest
+                        # Ensure no dimension issues in perturbation calculation
+                        perturbation = min_dist * (grad_closest / grad_norm)
                     else:  # Linf
                         perturbation = min_dist * torch.sign(grad_closest)
+
+                    # Make sure perturbation has same shape as adv_x before adding
+                    if perturbation.shape != adv_x.shape:
+                        perturbation = perturbation.reshape(adv_x.shape)
 
                     # Apply perturbation
                     adv_x = adv_x + perturbation
@@ -348,13 +320,24 @@ class DeepFool(BaseAttack):
                     # Ensure valid image range - this needs to happen in normalized space
                     # to ensure the model can process it correctly
                     if self.mean is not None and self.std is not None:
-                        # In normalized space, we need to ensure values remain reasonable
-                        # We can approximate by keeping the perturbation conservative
-                        mean_val = self.mean.mean().item()
-                        std_val = self.std.mean().item()
-                        norm_min = (0.0 - mean_val) / std_val
-                        norm_max = (1.0 - mean_val) / std_val
-                        adv_x = torch.clamp(adv_x, norm_min, norm_max)
+                        # Clone first to avoid modifying the original
+                        adv_x_denorm = adv_x.clone()
+
+                        # Extract the standard deviation and mean for each channel
+                        std_c = self.std.squeeze()  # Convert from [1,C,1,1] to [C]
+                        mean_c = self.mean.squeeze()
+
+                        # Apply denormalization properly with broadcasting
+                        for c in range(adv_x.shape[1]):
+                            # Properly apply the normalization with proper dimensions
+                            adv_x_denorm[0, c] = adv_x[0, c] * std_c[c] + mean_c[c]
+
+                        # Clip the values
+                        adv_x_denorm = torch.clamp(adv_x_denorm, 0.0, 1.0)
+
+                        # Re-normalize back
+                        for c in range(adv_x.shape[1]):
+                            adv_x[0, c] = (adv_x_denorm[0, c] - mean_c[c]) / std_c[c]
                     else:
                         # Without normalization, just use 0-1 range
                         adv_x = torch.clamp(adv_x, 0.0, 1.0)
@@ -389,6 +372,19 @@ class DeepFool(BaseAttack):
                 pert_norms[idx] = torch.norm(
                     total_perturbation.flatten(), p=float("inf")
                 )
+
+            # Early stopping based on perturbation norm threshold
+            max_perturbation_threshold = 0.2  # Or any other appropriate threshold
+            current_pert_norm = torch.norm(
+                total_perturbation.flatten(),
+                p=2 if self.norm.lower() == "l2" else float("inf"),
+            )
+            if current_pert_norm > max_perturbation_threshold:
+                if self.verbose:
+                    print(
+                        f"Stopping early: perturbation norm {current_pert_norm:.4f} exceeds threshold {max_perturbation_threshold}"
+                    )
+                break
 
         # Calculate success rate and other metrics
         success_rate = successful.float().mean().item() * 100

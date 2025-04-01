@@ -3,7 +3,7 @@
 # Dataset configuration
 dataset:
   name: "imagenet"
-  num_images: 10
+  num_images: 1
   image_dir: "data/imagenet/images"
 
 # Model configuration

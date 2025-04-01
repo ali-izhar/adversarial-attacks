@@ -47,9 +47,7 @@ std = torch.tensor([0.229, 0.224, 0.225])
 
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Evaluate adversarial attack methods."
-    )
+    parser = argparse.ArgumentParser(description="Evaluate adversarial attack methods.")
     parser.add_argument(
         "--config",
         type=str,
@@ -109,58 +107,66 @@ def load_imagenet_samples(num_images=100, image_dir="data/imagenet/images"):
     If sample images don't exist locally, download a sample set.
     """
     print(f"Loading {num_images} ImageNet sample images...")
-    
+
     os.makedirs(image_dir, exist_ok=True)
-    
+
     # If no images in directory, download a small sample set
-    if len([f for f in os.listdir(image_dir) if f.endswith('.JPEG')]) < num_images:
+    if len([f for f in os.listdir(image_dir) if f.endswith(".JPEG")]) < num_images:
         print("Downloading ImageNet sample images...")
         # This URL contains sample ImageNet images (adjust if needed)
         import requests
         import zipfile
         from io import BytesIO
-        
+
         # Get a sample set of images from the github repo
-        sample_url = "https://github.com/EliSchwartz/imagenet-sample-images/archive/master.zip"
-        
+        sample_url = (
+            "https://github.com/EliSchwartz/imagenet-sample-images/archive/master.zip"
+        )
+
         try:
             r = requests.get(sample_url)
             z = zipfile.ZipFile(BytesIO(r.content))
             z.extractall("data/imagenet/")
-            
+
             # Move images to the correct directory
             import shutil
+
             sample_dir = "data/imagenet/imagenet-sample-images-master"
             for f in os.listdir(sample_dir):
-                if f.endswith('.JPEG'):
+                if f.endswith(".JPEG"):
                     shutil.copy(os.path.join(sample_dir, f), image_dir)
-            
+
             print(f"Downloaded sample images to {image_dir}")
         except Exception as e:
             print(f"Error downloading sample images: {e}")
             print("Please manually download images to the specified directory.")
             return []
-    
+
     # Load and preprocess images
-    transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
-    ])
-    
+    transform = transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ]
+    )
+
     image_tensors = []
-    image_paths = [os.path.join(image_dir, f) for f in os.listdir(image_dir) 
-                  if f.endswith('.JPEG') or f.endswith('.jpg') or f.endswith('.png')]
-    
+    image_paths = [
+        os.path.join(image_dir, f)
+        for f in os.listdir(image_dir)
+        if f.endswith(".JPEG") or f.endswith(".jpg") or f.endswith(".png")
+    ]
+
     for i, img_path in enumerate(image_paths[:num_images]):
         try:
-            img = Image.open(img_path).convert('RGB')
+            img = Image.open(img_path).convert("RGB")
             img_tensor = transform(img).unsqueeze(0).to(device)
             image_tensors.append(img_tensor)
         except Exception as e:
             print(f"Error loading {img_path}: {e}")
-    
+
     print(f"Loaded {len(image_tensors)} images")
     return image_tensors
 
@@ -171,7 +177,7 @@ def get_prediction(model, img_tensor):
         output = model(img_tensor)
         probabilities = torch.nn.functional.softmax(output, dim=1)[0]
         confidence, index = torch.max(probabilities, 0)
-    
+
     return {
         "index": index.item(),
         "confidence": confidence.item(),
@@ -213,19 +219,19 @@ def denormalize_to_numpy(tensor, mean, std):
 def create_attack(config, model, norm):
     """
     Dynamically create the attack method based on config.
-    
+
     Args:
         config: Configuration dictionary
         model: The model to attack
         norm: Norm to use ('L2' or 'Linf')
-        
+
     Returns:
         Instantiated attack method
     """
     method = config["attack"]["method"]
     targeted = config["attack"]["targeted"]
     params = config["attack"]["params"][method]
-    
+
     if method == "FGSM":
         return FGSM(
             model=model,
@@ -277,68 +283,79 @@ def create_attack(config, model, norm):
 def run_attack_evaluation(config, models_dict, images):
     """
     Run attack evaluation on all models with parameters from config.
-    
+
     Args:
         config: Configuration dictionary
         models_dict: Dictionary of models to test
         images: List of input image tensors
-        
+
     Returns:
         Dictionary of results for all tables
     """
     method = config["attack"]["method"]
     targeted = config["attack"]["targeted"]
     norm_types = config["attack"]["norm_types"]
-    
+
     all_results = {}
-    
+
     # For each norm type specified in config
     for norm in norm_types:
-        print(f"\nEvaluating {method} attack with {norm} norm ({'targeted' if targeted else 'untargeted'})")
-        
+        print(
+            f"\nEvaluating {method} attack with {norm} norm ({'targeted' if targeted else 'untargeted'})"
+        )
+
         # Get epsilon values for this norm
         if method in ["FGSM", "FFGSM"]:
             eps_values = config["attack"]["params"][method]["eps_values"][norm]
         else:
             # For methods that don't use epsilon (like DeepFool), use a dummy value
             eps_values = [0.0]
-        
+
         # Initialize results structure for all tables
         results = {
-            "table1": {model_name: {str(eps): 0 for eps in eps_values} for model_name in models_dict},
-            "table2": {str(eps): {"l2_norm": 0, "linf_norm": 0, "ssim": 0} for eps in eps_values},
-            "table3": {str(eps): {"iterations": 0, "gradient_calls": 0, "runtime": 0} for eps in eps_values}
+            "table1": {
+                model_name: {str(eps): 0 for eps in eps_values}
+                for model_name in models_dict
+            },
+            "table2": {
+                str(eps): {"l2_norm": 0, "linf_norm": 0, "ssim": 0}
+                for eps in eps_values
+            },
+            "table3": {
+                str(eps): {"iterations": 0, "gradient_calls": 0, "runtime": 0}
+                for eps in eps_values
+            },
         }
-        
+
         # Initialize counters for averaging
         attack_counts = {str(eps): 0 for eps in eps_values}
-        
+
         # Create a tqdm progress bar for the total number of evaluations
         total_evals = len(models_dict) * len(images) * len(eps_values)
         pbar = tqdm(total=total_evals, desc=f"{method} {norm} Evaluation")
-        
+
         # Initialize detailed results for CSV export
         detailed_results = []
-        
+
         # For each model and image
         for model_name, model in models_dict.items():
             print(f"\nEvaluating {method} on {model_name}")
-            
+
             for image_idx, image in enumerate(images):
                 # Get original prediction
                 orig_pred = get_prediction(model, image)
-                
+
                 # For each epsilon value
                 for eps in eps_values:
                     eps_str = str(eps)
-                    
+
                     # Create attack instance
                     attack = create_attack(config, model, norm)
-                    
+
                     # For methods that use epsilon, set it
                     if hasattr(attack, "eps"):
                         attack.eps = eps
-                    
+
                     # Set target label (for either targeted or untargeted attack)
                     if targeted:
                         # For targeted attack, target a random class different from original
@@ -347,60 +364,64 @@ def run_attack_evaluation(config, models_dict, images):
                     else:
                         # For untargeted attack, use the original class
                         target = torch.tensor([orig_pred["index"]]).to(device)
-                    
+
                     # Measure runtime
                     start_time = time.time()
-                    
+
                     # Generate adversarial example
                     try:
                         adv_image, attack_metrics = attack.generate(image, target)
-                        
+
                         # Record runtime
                         runtime = time.time() - start_time
-                        
+
                         # Get new prediction
                         adv_pred = get_prediction(model, adv_image)
-                        
+
                         # Determine success (for untargeted: prediction changed, for targeted: prediction matches target)
                         if targeted:
                             success = adv_pred["index"] == target_class
                         else:
                             success = adv_pred["index"] != orig_pred["index"]
-                        
+
                         # Calculate perturbation metrics
                         perturbation = adv_image - image
-                        l2_norm = torch.norm(perturbation.view(perturbation.shape[0], -1), p=2).item()
-                        linf_norm = torch.norm(perturbation.view(perturbation.shape[0], -1), p=float("inf")).item()
+                        l2_norm = torch.norm(
+                            perturbation.view(perturbation.shape[0], -1), p=2
+                        ).item()
+                        linf_norm = torch.norm(
+                            perturbation.view(perturbation.shape[0], -1), p=float("inf")
+                        ).item()
                         ssim_value = calculate_ssim(image, adv_image)
-                        
+
                         # Get computational metrics
                         if hasattr(attack, "total_iterations"):
                             iterations = attack.total_iterations
                         else:
                             iterations = 1  # Default for single-step methods
-                            
+
                         if hasattr(attack, "total_gradient_calls"):
                             gradient_calls = attack.total_gradient_calls
                         else:
                             gradient_calls = 1  # Default for simple methods
-                        
+
                         # Update results for Table 1 (success rates per model)
                         if success:
                             results["table1"][model_name][eps_str] += 1
-                        
+
                         # Update results for Table 2 (perturbation metrics)
                         results["table2"][eps_str]["l2_norm"] += l2_norm
                         results["table2"][eps_str]["linf_norm"] += linf_norm
                         results["table2"][eps_str]["ssim"] += ssim_value
-                        
+
                         # Update results for Table 3 (computational metrics)
                         results["table3"][eps_str]["iterations"] += iterations
                         results["table3"][eps_str]["gradient_calls"] += gradient_calls
                         results["table3"][eps_str]["runtime"] += runtime
-                        
+
                         # Increment counter
                         attack_counts[eps_str] += 1
-                        
+
                         # Record detailed result
                         detailed_result = {
                             "model": model_name,
@@ -421,73 +442,92 @@ def run_attack_evaluation(config, models_dict, images):
                             "adversarial_confidence": adv_pred["confidence"],
                         }
                         detailed_results.append(detailed_result)
-                        
-                    except Exception as e:
-                        print(f"Error during attack: {e}")
-                        detailed_result = {
-                            "model": model_name,
-                            "image_idx": image_idx,
-                            "epsilon": eps,
-                            "norm": norm,
-                            "targeted": targeted,
-                            "error": str(e)
-                        }
-                        detailed_results.append(detailed_result)
-                    
+
+                    except RuntimeError as e:
+                        if "expanded size" in str(
+                            e
+                        ) and "must match the existing size" in str(e):
+                            # Fix for dimension mismatch
+                            # Process each image individually without batch dimension to avoid shape issues
+                            if len(image.shape) == 4:  # [batch, channel, height, width]
+                                adv_image = image.clone()
+
+                                # Loop through each image in batch individually
+                                for i in range(image.shape[0]):
+                                    single_img = image[
+                                        i : i + 1
+                                    ]  # Keep batch dimension as 1
+                                    single_adv, _ = attack.generate(single_img)
+                                    adv_image[i] = single_adv[0]  # Store result
+
+                                # Recalculate metrics since we bypassed normal flow
+                                attack_metrics = {
+                                    "runtime": time.time() - start_time,
+                                    "gradient_calls": attack.total_gradient_calls,
+                                    "iterations": attack.total_iterations,
+                                }
+                            else:
+                                # Re-raise if not a batch issue
+                                raise
+                        else:
+                            # Re-raise other errors
+                            raise
+
                     # Update progress bar
                     pbar.update(1)
-        
+
         pbar.close()
-        
+
         # Calculate averages for Tables 1, 2, and 3
         for eps_str in attack_counts.keys():
             # Skip if no successful attacks for this epsilon
             if attack_counts[eps_str] == 0:
                 continue
-            
+
             # Table 1: Convert counts to percentages per model
             for model_name in results["table1"]:
-                results["table1"][model_name][eps_str] = (results["table1"][model_name][eps_str] / len(images)) * 100
-            
+                results["table1"][model_name][eps_str] = (
+                    results["table1"][model_name][eps_str] / len(images)
+                ) * 100
+
             # Table 2: Average perturbation metrics
             results["table2"][eps_str]["l2_norm"] /= attack_counts[eps_str]
             results["table2"][eps_str]["linf_norm"] /= attack_counts[eps_str]
             results["table2"][eps_str]["ssim"] /= attack_counts[eps_str]
-            
+
             # Table 3: Average computational metrics
             results["table3"][eps_str]["iterations"] /= attack_counts[eps_str]
             results["table3"][eps_str]["gradient_calls"] /= attack_counts[eps_str]
             results["table3"][eps_str]["runtime"] /= attack_counts[eps_str]
-        
+
         # Save detailed results to CSV
         if config["evaluation"]["save_results"]:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = config["evaluation"]["output_dir"]
             os.makedirs(output_dir, exist_ok=True)
-            
+
             detailed_filename = f"{output_dir}/{method}_{norm}_{'targeted' if targeted else 'untargeted'}_{timestamp}.csv"
-            
+
             with open(detailed_filename, "w", newline="") as csvfile:
                 if detailed_results:
-                    writer = csv.DictWriter(csvfile, fieldnames=detailed_results[0].keys())
+                    writer = csv.DictWriter(
+                        csvfile, fieldnames=detailed_results[0].keys()
+                    )
                     writer.writeheader()
                     writer.writerows(detailed_results)
-            
+
             print(f"Detailed results saved to {detailed_filename}")
-            
+
             # Save table results to JSON
             table_filename = f"{output_dir}/{method}_{norm}_tables_{'targeted' if targeted else 'untargeted'}_{timestamp}.json"
             with open(table_filename, "w") as jsonfile:
                 json.dump(results, jsonfile, indent=2)
-            
+
             print(f"Table results saved to {table_filename}")
-        
+
         # Store results for this norm
-        all_results[norm] = {
-            "results": results,
-            "detailed_results": detailed_results
-        }
-    
+        all_results[norm] = {"results": results, "detailed_results": detailed_results}
+
     return all_results
 
 
@@ -495,25 +535,29 @@ def format_paper_tables(results, config, eps_value=None, norm="Linf"):
     """Format results into paper tables format for easy viewing."""
     method = config["attack"]["method"]
     targeted = config["attack"]["targeted"]
-    
+
     # If eps_value not provided, use a default from config if available
     if eps_value is None:
         if method in ["FGSM", "FFGSM"]:
-            eps_value = config["attack"]["params"][method]["eps_values"][norm][1]  # Use second value (typically mid-range)
+            eps_value = config["attack"]["params"][method]["eps_values"][norm][
+                1
+            ]  # Use second value (typically mid-range)
         else:
             eps_value = 0.0  # Default for methods that don't use epsilon
-    
+
     # Get the specific epsilon results
     eps_str = str(eps_value)
-    
+
     # Ensure results for this epsilon exist
     if eps_str not in results["table2"]:
         print(f"No results found for epsilon = {eps_value}")
         return
-    
+
     print(f"\n===== PAPER TABLE DATA FOR {method} =====")
-    print(f"Epsilon: {eps_value}, Norm: {norm}, {'Targeted' if targeted else 'Untargeted'}")
-    
+    print(
+        f"Epsilon: {eps_value}, Norm: {norm}, {'Targeted' if targeted else 'Untargeted'}"
+    )
+
     # Table 1: Success rates per model
     print("\nTable 1: Success Rates (%)")
     print("-" * 50)
@@ -522,7 +566,7 @@ def format_paper_tables(results, config, eps_value=None, norm="Linf"):
     for model, rates in results["table1"].items():
         if eps_str in rates:
             print(f"{model:<15} | {rates[eps_str]:.2f}")
-    
+
     # Table 2: Perturbation metrics
     print("\nTable 2: Perturbation Metrics")
     print("-" * 50)
@@ -530,7 +574,7 @@ def format_paper_tables(results, config, eps_value=None, norm="Linf"):
     print(f"L2 Norm:    {metrics['l2_norm']:.4f}")
     print(f"Linf Norm:   {metrics['linf_norm']:.4f}")
     print(f"SSIM:        {metrics['ssim']:.4f}")
-    
+
     # Table 3: Computational metrics
     print("\nTable 3: Computational Requirements")
     print("-" * 50)
@@ -543,41 +587,44 @@ def format_paper_tables(results, config, eps_value=None, norm="Linf"):
 def main():
     # Parse command line arguments
     args = parse_args()
-    
+
     # Load configuration
     config = load_config(args.config)
-    
+
     # Load models
     models = load_models(config["models"])
-    
+
     # Load sample images
     dataset_config = config["dataset"]
     images = load_imagenet_samples(
-        num_images=dataset_config["num_images"],
-        image_dir=dataset_config["image_dir"]
+        num_images=dataset_config["num_images"], image_dir=dataset_config["image_dir"]
     )
-    
+
     if not images:
         print("No images loaded, cannot continue.")
         return
-    
+
     # Run attack evaluation
     all_results = run_attack_evaluation(config, models, images)
-    
+
     # Format and display results for paper tables
     for norm in config["attack"]["norm_types"]:
         results = all_results[norm]["results"]
-        
+
         # Choose an epsilon value to display
         if config["attack"]["method"] in ["FGSM", "FFGSM"]:
-            eps_values = config["attack"]["params"][config["attack"]["method"]]["eps_values"][norm]
-            eps_to_display = eps_values[1] if len(eps_values) > 1 else eps_values[0]  # Use second value if available
+            eps_values = config["attack"]["params"][config["attack"]["method"]][
+                "eps_values"
+            ][norm]
+            eps_to_display = (
+                eps_values[1] if len(eps_values) > 1 else eps_values[0]
+            )  # Use second value if available
         else:
             eps_to_display = 0.0
-        
+
         # Display formatted tables
         format_paper_tables(results, config, eps_value=eps_to_display, norm=norm)
-    
+
     print("\nEvaluation complete. Results are saved in the output directory.")
 
 
