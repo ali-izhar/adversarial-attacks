@@ -1,0 +1,72 @@
+# Configuration for adversarial attack method evaluation
+
+# Dataset configuration
+dataset:
+  name: "imagenet"
+  num_images: 10
+  image_dir: "data/imagenet/images"
+
+# Model configuration
+models:
+  - "resnet18"
+  - "resnet50"
+  - "vgg16"
+  - "efficientnet"
+  - "mobilenet"
+
+# Evaluation parameters
+evaluation:
+  save_results: true
+  output_dir: "results"
+
+# Attack method configuration
+attack:
+  method: "CW"  # Options: FGSM, FFGSM, DeepFool, CW
+  targeted: false
+  norm_types:
+    - "Linf"
+    - "L2"
+  
+  # Method-specific parameters
+  params:
+    FGSM:
+      loss_fn: "cross_entropy"
+      eps_values:
+        Linf: [0.01, 0.03, 0.05, 0.1]
+        L2: [0.5, 1.0, 2.0, 5.0]
+    
+    FFGSM:
+      loss_fn: "cross_entropy"
+      alpha: 0.2
+      eps_values:
+        Linf: [0.01, 0.03, 0.05, 0.1]
+        L2: [0.5, 1.0, 2.0, 5.0]
+    
+    DeepFool:
+      num_classes: 1000
+      overshoot: 0.02
+      max_iter: 50
+    
+    CW:
+      confidence: 0.0
+      c_init: 0.01
+      max_iter: 1000
+      binary_search_steps: 5
+      learning_rate: 0.01
+      abort_early: true
+
+# Tables configuration for reporting results
+tables:
+  table1:
+    title: "Success Rates (%)"
+    description: "Attack success rates per model"
+  
+  table2:
+    title: "Perturbation Metrics" 
+    description: "Measures of perturbation size and quality"
+    metrics: ["l2_norm", "linf_norm", "ssim"]
+  
+  table3:
+    title: "Computational Requirements"
+    description: "Performance metrics for computational efficiency"
+    metrics: ["iterations", "gradient_calls", "runtime"]

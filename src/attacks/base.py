@@ -83,12 +83,12 @@ class BaseAttack(ABC):
         # These are important for correctly computing perturbations in the original input space
         try:
             self.mean = (
-                torch.tensor(model.mean).view(1, -1, 1, 1).to(self.device)
+                model.mean.clone().detach().view(1, -1, 1, 1).to(self.device)
                 if hasattr(model, "mean")
                 else None
             )
             self.std = (
-                torch.tensor(model.std).view(1, -1, 1, 1).to(self.device)
+                model.std.clone().detach().view(1, -1, 1, 1).to(self.device)
                 if hasattr(model, "std")
                 else None
             )

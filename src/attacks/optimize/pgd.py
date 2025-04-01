@@ -30,7 +30,7 @@ import time
 import numpy as np
 from typing import Tuple, Dict, Any, Optional, Callable
 
-from ..projections import project_adversarial_example
+from .projections import project_adversarial_example
 
 
 class PGDOptimizer:
