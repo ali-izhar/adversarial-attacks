@@ -21,7 +21,7 @@ evaluation:
 
 # Attack method configuration
 attack:
-  method: "CW"  # Options: FGSM, FFGSM, DeepFool, CW
+  method: "DeepFool"  # Options: FGSM, FFGSM, DeepFool, CW
   targeted: false
   norm_types:
     - "Linf"

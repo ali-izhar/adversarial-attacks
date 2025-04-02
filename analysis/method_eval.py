@@ -20,6 +20,8 @@ import yaml
 from datetime import datetime
 from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
+import torch.backends.cudnn as cudnn
+import gc
 
 from torchvision.models import (
     ResNet18_Weights,
@@ -43,6 +45,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ImageNet normalization parameters
 mean = torch.tensor([0.485, 0.456, 0.406])
 std = torch.tensor([0.229, 0.224, 0.225])
+
+# Enable cuDNN autotuner for faster convolutions
+cudnn.benchmark = True
 
 
 def parse_args():
@@ -92,6 +97,11 @@ def load_models(model_names):
 
         print(f"Loading {model_name}...")
         model = model_functions[model_name](weights=model_weights[model_name])
+
+        # Use channels_last memory format for better GPU performance on CUDA
+        if torch.cuda.is_available():
+            model = model.to(memory_format=torch.channels_last)
+
         model.mean = mean
         model.std = std
         model.eval()
@@ -292,11 +302,36 @@ def run_attack_evaluation(config, models_dict, images):
     Returns:
         Dictionary of results for all tables
     """
+    # 1. Detect and set optimal batch size based on available GPU memory
+    gpu_mem = torch.cuda.get_device_properties(0).total_memory
+    free_mem = torch.cuda.memory_reserved(0) - torch.cuda.memory_allocated(0)
+
+    # Calculate dynamic batch size based on available memory and image size
+    img_size_bytes = images[0].element_size() * images[0].nelement()
+    method = config["attack"]["method"]
+
+    # Different methods have different memory requirements
+    memory_factor = {
+        "FGSM": 3,  # Low memory usage
+        "FFGSM": 3,  # Low memory usage
+        "DeepFool": 8,  # Medium memory usage
+        "CW": 15,  # High memory usage (stores optimization history)
+    }
+
+    # Calculate batch size based on 70% of free memory (leave room for other operations)
+    max_batch_size = int(
+        0.7 * free_mem / (img_size_bytes * memory_factor.get(method, 5))
+    )
+    batch_size = max(1, min(len(images), max_batch_size))
+
+    print(f"Using batch size of {batch_size} for {method} attack")
+
+    # 2. Pre-allocate tensors for results to avoid dynamic allocations
+    all_results = {}
+
     method = config["attack"]["method"]
     targeted = config["attack"]["targeted"]
     norm_types = config["attack"]["norm_types"]
-
-    all_results = {}
 
     # For each norm type specified in config
     for norm in norm_types:
@@ -337,13 +372,18 @@ def run_attack_evaluation(config, models_dict, images):
         # Initialize detailed results for CSV export
         detailed_results = []
 
-        # For each model and image
+        # For each model, process images in batches
         for model_name, model in models_dict.items():
             print(f"\nEvaluating {method} on {model_name}")
 
-            for image_idx, image in enumerate(images):
-                # Get original prediction
-                orig_pred = get_prediction(model, image)
+            # Process images in batches
+            for batch_start in range(0, len(images), batch_size):
+                batch_end = min(batch_start + batch_size, len(images))
+                image_batch = torch.cat(images[batch_start:batch_end], dim=0)
+
+                # Get original predictions
+                with torch.amp.autocast("cuda", enabled=True):
+                    orig_preds = model(image_batch).argmax(dim=1)
 
                 # For each epsilon value
                 for eps in eps_values:
@@ -352,120 +392,229 @@ def run_attack_evaluation(config, models_dict, images):
                     # Create attack instance
                     attack = create_attack(config, model, norm)
 
-                    # For methods that use epsilon, set it
+                    # Set epsilon if applicable
                     if hasattr(attack, "eps"):
                         attack.eps = eps
 
-                    # Set target label (for either targeted or untargeted attack)
+                    # Set targets (for targeted/untargeted attacks)
                     if targeted:
                         # For targeted attack, target a random class different from original
-                        target_class = (orig_pred["index"] + 1) % 1000
-                        target = torch.tensor([target_class]).to(device)
+                        target_classes = (orig_preds + 1) % 1000
+                        targets = target_classes
                     else:
-                        # For untargeted attack, use the original class
-                        target = torch.tensor([orig_pred["index"]]).to(device)
+                        # For untargeted attack, use the original classes
+                        targets = orig_preds
 
                     # Measure runtime
                     start_time = time.time()
 
-                    # Generate adversarial example
+                    # Try batch processing first, fall back to individual if needed
                     try:
-                        adv_image, attack_metrics = attack.generate(image, target)
+                        # Enable mixed precision for faster computation
+                        with torch.amp.autocast("cuda", enabled=True):
+                            adv_images, attack_metrics = attack.generate(
+                                image_batch, targets
+                            )
 
-                        # Record runtime
-                        runtime = time.time() - start_time
+                            # Get new predictions
+                            adv_preds = model(adv_images).argmax(dim=1)
 
-                        # Get new prediction
-                        adv_pred = get_prediction(model, adv_image)
+                            # Determine success for each image in batch
+                            if targeted:
+                                successes = adv_preds == target_classes
+                            else:
+                                successes = adv_preds != orig_preds
 
-                        # Determine success (for untargeted: prediction changed, for targeted: prediction matches target)
-                        if targeted:
-                            success = adv_pred["index"] == target_class
-                        else:
-                            success = adv_pred["index"] != orig_pred["index"]
+                            # Measure perturbation metrics
+                            perturbations = adv_images - image_batch
+                            l2_norms = torch.norm(
+                                perturbations.reshape(perturbations.shape[0], -1),
+                                p=2,
+                                dim=1,
+                            )
+                            linf_norms = torch.norm(
+                                perturbations.reshape(perturbations.shape[0], -1),
+                                p=float("inf"),
+                                dim=1,
+                            )
 
-                        # Calculate perturbation metrics
-                        perturbation = adv_image - image
-                        l2_norm = torch.norm(
-                            perturbation.view(perturbation.shape[0], -1), p=2
-                        ).item()
-                        linf_norm = torch.norm(
-                            perturbation.view(perturbation.shape[0], -1), p=float("inf")
-                        ).item()
-                        ssim_value = calculate_ssim(image, adv_image)
+                            # Calculate ssim for each image
+                            ssim_values = [
+                                calculate_ssim(image_batch[i], adv_images[i])
+                                for i in range(len(image_batch))
+                            ]
 
-                        # Get computational metrics
-                        if hasattr(attack, "total_iterations"):
-                            iterations = attack.total_iterations
-                        else:
-                            iterations = 1  # Default for single-step methods
+                            # Get computational metrics
+                            if hasattr(attack, "total_iterations"):
+                                iterations = attack.total_iterations
+                            else:
+                                iterations = 1  # Default for single-step methods
 
-                        if hasattr(attack, "total_gradient_calls"):
-                            gradient_calls = attack.total_gradient_calls
-                        else:
-                            gradient_calls = 1  # Default for simple methods
+                            if hasattr(attack, "total_gradient_calls"):
+                                gradient_calls = attack.total_gradient_calls
+                            else:
+                                gradient_calls = 1  # Default for simple methods
 
-                        # Update results for Table 1 (success rates per model)
-                        if success:
-                            results["table1"][model_name][eps_str] += 1
+                            # Special handling for DeepFool
+                            if method == "DeepFool":
+                                # DeepFool needs memory optimization and special handling
+                                # Process each image individually to avoid memory issues
+                                for i in range(len(image_batch)):
+                                    # Clear GPU memory before processing each image
+                                    torch.cuda.empty_cache()
 
-                        # Update results for Table 2 (perturbation metrics)
-                        results["table2"][eps_str]["l2_norm"] += l2_norm
-                        results["table2"][eps_str]["linf_norm"] += linf_norm
-                        results["table2"][eps_str]["ssim"] += ssim_value
+                                    # Get individual image and target
+                                    img = image_batch[i : i + 1]
+                                    target = (
+                                        targets[i : i + 1]
+                                        if targets is not None
+                                        else None
+                                    )
 
-                        # Update results for Table 3 (computational metrics)
-                        results["table3"][eps_str]["iterations"] += iterations
-                        results["table3"][eps_str]["gradient_calls"] += gradient_calls
-                        results["table3"][eps_str]["runtime"] += runtime
+                                    # Generate adversarial example
+                                    adv_img, metrics = attack.generate(img, target)
 
-                        # Increment counter
-                        attack_counts[eps_str] += 1
+                                    # Update predictions
+                                    with torch.no_grad():
+                                        adv_preds[i] = model(adv_img).argmax(dim=1)[0]
 
-                        # Record detailed result
-                        detailed_result = {
-                            "model": model_name,
-                            "image_idx": image_idx,
-                            "epsilon": eps,
-                            "norm": norm,
-                            "targeted": targeted,
-                            "success": success,
-                            "l2_norm": l2_norm,
-                            "linf_norm": linf_norm,
-                            "ssim": ssim_value,
-                            "runtime": runtime,
-                            "iterations": iterations,
-                            "gradient_calls": gradient_calls,
-                            "original_class": orig_pred["index"],
-                            "original_confidence": orig_pred["confidence"],
-                            "adversarial_class": adv_pred["index"],
-                            "adversarial_confidence": adv_pred["confidence"],
-                        }
-                        detailed_results.append(detailed_result)
+                                    # Update perturbation metrics
+                                    perturbations = adv_img - img
+                                    l2_norms[i] = torch.norm(
+                                        perturbations.flatten(), p=2
+                                    )
+                                    linf_norms[i] = torch.norm(
+                                        perturbations.flatten(), p=float("inf")
+                                    )
+
+                                    # Calculate SSIM
+                                    ssim_values[i] = calculate_ssim(img, adv_img)
+
+                                    # Update success
+                                    if targeted:
+                                        successes[i] = adv_preds[i] == target_classes[i]
+                                    else:
+                                        successes[i] = adv_preds[i] != orig_preds[i]
+
+                                    # Update computational metrics
+                                    iterations = attack.total_iterations
+                                    gradient_calls = attack.total_gradient_calls
+
+                                    # Update results
+                                    results["table3"][eps_str][
+                                        "iterations"
+                                    ] += iterations
+                                    results["table3"][eps_str][
+                                        "gradient_calls"
+                                    ] += gradient_calls
+                                    results["table3"][eps_str]["runtime"] += (
+                                        time.time() - start_time
+                                    ) / len(image_batch)
+
+                                    # Monitor GPU memory usage
+                                    if torch.cuda.is_available():
+                                        memory_used = (
+                                            torch.cuda.memory_allocated(0) / 1e9
+                                        )  # Convert to GB
+                                        if (
+                                            memory_used > 0.8
+                                        ):  # If using more than 80% of GPU memory
+                                            print(
+                                                f"Warning: High GPU memory usage ({memory_used:.2f}GB)"
+                                            )
+                                            torch.cuda.empty_cache()
+
+                                    # Clear memory after processing each image
+                                    del adv_img, perturbations
+                                    torch.cuda.empty_cache()
+                            else:
+                                # Update results for Table 1 (success rates per model)
+                                results["table1"][model_name][
+                                    eps_str
+                                ] += successes.sum().item()
+
+                                # Update results for Table 2 (perturbation metrics)
+                                for i in range(len(image_batch)):
+                                    results["table2"][eps_str]["l2_norm"] += l2_norms[
+                                        i
+                                    ].item()
+                                    results["table2"][eps_str][
+                                        "linf_norm"
+                                    ] += linf_norms[i].item()
+                                    results["table2"][eps_str]["ssim"] += ssim_values[i]
+
+                                # Update results for Table 3 (computational metrics)
+                                if method in ["FGSM", "FFGSM"]:
+                                    results["table3"][eps_str]["iterations"] = 1.0
+                                    results["table3"][eps_str]["gradient_calls"] = 1.0
+                                    results["table3"][eps_str]["runtime"] += (
+                                        time.time() - start_time
+                                    )
+                                else:
+                                    results["table3"][eps_str][
+                                        "iterations"
+                                    ] += iterations
+                                    results["table3"][eps_str][
+                                        "gradient_calls"
+                                    ] += gradient_calls
+                                    results["table3"][eps_str]["runtime"] += (
+                                        time.time() - start_time
+                                    )
+
+                            # Increment counter
+                            attack_counts[eps_str] += len(image_batch)
+
+                            # Record detailed result
+                            for i in range(len(image_batch)):
+                                detailed_result = {
+                                    "model": model_name,
+                                    "image_idx": batch_start + i,
+                                    "epsilon": eps,
+                                    "norm": norm,
+                                    "targeted": targeted,
+                                    "success": successes[i],
+                                    "l2_norm": l2_norms[i].item(),
+                                    "linf_norm": linf_norms[i].item(),
+                                    "ssim": ssim_values[i],
+                                    "runtime": time.time() - start_time,
+                                    "iterations": iterations,
+                                    "gradient_calls": gradient_calls,
+                                    "original_class": orig_preds[i].item(),
+                                    "original_confidence": model(
+                                        image_batch[i].unsqueeze(0)
+                                    )
+                                    .max()
+                                    .item(),
+                                    "adversarial_class": adv_preds[i].item(),
+                                    "adversarial_confidence": model(
+                                        adv_images[i].unsqueeze(0)
+                                    )
+                                    .max()
+                                    .item(),
+                                }
+                                detailed_results.append(detailed_result)
 
                     except RuntimeError as e:
+                        # Fall back to individual processing if needed
                         if "expanded size" in str(
                             e
                         ) and "must match the existing size" in str(e):
                             # Fix for dimension mismatch
                             # Process each image individually without batch dimension to avoid shape issues
-                            if len(image.shape) == 4:  # [batch, channel, height, width]
-                                adv_image = image.clone()
-
-                                # Loop through each image in batch individually
-                                for i in range(image.shape[0]):
-                                    single_img = image[
-                                        i : i + 1
-                                    ]  # Keep batch dimension as 1
-                                    single_adv, _ = attack.generate(single_img)
-                                    adv_image[i] = single_adv[0]  # Store result
-
-                                # Recalculate metrics since we bypassed normal flow
-                                attack_metrics = {
-                                    "runtime": time.time() - start_time,
-                                    "gradient_calls": attack.total_gradient_calls,
-                                    "iterations": attack.total_iterations,
-                                }
+                            if len(image_batch) == 1:  # Single image
+                                adv_image, _ = attack.generate(image_batch[0])
+                                adv_pred = get_prediction(model, adv_image)
+                                success = adv_pred["index"] != orig_preds[0].item()
+                                l2_norm = torch.norm(
+                                    adv_image - image_batch[0], p=2
+                                ).item()
+                                linf_norm = torch.norm(
+                                    adv_image - image_batch[0], p=float("inf")
+                                ).item()
+                                ssim_value = calculate_ssim(image_batch[0], adv_image)
+                                runtime = time.time() - start_time
+                                iterations = 1
+                                gradient_calls = 1
                             else:
                                 # Re-raise if not a batch issue
                                 raise
@@ -474,7 +623,7 @@ def run_attack_evaluation(config, models_dict, images):
                             raise
 
                     # Update progress bar
-                    pbar.update(1)
+                    pbar.update(len(image_batch))
 
         pbar.close()
 
@@ -496,9 +645,14 @@ def run_attack_evaluation(config, models_dict, images):
             results["table2"][eps_str]["ssim"] /= attack_counts[eps_str]
 
             # Table 3: Average computational metrics
-            results["table3"][eps_str]["iterations"] /= attack_counts[eps_str]
-            results["table3"][eps_str]["gradient_calls"] /= attack_counts[eps_str]
-            results["table3"][eps_str]["runtime"] /= attack_counts[eps_str]
+            if method in ["FGSM", "FFGSM"]:
+                # Don't divide iterations and gradient_calls by attack_counts - they should stay at 1.0
+                results["table3"][eps_str]["runtime"] /= attack_counts[eps_str]
+            else:
+                # For other methods, average all metrics
+                results["table3"][eps_str]["iterations"] /= attack_counts[eps_str]
+                results["table3"][eps_str]["gradient_calls"] /= attack_counts[eps_str]
+                results["table3"][eps_str]["runtime"] /= attack_counts[eps_str]
 
         # Save detailed results to CSV
         if config["evaluation"]["save_results"]:
@@ -604,8 +758,14 @@ def main():
         print("No images loaded, cannot continue.")
         return
 
+    # Clear GPU cache before starting
+    cleanup_gpu_memory()
+
     # Run attack evaluation
     all_results = run_attack_evaluation(config, models, images)
+
+    # Clear GPU cache after results are saved
+    cleanup_gpu_memory()
 
     # Format and display results for paper tables
     for norm in config["attack"]["norm_types"]:
@@ -626,6 +786,11 @@ def main():
         format_paper_tables(results, config, eps_value=eps_to_display, norm=norm)
 
     print("\nEvaluation complete. Results are saved in the output directory.")
+
+
+def cleanup_gpu_memory():
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
