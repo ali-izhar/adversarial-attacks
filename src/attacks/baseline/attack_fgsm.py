@@ -5,6 +5,7 @@ Code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
 
 import torch
 import torch.nn as nn
+import time
 
 from .attack import Attack
 
@@ -52,6 +53,9 @@ class FGSM(Attack):
         images = images.clone().detach().to(self.device)
         labels = labels.clone().detach().to(self.device)
 
+        # Note start time for performance tracking
+        start_time = time.time()
+
         # For targeted attacks, get the target labels
         if self.targeted:
             target_labels = self.get_target_label(images, labels)
@@ -61,8 +65,12 @@ class FGSM(Attack):
 
         # Enable gradient computation for input images
         images.requires_grad = True
+
         # Get model predictions
         outputs = self.get_logits(images)
+
+        # FGSM is a single-step method, so we count this as one iteration per sample
+        self.total_iterations += images.size(0)
 
         # Calculate loss based on attack mode
         if self.targeted:
@@ -80,7 +88,12 @@ class FGSM(Attack):
         # FGSM update: add signed gradients scaled by epsilon
         # The sign of the gradient indicates the direction of steepest ascent
         adv_images = images + self.eps * grad.sign()
+
         # Clamp values to valid image range [0,1]
         adv_images = torch.clamp(adv_images, min=0, max=1).detach()
+
+        # Track how long the attack took
+        end_time = time.time()
+        self.total_time += end_time - start_time
 
         return adv_images

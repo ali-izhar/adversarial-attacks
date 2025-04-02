@@ -5,6 +5,7 @@ Code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
 
 import torch
 import torch.nn as nn
+import time
 
 from .attack import Attack
 
@@ -60,6 +61,9 @@ class FFGSM(Attack):
         r"""
         Overridden.
         """
+        # Start timer for performance tracking
+        start_time = time.time()
+
         # Clone and detach input images to avoid modifying the original data
         images = images.clone().detach().to(self.device)
         labels = labels.clone().detach().to(self.device)
@@ -84,6 +88,9 @@ class FFGSM(Attack):
         # Get model predictions for the randomly perturbed images
         outputs = self.get_logits(adv_images)
 
+        # FFGSM is a single-step method, so increment iteration count by batch size
+        self.total_iterations += images.size(0)
+
         # Calculate loss based on attack mode
         if self.targeted:
             # For targeted attacks, minimize loss with respect to target labels
@@ -106,5 +113,9 @@ class FFGSM(Attack):
         delta = torch.clamp(adv_images - images, min=-self.eps, max=self.eps)
         # Final adversarial images are original images plus bounded perturbation
         adv_images = torch.clamp(images + delta, min=0, max=1).detach()
+
+        # Measure and record time taken
+        end_time = time.time()
+        self.total_time += end_time - start_time
 
         return adv_images

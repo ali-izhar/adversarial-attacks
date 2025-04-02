@@ -6,6 +6,7 @@ Code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import time
 
 from .attack import Attack
 
@@ -64,9 +65,13 @@ class CW(Attack):
         r"""
         Overridden.
         """
+        # Track time for performance metrics
+        start_time = time.time()
+
         # Clone and detach input images to avoid modifying the original data
         images = images.clone().detach().to(self.device)
         labels = labels.clone().detach().to(self.device)
+        batch_size = images.size(0)
 
         if self.targeted:
             target_labels = self.get_target_label(images, labels)
@@ -101,8 +106,14 @@ class CW(Attack):
             else:
                 optimizer = optim.Adam([w], lr=self.lr * 5)
 
+        # Track actual steps performed
+        actual_steps = 0
+
         # Main optimization loop
         for step in range(self.steps):
+            # Increment total iterations counter (each step counts for all samples in batch)
+            actual_steps += 1
+
             # Convert w back to image space using tanh
             adv_images = self.tanh_space(w)
 
@@ -137,6 +148,8 @@ class CW(Attack):
             # Optimize the objective
             optimizer.zero_grad()
             cost.backward()
+            # Count backward pass as a gradient call (one per sample in batch)
+            self.total_gradient_calls += batch_size
             optimizer.step()
 
             # Update best adversarial images
@@ -163,8 +176,18 @@ class CW(Attack):
                     # Only consider early stopping if we're halfway through
                     # and only if we have successful attacks
                     if torch.any(condition):
-                        return best_adv_images
+                        break
                 prev_cost = cost.item()
+
+        # Update metrics for the paper
+        self.total_iterations += batch_size * actual_steps  # Count per sample
+
+        # The gradient is computed once per step per sample
+        # self.get_logits already incremented total_gradient_calls
+
+        # Update time
+        end_time = time.time()
+        self.total_time += end_time - start_time
 
         return best_adv_images
 

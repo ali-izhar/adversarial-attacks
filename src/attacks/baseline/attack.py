@@ -5,9 +5,18 @@ Code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
 
 import time
 from collections import OrderedDict
+import numpy as np
 
 import torch
 from torch.utils.data import DataLoader, TensorDataset
+
+try:
+    from skimage.metrics import structural_similarity
+
+    SSIM_AVAILABLE = True
+except ImportError:
+    SSIM_AVAILABLE = False
+    print("Warning: scikit-image not available. SSIM calculation will be disabled.")
 
 
 def wrapper_method(func):
@@ -73,6 +82,43 @@ class Attack(object):
         self._batchnorm_training = False
         self._dropout_training = False
 
+        # Metrics tracking for paper evaluation
+        self.reset_metrics()
+
+    def reset_metrics(self):
+        """Reset all tracked metrics for a new evaluation."""
+        self.total_iterations = 0
+        self.total_gradient_calls = 0
+        self.start_time = None
+        self.end_time = None
+        self.total_time = 0
+        self.attack_success_count = 0
+        self.total_samples = 0
+        self.l2_norms = []
+        self.linf_norms = []
+        self.ssim_values = []
+
+    def get_metrics(self):
+        """Return dictionary of metrics for paper evaluation."""
+        if self.total_samples == 0:
+            success_rate = 0
+        else:
+            success_rate = 100 * self.attack_success_count / self.total_samples
+
+        metrics = {
+            "attack_name": self.attack,
+            "attack_mode": self.attack_mode,
+            "model_name": self.model_name,
+            "success_rate": success_rate,
+            "iterations": self.total_iterations / max(1, self.total_samples),
+            "gradient_calls": self.total_gradient_calls / max(1, self.total_samples),
+            "time_per_sample": self.total_time / max(1, self.total_samples),
+            "l2_norm": np.mean(self.l2_norms) if self.l2_norms else 0.0,
+            "linf_norm": np.mean(self.linf_norms) if self.linf_norms else 0.0,
+            "ssim": np.mean(self.ssim_values) if self.ssim_values else 1.0,
+        }
+        return metrics
+
     def forward(self, inputs, labels=None, *args, **kwargs):
         r"""
         It defines the computation performed at every call.
@@ -88,10 +134,129 @@ class Attack(object):
 
     def get_logits(self, inputs, labels=None, *args, **kwargs):
         """Get model predictions (logits) for given inputs."""
+        # Track gradient call
+        self.total_gradient_calls += inputs.size(0)
+
         if self._normalization_applied is False:
             inputs = self.normalize(inputs)
         logits = self.model(inputs)
         return logits
+
+    def increment_iteration(self):
+        """Increment iteration counter.
+        This should be called once per sample per main iteration."""
+        self.total_iterations += 1
+
+    def compute_perturbation_metrics(self, original_images, adversarial_images):
+        """Compute perturbation metrics between original and adversarial images.
+
+        Args:
+            original_images: Clean input images
+            adversarial_images: Adversarial examples
+
+        Returns:
+            dict: Dictionary with L2 norm, L-inf norm, and SSIM
+        """
+        # Calculate perturbation and convert to CPU for numpy
+        perturbation = adversarial_images - original_images
+
+        # Scale factor - for normalized ImageNet images, multiplying by 255 gives pixel values
+        scale_factor = 255.0
+
+        # L2 norm (Euclidean distance) - normalize by image dimensions and scale factor
+        # This gives the average per-pixel, per-channel distortion
+        pixel_count = (
+            original_images.size(1) * original_images.size(2) * original_images.size(3)
+        )  # C * H * W
+        l2_norm = torch.norm(
+            perturbation.view(original_images.size(0), -1), p=2, dim=1
+        ) / torch.sqrt(torch.tensor(pixel_count).float())
+        l2_norm_mean = l2_norm.mean().item()
+        self.l2_norms.extend(l2_norm.detach().cpu().numpy())
+
+        # L-inf norm (maximum absolute pixel difference)
+        linf_norm = torch.norm(
+            perturbation.view(original_images.size(0), -1), p=float("inf"), dim=1
+        )
+        linf_norm_mean = linf_norm.mean().item()
+        self.linf_norms.extend(linf_norm.detach().cpu().numpy())
+
+        # SSIM (structural similarity)
+        if SSIM_AVAILABLE:
+            batch_size = original_images.size(0)
+            ssim_vals = []
+
+            # Process each image in the batch individually
+            for i in range(batch_size):
+                # Get individual images and ensure they're in the proper range [0, 1]
+                orig_img = original_images[i].detach().cpu().permute(1, 2, 0).numpy()
+                adv_img = adversarial_images[i].detach().cpu().permute(1, 2, 0).numpy()
+
+                # Clamp images to [0, 1] range for SSIM calculation
+                orig_img = np.clip(orig_img, 0, 1)
+                adv_img = np.clip(adv_img, 0, 1)
+
+                # Calculate SSIM using skimage
+                try:
+                    # Try newer scikit-image API (>=0.19.0) with channel_axis
+                    ssim_val = structural_similarity(
+                        orig_img, adv_img, channel_axis=2, data_range=1.0
+                    )
+                except TypeError:
+                    # Fall back to older API (<0.19.0) with multichannel
+                    ssim_val = structural_similarity(
+                        orig_img, adv_img, multichannel=True, data_range=1.0
+                    )
+
+                # Ensure SSIM is in [0, 1] range
+                ssim_val = max(0.0, min(1.0, ssim_val))
+                ssim_vals.append(ssim_val)
+
+            # Average SSIM across batch
+            ssim_val = np.mean(ssim_vals)
+            self.ssim_values.extend(ssim_vals)
+        else:
+            ssim_val = 1.0  # Default value when SSIM is not available
+
+        return {"l2_norm": l2_norm_mean, "linf_norm": linf_norm_mean, "ssim": ssim_val}
+
+    def evaluate_attack_success(self, original_images, adversarial_images, true_labels):
+        """Evaluate if attack was successful (caused misclassification).
+
+        Args:
+            original_images: Clean input images
+            adversarial_images: Adversarial examples
+            true_labels: True class labels
+
+        Returns:
+            tuple: (success_rate, success_mask) where success_mask is a boolean tensor
+                  indicating which samples were successfully attacked
+        """
+        with torch.no_grad():
+            # Get original predictions
+            orig_outputs = self.get_output_with_eval_nograd(original_images)
+            orig_predictions = torch.argmax(orig_outputs, dim=1)
+
+            # Get adversarial predictions
+            adv_outputs = self.get_output_with_eval_nograd(adversarial_images)
+            adv_predictions = torch.argmax(adv_outputs, dim=1)
+
+            # Calculate success based on attack mode
+            if self.targeted:
+                target_labels = self.get_target_label(original_images, true_labels)
+                success_mask = adv_predictions == target_labels
+            else:
+                success_mask = adv_predictions != true_labels
+
+            success_count = success_mask.sum().item()
+            total = success_mask.size(0)
+            success_rate = 100 * success_count / total
+
+            # Update attack metrics
+            self.attack_success_count += success_count
+            self.total_samples += total
+
+            return success_rate, success_mask, (orig_predictions, adv_predictions)
 
     @wrapper_method
     def _set_normalization_applied(self, flag):
@@ -258,6 +423,114 @@ class Attack(object):
         """Restore original model training mode after attack."""
         if given_training:
             self.model.train()
+
+    def evaluate_on_batch(self, inputs, labels, verbose=False):
+        """Evaluate attack on a batch of samples and collect metrics.
+
+        Args:
+            inputs: Clean input images
+            labels: True class labels
+            verbose: Whether to print progress
+
+        Returns:
+            dict: Dictionary of metrics for the batch
+        """
+        # Reset iteration/gradient counters per batch
+        if self.start_time is None:
+            self.start_time = time.time()
+
+        # Generate adversarial examples
+        adv_inputs = self.__call__(inputs, labels)
+
+        # Calculate metrics
+        batch_size = inputs.size(0)
+
+        # Evaluate attack success (misclassification)
+        success_rate, success_mask, predictions = self.evaluate_attack_success(
+            inputs, adv_inputs, labels
+        )
+
+        # Calculate perturbation metrics
+        perturbation_metrics = self.compute_perturbation_metrics(
+            inputs.to(self.device), adv_inputs
+        )
+
+        # Update timing information
+        self.end_time = time.time()
+        batch_time = self.end_time - self.start_time
+        self.total_time += batch_time
+        self.start_time = self.end_time
+
+        # Compile batch results
+        batch_metrics = {
+            "batch_size": batch_size,
+            "success_rate": success_rate,
+            "time_taken": batch_time,
+            **perturbation_metrics,
+        }
+
+        if verbose:
+            print(
+                f"Attack: {self.attack}, "
+                f"Mode: {self.attack_mode}, "
+                f"Success: {success_rate:.2f}%, "
+                f"L2: {perturbation_metrics['l2_norm']:.4f}, "
+                f"L∞: {perturbation_metrics['linf_norm']:.4f}, "
+                f"SSIM: {perturbation_metrics['ssim']:.4f}, "
+                f"Time: {batch_time:.3f}s"
+            )
+
+        return batch_metrics
+
+    def evaluate(self, data_loader, verbose=True):
+        """Evaluate attack on the entire dataset.
+
+        Args:
+            data_loader: DataLoader with clean samples
+            verbose: Whether to print progress
+
+        Returns:
+            dict: Dictionary of overall metrics
+        """
+        # Reset metrics
+        self.reset_metrics()
+        all_batch_metrics = []
+
+        total_batches = len(data_loader)
+
+        for batch_idx, (inputs, labels) in enumerate(data_loader):
+            # Evaluate on batch
+            batch_metrics = self.evaluate_on_batch(
+                inputs.to(self.device), labels.to(self.device), verbose=False
+            )
+            all_batch_metrics.append(batch_metrics)
+
+            # Print progress
+            if verbose and (batch_idx % max(total_batches // 10, 1) == 0):
+                print(
+                    f"Batch {batch_idx+1}/{total_batches} - "
+                    f"Success: {batch_metrics['success_rate']:.2f}%, "
+                    f"L2: {batch_metrics['l2_norm']:.4f}, "
+                    f"L∞: {batch_metrics['linf_norm']:.4f}"
+                )
+
+        # Compile overall results
+        overall_metrics = self.get_metrics()
+
+        if verbose:
+            print("\nOverall Attack Results:")
+            print(
+                f"Attack: {self.attack}, Mode: {self.attack_mode}, Model: {self.model_name}"
+            )
+            print(f"Success Rate: {overall_metrics['success_rate']:.2f}%")
+            print(f"Average Iterations: {overall_metrics['iterations']:.2f}")
+            print(f"Average Gradient Calls: {overall_metrics['gradient_calls']:.2f}")
+            print(f"Average Time: {overall_metrics['time_per_sample']:.4f}s")
+            print(f"Average L2 Norm: {overall_metrics['l2_norm']:.4f}")
+            print(f"Average L∞ Norm: {overall_metrics['linf_norm']:.4f}")
+            print(f"Average SSIM: {overall_metrics['ssim']:.4f}")
+
+        return overall_metrics
 
     def save(
         self,
