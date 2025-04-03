@@ -22,15 +22,17 @@ class FGSM(Attack):
         eps (float): maximum perturbation. (Default: 8/255)
 
     Shape:
-        - images: :math:`(N, C, H, W)` where `N = number of batches`, `C = number of channels`,
-            `H = height` and `W = width`. It must have a range [0, 1].
+        - images: :math:`(N, C, H, W)` normalized images with ImageNet mean/std
         - labels: :math:`(N)` where each value :math:`y_i` is :math:`0 \leq y_i \leq` `number of labels`.
-        - output: :math:`(N, C, H, W)`.
+        - output: :math:`(N, C, H, W)` normalized adversarial images.
 
     Examples::
-        >>> attack = torchattacks.FGSM(model, eps=8/255)
+        >>> attack = FGSM(model, eps=8/255)
         >>> adv_images = attack(images, labels)
 
+    Note:
+        The epsilon value is applied in normalized space. For a standard epsilon of 8/255
+        in [0,1] space, we scale by the std values of ImageNet normalization.
     """
 
     def __init__(self, model, eps=8 / 255):
@@ -38,10 +40,19 @@ class FGSM(Attack):
 
         Args:
             model: Target model to attack
-            eps: Maximum perturbation size (default: 8/255)
+            eps: Maximum perturbation size in [0,1] space (default: 8/255)
+                This will be appropriately scaled to the normalized space
         """
         super().__init__("FGSM", model)
-        self.eps = eps  # Maximum perturbation size
+
+        # Store the original epsilon as specified in [0,1] space
+        self.orig_eps = eps
+
+        # Scale epsilon to normalized space by dividing by ImageNet std
+        # This makes the perturbation magnitude consistent across channels
+        mean_std = self.std.clone().detach().mean().item()
+        self.eps = eps / mean_std
+
         # FGSM supports both untargeted and targeted attacks
         self.supported_mode = ["default", "targeted"]
 
@@ -89,8 +100,19 @@ class FGSM(Attack):
         # The sign of the gradient indicates the direction of steepest ascent
         adv_images = images + self.eps * grad.sign()
 
-        # Clamp values to valid image range [0,1]
-        adv_images = torch.clamp(adv_images, min=0, max=1).detach()
+        # Calculate normalized min/max bounds to keep adversarial example
+        # within valid pixel ranges after denormalization
+        # Create normalized min/max bounds directly - ensuring correct dtype
+        min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
+        max_bound = ((1 - self.mean) / self.std).to(
+            device=images.device, dtype=images.dtype
+        )
+
+        min_bound = min_bound.view(1, 3, 1, 1)
+        max_bound = max_bound.view(1, 3, 1, 1)
+
+        # Clamp to valid normalized range
+        adv_images = torch.clamp(adv_images, min=min_bound, max=max_bound).detach()
 
         # Track how long the attack took
         end_time = time.time()

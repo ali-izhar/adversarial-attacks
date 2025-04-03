@@ -1,4 +1,4 @@
-"""Fast Gradient Sign Method (FGSM) adversarial attack implementation.
+"""Fast Fast Gradient Sign Method (FFGSM) adversarial attack implementation.
 
 Code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
 """
@@ -23,14 +23,17 @@ class FFGSM(Attack):
         alpha (float): step size. (Default: 6/255)
 
     Shape:
-        - images: :math:`(N, C, H, W)` where `N = number of batches`, `C = number of channels`,
-            `H = height` and `W = width`. It must have a range [0, 1].
+        - images: :math:`(N, C, H, W)` normalized images with ImageNet mean/std
         - labels: :math:`(N)` where each value :math:`y_i` is :math:`0 \leq y_i \leq` `number of labels`.
-        - output: :math:`(N, C, H, W)`.
+        - output: :math:`(N, C, H, W)` normalized adversarial images.
 
     Examples::
-        >>> attack = torchattacks.FFGSM(model, eps=8/255, alpha=6/255)
+        >>> attack = FFGSM(model, eps=8/255, alpha=6/255)
         >>> adv_images = attack(images, labels)
+
+    Note:
+        The epsilon and alpha values are applied in normalized space. For standard values of
+        8/255 and 6/255 in [0,1] space, they are scaled by the std values of ImageNet normalization.
     """
 
     def __init__(self, model, eps=8 / 255, alpha=6 / 255):
@@ -38,15 +41,23 @@ class FFGSM(Attack):
 
         Args:
             model: Target model to attack
-            eps: Maximum perturbation size (default: 8/255)
-            alpha: Step size for gradient update (default: 6/255)
+            eps: Maximum perturbation size in [0,1] space (default: 8/255)
+            alpha: Step size for gradient update in [0,1] space (default: 6/255)
 
         Raises:
             ValueError: If alpha is greater than epsilon
         """
         super().__init__("FFGSM", model)
-        self.eps = eps  # Maximum perturbation size
-        self.alpha = alpha  # Step size for gradient update
+
+        # Store the original epsilon and alpha as specified in [0,1] space
+        self.orig_eps = eps
+        self.orig_alpha = alpha
+
+        # Scale epsilon and alpha to normalized space by dividing by ImageNet std
+        # This makes the perturbation magnitude consistent across channels
+        mean_std = self.std.clone().detach().mean().item()
+        self.eps = eps / mean_std
+        self.alpha = alpha / mean_std
 
         # Validate that alpha is less than or equal to epsilon
         if self.alpha > self.eps:
@@ -75,13 +86,23 @@ class FFGSM(Attack):
         # Use cross-entropy loss for classification tasks
         loss = nn.CrossEntropyLoss()
 
-        # Initialize adversarial images with random noise within epsilon bound
+        # Calculate normalized min/max bounds for valid pixel values
+        # Create normalized min/max bounds directly - ensuring correct dtype
+        min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
+        max_bound = ((1 - self.mean) / self.std).to(
+            device=images.device, dtype=images.dtype
+        )
+
+        min_bound = min_bound.view(1, 3, 1, 1)
+        max_bound = max_bound.view(1, 3, 1, 1)
+
+        # Initialize adversarial images with random noise within epsilon bound in normalized space
         # This is the key difference from standard FGSM - starting from a random point
-        adv_images = images + torch.randn_like(images).uniform_(
-            -self.eps, self.eps
-        )  # nopep8
-        # Ensure the initial perturbation is within valid image range
-        adv_images = torch.clamp(adv_images, min=0, max=1).detach()
+        adv_images = images + torch.randn_like(images).uniform_(-self.eps, self.eps)
+
+        # Ensure the initial perturbation is within valid normalized image range
+        adv_images = torch.clamp(adv_images, min=min_bound, max=max_bound).detach()
+
         # Enable gradient computation for the perturbed images
         adv_images.requires_grad = True
 
@@ -108,11 +129,13 @@ class FFGSM(Attack):
         # This is similar to FGSM but with a different step size (alpha)
         adv_images = adv_images + self.alpha * grad.sign()
 
-        # Project the perturbation back to epsilon-ball around original images
+        # Project the perturbation back to epsilon-ball around original images in normalized space
         # This ensures the total perturbation doesn't exceed epsilon
         delta = torch.clamp(adv_images - images, min=-self.eps, max=self.eps)
+
         # Final adversarial images are original images plus bounded perturbation
-        adv_images = torch.clamp(images + delta, min=0, max=1).detach()
+        # Ensure result is within valid normalized image range
+        adv_images = torch.clamp(images + delta, min=min_bound, max=max_bound).detach()
 
         # Measure and record time taken
         end_time = time.time()

@@ -20,13 +20,17 @@ class DeepFool(Attack):
         steps (int): number of steps. (Default: 50)
         overshoot (float): parameter for enhancing the noise. (Default: 0.02)
     Shape:
-        - images: :math:`(N, C, H, W)` where `N = number of batches`, `C = number of channels`,
-            `H = height` and `W = width`. It must have a range [0, 1].
+        - images: :math:`(N, C, H, W)` normalized images with ImageNet mean/std
         - labels: :math:`(N)` where each value :math:`y_i` is :math:`0 \leq y_i \leq` `number of labels`.
-        - output: :math:`(N, C, H, W)`.
+        - output: :math:`(N, C, H, W)` normalized adversarial images.
     Examples::
-        >>> attack = torchattacks.DeepFool(model, steps=50, overshoot=0.02)
+        >>> attack = DeepFool(model, steps=50, overshoot=0.02)
         >>> adv_images = attack(images, labels)
+
+    Note:
+        The attack operates in normalized input space. All perturbations and boundary
+        calculations are performed in the normalized domain, and results are properly
+        bounded to valid normalized image values.
     """
 
     def __init__(self, model, steps=50, overshoot=0.02):
@@ -65,6 +69,16 @@ class DeepFool(Attack):
 
         batch_size = len(images)
 
+        # Calculate normalized min/max bounds for valid pixel values
+        # Create normalized min/max bounds directly - ensuring correct dtype
+        min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
+        max_bound = ((1 - self.mean) / self.std).to(
+            device=images.device, dtype=images.dtype
+        )
+
+        min_bound = min_bound.view(1, 3, 1, 1)
+        max_bound = max_bound.view(1, 3, 1, 1)
+
         # Get initial predictions and prepare tensors
         with torch.no_grad():
             logits = self.get_logits(images)
@@ -88,7 +102,7 @@ class DeepFool(Attack):
         # Main iteration loop
         while active_samples.any() and curr_steps < self.steps:
             # Keep only active samples (not yet fooled)
-            curr_images = torch.clamp(images + r_tot, 0, 1)
+            curr_images = torch.clamp(images + r_tot, min=min_bound, max=max_bound)
             curr_images.requires_grad_(True)
 
             # Get current logits
@@ -106,12 +120,6 @@ class DeepFool(Attack):
                 # Exit early if all samples are fooled
                 if not active_samples.any():
                     break
-
-            # Initialize perturbation for this step
-            w_norm_list = []
-            f_k_list = []
-            grad_list = []
-            k_list = []
 
             # For active samples, compute gradients for all classes in parallel
             pert = torch.ones_like(curr_images) * float("inf")
@@ -188,8 +196,10 @@ class DeepFool(Attack):
             # Apply perturbation with overshoot
             r_tot = r_tot + (1 + self.overshoot) * pert
 
-            # Ensure the perturbed images are within valid range
-            perturbed_images = torch.clamp(original_images + r_tot, 0, 1)
+            # Ensure the perturbed images are within valid normalized range
+            perturbed_images = torch.clamp(
+                original_images + r_tot, min=min_bound, max=max_bound
+            )
             r_tot = perturbed_images - original_images
 
             # Update images for next iteration (no need to clone since we don't modify)
@@ -200,7 +210,9 @@ class DeepFool(Attack):
             curr_steps += 1
 
         # Final perturbed images
-        adv_images = torch.clamp(original_images + r_tot, 0, 1).detach()
+        adv_images = torch.clamp(
+            original_images + r_tot, min=min_bound, max=max_bound
+        ).detach()
 
         # Calculate perturbation metrics
         perturbation_metrics = self.compute_perturbation_metrics(
@@ -226,7 +238,7 @@ class DeepFool(Attack):
         """Process a single image in DeepFool algorithm.
 
         Args:
-            image: Input image to process
+            image: Input image to process (normalized)
             label: True label of the image
 
         Returns:
@@ -236,6 +248,16 @@ class DeepFool(Attack):
         """
         # Get a copy of the image for gradient computation
         image_copy = image.clone().detach().requires_grad_(True)
+
+        # Calculate normalized min/max bounds for valid pixel values
+        # Create normalized min/max bounds directly - ensuring correct dtype
+        min_bound = (-self.mean / self.std).to(device=image.device, dtype=image.dtype)
+        max_bound = ((1 - self.mean) / self.std).to(
+            device=image.device, dtype=image.dtype
+        )
+
+        min_bound = min_bound.view(1, 3, 1, 1)
+        max_bound = max_bound.view(1, 3, 1, 1)
 
         # Get model predictions
         fs = self.get_logits(image_copy)[0]
@@ -300,7 +322,7 @@ class DeepFool(Attack):
 
         # Make sure the perturbation respects image bounds when applied
         perturbed_image = image + perturbation
-        perturbed_image = torch.clamp(perturbed_image, 0, 1)
+        perturbed_image = torch.clamp(perturbed_image, min=min_bound, max=max_bound)
         perturbation = perturbed_image - image
 
         return (False, target_label, perturbation)

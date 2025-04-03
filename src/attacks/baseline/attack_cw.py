@@ -30,17 +30,17 @@ class CW(Attack):
     .. warning:: With default c, you can't easily get adversarial images. Set higher c like 1.
 
     Shape:
-        - images: :math:`(N, C, H, W)` where `N = number of batches`, `C = number of channels`,
-            `H = height` and `W = width`. It must have a range [0, 1].
+        - images: :math:`(N, C, H, W)` normalized images with ImageNet mean/std
         - labels: :math:`(N)` where each value :math:`y_i` is :math:`0 \leq y_i \leq` `number of labels`.
-        - output: :math:`(N, C, H, W)`.
+        - output: :math:`(N, C, H, W)` normalized adversarial images.
 
     Examples::
-        >>> attack = torchattacks.CW(model, c=1, kappa=0, steps=1000, lr=0.01)
+        >>> attack = CW(model, c=1, kappa=0, steps=1000, lr=0.01)
         >>> adv_images = attack(images, labels)
 
-    .. note:: Binary search for c is NOT IMPLEMENTED methods in the paper due to time consuming.
-
+    Note:
+        This implementation works with normalized inputs. The tanh transformation
+        is adjusted to properly map between normalized space and optimization space.
     """
 
     def __init__(self, model, c=1, kappa=0, steps=1000, lr=0.01):
@@ -76,9 +76,19 @@ class CW(Attack):
         if self.targeted:
             target_labels = self.get_target_label(images, labels)
 
+        # Calculate normalized min/max bounds for valid pixel values
+        # Create normalized min/max bounds directly - ensuring correct dtype
+        min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
+        max_bound = ((1 - self.mean) / self.std).to(
+            device=images.device, dtype=images.dtype
+        )
+
+        min_bound = min_bound.view(1, 3, 1, 1)
+        max_bound = max_bound.view(1, 3, 1, 1)
+
         # Initialize optimization variable w in tanh space
-        # This ensures the output is always in [0,1] range
-        w = self.inverse_tanh_space(images).detach()
+        # This ensures the output is always in valid normalized range
+        w = self.inverse_tanh_space(images, min_bound, max_bound).detach()
         w.requires_grad = True
 
         # Initialize best adversarial images and their L2 distances
@@ -115,7 +125,7 @@ class CW(Attack):
             actual_steps += 1
 
             # Convert w back to image space using tanh
-            adv_images = self.tanh_space(w)
+            adv_images = self.tanh_space(w, min_bound, max_bound)
 
             # Calculate L2 distance between original and adversarial images
             current_L2 = MSELoss(Flatten(adv_images), Flatten(images)).sum(dim=1)
@@ -191,18 +201,46 @@ class CW(Attack):
 
         return best_adv_images
 
-    def tanh_space(self, x):
-        """Convert from optimization space to image space using tanh."""
-        return 1 / 2 * (torch.tanh(x) + 1)
+    def tanh_space(self, x, min_bound, max_bound):
+        """
+        Convert from optimization space to normalized image space using tanh.
 
-    def inverse_tanh_space(self, x):
-        """Convert from image space to optimization space using inverse tanh."""
-        # torch.atanh is only for torch >= 1.7.0
-        # atanh is defined in the range -1 to 1
-        return self.atanh(torch.clamp(x * 2 - 1, min=-1, max=1))
+        Args:
+            x: Input in optimization space
+            min_bound: Minimum allowed values in normalized space
+            max_bound: Maximum allowed values in normalized space
+
+        Returns:
+            Image in normalized space [-2.64, 2.64]
+        """
+        # Scale tanh output [0,1] to the appropriate normalized range
+        normalized = 0.5 * (torch.tanh(x) + 1)
+        # Scale from [0,1] to [min_bound, max_bound]
+        return min_bound + (max_bound - min_bound) * normalized
+
+    def inverse_tanh_space(self, x, min_bound, max_bound):
+        """
+        Convert from normalized image space to optimization space using inverse tanh.
+
+        Args:
+            x: Input in normalized space [-2.64, 2.64]
+            min_bound: Minimum allowed values in normalized space
+            max_bound: Maximum allowed values in normalized space
+
+        Returns:
+            Image in optimization space
+        """
+        # Scale the input from [min_bound, max_bound] to [0, 1]
+        x_01 = (x - min_bound) / (max_bound - min_bound + 1e-12)
+        # Clip to ensure we're in [0, 1] range
+        x_01 = torch.clamp(x_01, 0, 1)
+        # Apply inverse tanh to get to optimization space
+        return self.atanh(2 * x_01 - 1)
 
     def atanh(self, x):
         """Compute inverse hyperbolic tangent."""
+        # Clamp to ensure we're in [-1+eps, 1-eps] to avoid numerical instability
+        x = torch.clamp(x, min=-1 + 1e-6, max=1 - 1e-6)
         return 0.5 * torch.log((1 + x) / (1 - x))
 
     def f(self, outputs, labels):

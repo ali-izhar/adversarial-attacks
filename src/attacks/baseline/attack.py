@@ -6,7 +6,8 @@ NORMALIZATION WARNING:
 When using these attacks with our framework:
 1. Our model wrappers now expect ALREADY NORMALIZED inputs from ImageNetDataset
 2. No additional normalization should be needed or applied
-3. Always ensure proper clamping of images to [0,1] range after perturbation
+3. Perturbations are applied in the normalized space [-2.64, 2.64]
+4. For reporting and visualization, we convert back to [0,1] space
 """
 
 import time
@@ -23,6 +24,10 @@ try:
 except ImportError:
     SSIM_AVAILABLE = False
     print("Warning: scikit-image not available. SSIM calculation will be disabled.")
+
+# ImageNet normalization constants
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
+IMAGENET_STD = np.array([0.229, 0.224, 0.225])
 
 
 def wrapper_method(func):
@@ -48,10 +53,10 @@ class Attack(object):
         To change this, please see `set_model_training_mode`.
 
     NORMALIZATION EXPECTATIONS:
-    - The attack methods assume inputs are in the range used by the models
-    - For our framework, this means normalized inputs from ImageNetDataset
-    - Our model wrappers have been updated to expect already normalized inputs
-    - No additional normalization is needed or applied by default
+    - The attack methods work with normalized image inputs (ImageNet normalization)
+    - This means inputs are in range [-2.64, 2.64] with mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+    - Perturbations are computed and applied in this normalized space
+    - When clamping or visualizing, we denormalize to [0,1] range
     """
 
     def __init__(self, name, model):
@@ -71,8 +76,11 @@ class Attack(object):
         # Automatically detect and set the device (CPU/GPU) where the model is
         try:
             self.device = next(model.parameters()).device
+            # Get the model's dtype for consistency
+            self.model_dtype = next(model.parameters()).dtype
         except Exception:
             self.device = None
+            self.model_dtype = torch.float32  # Default to float32
             print("Failed to set device automatically, please try set_device() manual.")
 
         # Attack mode configuration
@@ -88,6 +96,11 @@ class Attack(object):
         # inputs are already normalized and model wrappers expect normalized inputs
         self.normalization_used = None
         self._normalization_applied = None
+
+        # Store ImageNet normalization parameters for conversion
+        # CRITICAL: Ensure these tensors use the same float type as the model
+        self.mean = torch.tensor(IMAGENET_MEAN, dtype=self.model_dtype).view(1, 3, 1, 1)
+        self.std = torch.tensor(IMAGENET_STD, dtype=self.model_dtype).view(1, 3, 1, 1)
 
         # Model mode control during attack
         self._model_training = False
@@ -110,24 +123,79 @@ class Attack(object):
         self.linf_norms = []
         self.ssim_values = []
 
+    def denormalize(self, images):
+        """
+        Convert normalized images back to [0,1] range for visualization
+        and accurate perturbation magnitude reporting.
+
+        Args:
+            images: Normalized input images (with ImageNet normalization)
+
+        Returns:
+            Images in [0,1] range
+        """
+        # Move normalization tensors to the correct device and ensure correct dtype
+        mean = self.mean.to(device=images.device, dtype=images.dtype)
+        std = self.std.to(device=images.device, dtype=images.dtype)
+
+        # Denormalize: x * std + mean
+        denorm_images = images * std + mean
+
+        # Clamp to [0,1] range to handle any out-of-bounds values
+        denorm_images = torch.clamp(denorm_images, 0, 1)
+
+        return denorm_images
+
+    def normalize(self, images):
+        """
+        Convert images from [0,1] range to normalized range with ImageNet stats.
+
+        Args:
+            images: Images in [0,1] range
+
+        Returns:
+            Normalized images (with ImageNet normalization)
+        """
+        # Move normalization tensors to the correct device and ensure correct dtype
+        mean = self.mean.to(device=images.device, dtype=images.dtype)
+        std = self.std.to(device=images.device, dtype=images.dtype)
+
+        # Normalize: (x - mean) / std
+        norm_images = (images - mean) / std
+
+        return norm_images
+
     def get_metrics(self):
         """Return dictionary of metrics for paper evaluation."""
+        # Handle case where no samples were evaluated
         if self.total_samples == 0:
             success_rate = 0
+            avg_iterations = 0
+            avg_grad_calls = 0
+            avg_time = 0
+            avg_l2 = 0.0
+            avg_linf = 0.0
+            avg_ssim = 1.0
         else:
             success_rate = 100 * self.attack_success_count / self.total_samples
+            avg_iterations = self.total_iterations / self.total_samples
+            avg_grad_calls = self.total_gradient_calls / self.total_samples
+            avg_time = self.total_time / self.total_samples
+            avg_l2 = np.mean(self.l2_norms) if self.l2_norms else 0.0
+            avg_linf = np.mean(self.linf_norms) if self.linf_norms else 0.0
+            avg_ssim = np.mean(self.ssim_values) if self.ssim_values else 1.0
 
         metrics = {
             "attack_name": self.attack,
             "attack_mode": self.attack_mode,
             "model_name": self.model_name,
             "success_rate": success_rate,
-            "iterations": self.total_iterations / max(1, self.total_samples),
-            "gradient_calls": self.total_gradient_calls / max(1, self.total_samples),
-            "time_per_sample": self.total_time / max(1, self.total_samples),
-            "l2_norm": np.mean(self.l2_norms) if self.l2_norms else 0.0,
-            "linf_norm": np.mean(self.linf_norms) if self.linf_norms else 0.0,
-            "ssim": np.mean(self.ssim_values) if self.ssim_values else 1.0,
+            "iterations": avg_iterations,
+            "gradient_calls": avg_grad_calls,
+            "time_per_sample": avg_time,
+            "l2_norm": avg_l2,
+            "linf_norm": avg_linf,
+            "ssim": avg_ssim,
         }
         return metrics
 
@@ -162,19 +230,24 @@ class Attack(object):
         """Compute perturbation metrics between original and adversarial images.
 
         Args:
-            original_images: Clean input images
-            adversarial_images: Adversarial examples
+            original_images: Clean input images (normalized)
+            adversarial_images: Adversarial examples (normalized)
 
         Returns:
             dict: Dictionary with L2 norm, L-inf norm, and SSIM
+
+        Note:
+            For accurate reporting, we denormalize images to [0,1] range
+            before computing perturbation metrics.
         """
-        # Calculate perturbation and convert to CPU for numpy
-        perturbation = adversarial_images - original_images
+        # Denormalize images for more intuitive metrics in [0,1] space
+        original_denorm = self.denormalize(original_images)
+        adversarial_denorm = self.denormalize(adversarial_images)
 
-        # Scale factor - for normalized ImageNet images, multiplying by 255 gives pixel values
-        scale_factor = 255.0
+        # Calculate perturbation in denormalized space [0,1]
+        perturbation = adversarial_denorm - original_denorm
 
-        # L2 norm (Euclidean distance) - normalize by image dimensions and scale factor
+        # L2 norm (Euclidean distance) - normalize by image dimensions
         # This gives the average per-pixel, per-channel distortion
         pixel_count = (
             original_images.size(1) * original_images.size(2) * original_images.size(3)
@@ -192,16 +265,16 @@ class Attack(object):
         linf_norm_mean = linf_norm.mean().item()
         self.linf_norms.extend(linf_norm.detach().cpu().numpy())
 
-        # SSIM (structural similarity)
+        # SSIM (structural similarity) - computed in denormalized [0,1] space
         if SSIM_AVAILABLE:
             batch_size = original_images.size(0)
             ssim_vals = []
 
             # Process each image in the batch individually
             for i in range(batch_size):
-                # Get individual images and ensure they're in the proper range [0, 1]
-                orig_img = original_images[i].detach().cpu().permute(1, 2, 0).numpy()
-                adv_img = adversarial_images[i].detach().cpu().permute(1, 2, 0).numpy()
+                # Get individual images in denormalized [0,1] range
+                orig_img = original_denorm[i].detach().cpu().permute(1, 2, 0).numpy()
+                adv_img = adversarial_denorm[i].detach().cpu().permute(1, 2, 0).numpy()
 
                 # Clamp images to [0, 1] range for SSIM calculation
                 orig_img = np.clip(orig_img, 0, 1)
@@ -235,8 +308,8 @@ class Attack(object):
         """Evaluate if attack was successful (caused misclassification).
 
         Args:
-            original_images: Clean input images
-            adversarial_images: Adversarial examples
+            original_images: Clean input images (normalized)
+            adversarial_images: Adversarial examples (normalized)
             true_labels: True class labels
 
         Returns:
