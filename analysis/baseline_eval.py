@@ -6,27 +6,64 @@ perturbation metrics (L2, L-inf, SSIM), and computational metrics
 """
 
 import os
+import time
 import torch
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 
 class AttackEvaluator:
     """Framework for evaluating adversarial attacks across multiple models and metrics."""
 
-    def __init__(self, models, dataset, device=None):
+    def __init__(
+        self,
+        models,
+        dataset,
+        device=None,
+        batch_size=32,
+        num_workers=8,
+        pin_memory=True,
+    ):
         """
         Args:
             models (dict): Dictionary mapping model names to model instances
             dataset: Dataset containing clean images and labels
             device: Device to run evaluation on (default: auto-detect)
+            batch_size: Batch size for evaluation (default: 32, will be auto-adjusted for GPU)
+            num_workers: Number of data loading workers (default: 8)
+            pin_memory: Whether to use pinned memory for faster data transfer to GPU
         """
         self.models = models
         self.dataset = dataset
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+
+        # Initialize batch size based on GPU model
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+
+        # Auto-tune batch size for high-end GPUs
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0).lower()
+            gpu_mem = torch.cuda.get_device_properties(0).total_memory / (
+                1024**3
+            )  # in GB
+
+            # RTX 4090 has ~24GB of VRAM, optimize for large batches
+            if "4090" in gpu_name or "3090" in gpu_name or gpu_mem > 20:
+                self.batch_size = min(128, len(dataset))
+                self.num_workers = min(16, os.cpu_count() or 8)
+                print(f"Optimizing for high-end GPU ({gpu_name}, {gpu_mem:.1f}GB VRAM)")
+                print(f"Using batch_size={self.batch_size}, workers={self.num_workers}")
+            # RTX 3080/3070 or similar has ~10GB of VRAM
+            elif "3080" in gpu_name or "3070" in gpu_name or gpu_mem > 8:
+                self.batch_size = min(64, len(dataset))
+                self.num_workers = min(12, os.cpu_count() or 8)
+
         self.results = {}
 
     def evaluate_attack(self, attack_name, attack_fn, targeted=False, **attack_kwargs):
@@ -55,14 +92,23 @@ class AttackEvaluator:
             model.to(self.device)
             model.eval()
 
-            # Create dataloader
+            # Create dataloader with optimized settings for GPU
             dataloader = torch.utils.data.DataLoader(
-                self.dataset, batch_size=16, shuffle=False
+                self.dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                persistent_workers=self.num_workers > 0,
+                prefetch_factor=2 if self.num_workers > 0 else None,
             )
 
             # Create attack instance
             attack = attack_fn(model, **attack_kwargs)
             print(f"\nEvaluating {attack_name} ({attack_type}) on {model_name}")
+
+            # Reset metrics before starting the evaluation
+            attack.reset_metrics()
 
             # Setup targeted mode if needed
             if targeted:
@@ -70,11 +116,124 @@ class AttackEvaluator:
             else:
                 attack.set_mode_default()
 
-            # Run the evaluation using our new method in the Attack base class
-            attack_results = attack.evaluate(dataloader, verbose=True)
+            # Process each batch
+            total_samples = 0
+            successful_examples = []
 
-            # Store results - we don't store the attack instance itself
-            self.results[attack_name][attack_type][model_name] = attack_results
+            # Use CUDA profiler to optimize performance
+            with torch.autograd.profiler.emit_nvtx():
+                for batch_idx, (inputs, labels) in enumerate(
+                    tqdm(dataloader, desc=f"{attack_name}")
+                ):
+                    # Ensure inputs and labels are the right type and on the right device
+                    # Use non-blocking transfers for better CUDA performance
+                    inputs = inputs.to(self.device, non_blocking=True).float()
+                    labels = labels.to(self.device, non_blocking=True)
+
+                    total_samples += inputs.size(0)
+
+                    # Pre-emptively clear GPU cache if running large batch sizes
+                    if batch_idx % 10 == 0 and self.batch_size >= 64:
+                        torch.cuda.empty_cache()
+
+                    # Get original predictions
+                    with torch.no_grad():
+                        outputs = model(inputs)
+                        _, original_preds = torch.max(outputs, 1)
+
+                        # Skip samples that are already misclassified
+                        correct_mask = original_preds == labels
+                        if not correct_mask.any():
+                            print(
+                                f"  All samples in this batch are already misclassified, skipping"
+                            )
+                            continue
+
+                        # Only attack correctly classified samples
+                        correct_inputs = inputs[correct_mask]
+                        correct_labels = labels[correct_mask]
+
+                        if len(correct_inputs) == 0:
+                            continue
+
+                    # Attack only the correctly classified samples
+                    attack_start = time.time()
+
+                    # Use CUDA events for more accurate timing
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+
+                    start_event.record()
+                    adversarial = attack(correct_inputs, correct_labels)
+                    end_event.record()
+
+                    # Synchronize CUDA to wait for attack to complete
+                    torch.cuda.synchronize()
+                    attack_time_ms = start_event.elapsed_time(end_event)
+
+                    # Explicitly evaluate attack success and update metrics
+                    batch_success_rate, success_mask, (orig_preds, adv_preds) = (
+                        attack.evaluate_attack_success(
+                            correct_inputs, adversarial, correct_labels
+                        )
+                    )
+
+                    # Explicitly compute perturbation metrics
+                    perturbation_metrics = attack.compute_perturbation_metrics(
+                        correct_inputs, adversarial
+                    )
+
+                    # Display batch results
+                    print(
+                        f"  Batch {batch_idx+1}: Success Rate = {batch_success_rate:.2f}%, "
+                        f"L2: {perturbation_metrics['l2_norm']:.4f}, "
+                        f"L∞: {perturbation_metrics['linf_norm']:.4f}, "
+                        f"SSIM: {perturbation_metrics['ssim']:.4f}, "
+                        f"Time: {attack_time_ms:.1f}ms"
+                    )
+
+                    # Store successful examples for visualization
+                    if success_mask.any():
+                        for i in range(min(3, success_mask.sum().item())):
+                            success_idx = torch.where(success_mask)[0][i].item()
+
+                            successful_examples.append(
+                                {
+                                    "original": correct_inputs[success_idx].cpu(),
+                                    "adversarial": adversarial[success_idx].cpu(),
+                                    "original_label": correct_labels[
+                                        success_idx
+                                    ].item(),
+                                    "adversarial_label": adv_preds[success_idx].item(),
+                                }
+                            )
+
+                            if len(successful_examples) >= 3:  # Limit to 3 examples
+                                break
+
+            # Get metrics from the attack
+            attack_metrics = attack.get_metrics()
+            self.results[attack_name][attack_type][model_name] = attack_metrics
+
+            # Print summary metrics
+            print(
+                f"\nSummary metrics for {attack_name} ({attack_type}) on {model_name}:"
+            )
+            print(f"  Success Rate: {attack_metrics['success_rate']:.2f}%")
+            print(f"  L2 Norm: {attack_metrics['l2_norm']:.4f}")
+            print(f"  L∞ Norm: {attack_metrics['linf_norm']:.4f}")
+            print(f"  SSIM: {attack_metrics['ssim']:.4f}")
+            print(f"  Time per sample: {attack_metrics['time_per_sample']*1000:.2f} ms")
+            print(f"  Average iterations: {attack_metrics['iterations']:.2f}")
+            print(f"  Average gradient calls: {attack_metrics['gradient_calls']:.2f}")
+
+            # Store successful examples for later visualization
+            self.results[attack_name][attack_type][model_name][
+                "examples"
+            ] = successful_examples
+
+            # Explicitly free memory after each model evaluation
+            torch.cuda.empty_cache()
 
         return self.results[attack_name]
 
@@ -89,7 +248,7 @@ class AttackEvaluator:
             # Determine category (baseline or optimization)
             category = (
                 "Baseline"
-                if attack_name in ["FGSM", "FFGSM", "DeepFool", "CW"]
+                if attack_name.startswith(("FGSM", "FFGSM", "DeepFool", "CW"))
                 else "Optimization"
             )
 
@@ -98,32 +257,55 @@ class AttackEvaluator:
             # Add untargeted success rates
             if "untargeted" in self.results[attack_name]:
                 for model_name in self.models:
-                    model_results = self.results[attack_name]["untargeted"][model_name]
-                    row[f"{model_name} (Untargeted)"] = (
-                        f"{model_results['success_rate']:.1f}"
-                    )
+                    if model_name in self.results[attack_name]["untargeted"]:
+                        model_results = self.results[attack_name]["untargeted"][
+                            model_name
+                        ]
+                        row[f"{model_name}"] = f"{model_results['success_rate']:.1f}"
+                    else:
+                        row[f"{model_name}"] = "N/A"
             else:
                 for model_name in self.models:
-                    row[f"{model_name} (Untargeted)"] = "N/A"
-
-            # Add targeted success rates
-            if "targeted" in self.results[attack_name]:
-                for model_name in self.models:
-                    model_results = self.results[attack_name]["targeted"][model_name]
-                    row[f"{model_name} (Targeted)"] = (
-                        f"{model_results['success_rate']:.1f}"
-                    )
-            else:
-                for model_name in self.models:
-                    row[f"{model_name} (Targeted)"] = "N/A"
+                    row[f"{model_name}"] = "N/A"
 
             effectiveness_data.append(row)
+
+        # Add another table for targeted attacks if available
+        targeted_data = []
+
+        for attack_name in self.results:
+            if "targeted" not in self.results[attack_name]:
+                continue
+
+            category = (
+                "Baseline"
+                if attack_name.startswith(("FGSM", "FFGSM", "DeepFool", "CW"))
+                else "Optimization"
+            )
+
+            row = {"Category": category, "Method": attack_name}
+
+            for model_name in self.models:
+                if model_name in self.results[attack_name]["targeted"]:
+                    model_results = self.results[attack_name]["targeted"][model_name]
+                    row[f"{model_name}"] = f"{model_results['success_rate']:.1f}"
+                else:
+                    row[f"{model_name}"] = "N/A"
+
+            targeted_data.append(row)
 
         # Convert to DataFrame and save
         effectiveness_df = pd.DataFrame(effectiveness_data)
         effectiveness_df.to_csv(
             os.path.join(output_dir, "table2_attack_effectiveness.csv"), index=False
         )
+
+        if targeted_data:
+            targeted_df = pd.DataFrame(targeted_data)
+            targeted_df.to_csv(
+                os.path.join(output_dir, "table2b_targeted_effectiveness.csv"),
+                index=False,
+            )
 
         # Table 3: Perturbation Efficiency
         perturbation_data = []
@@ -132,13 +314,13 @@ class AttackEvaluator:
             # Determine category
             category = (
                 "Baseline"
-                if attack_name in ["FGSM", "FFGSM", "DeepFool", "CW"]
+                if attack_name.startswith(("FGSM", "FFGSM", "DeepFool", "CW"))
                 else "Optimization"
             )
 
             row = {"Category": category, "Method": attack_name}
 
-            # Average across all models for each metric (L2, L∞, SSIM)
+            # Average perturbation metrics across models
             for attack_type in ["untargeted", "targeted"]:
                 if attack_type in self.results[attack_name]:
                     l2_values = []
@@ -257,179 +439,176 @@ class AttackEvaluator:
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-        # Create dataloader with a small batch size
-        dataloader = torch.utils.data.DataLoader(
-            self.dataset, batch_size=num_samples, shuffle=True
-        )
-
-        # Get a batch of images and labels
-        images, labels = next(iter(dataloader))
-        images = images.to(self.device)
-        labels = labels.to(self.device)
-
-        # Ensure the model is on the correct device
-        model = self.models[model_name].to(self.device)
-        model.eval()
-
-        # Access the base model directly to avoid double normalization
-        if hasattr(model, "model"):
-            # This is our DirectModelAttackWrapper
-            base_model = model.model
-        elif hasattr(model, "_model"):
-            # This is a regular model wrapper
-            base_model = model._model
-        else:
-            # This is already a base model
-            base_model = model
-
-        # Print some info about the labels being used
-        print(f"Visualizing attack: {attack_name} on {model_name}")
-        print(f"Using labels: {labels.tolist()}")
-
-        # Get original model predictions for these images
-        with torch.no_grad():
-            outputs = base_model(images)  # Use base model directly
-            _, init_preds = torch.max(outputs, 1)
-            # Count how many are already correctly classified
-            init_correct = (init_preds == labels).sum().item()
-            print(f"Initial model accuracy: {100 * init_correct / len(labels):.2f}%")
-            print(f"Initial predictions: {init_preds.tolist()}")
-
-        # Import attacks dynamically based on attack name
-        if attack_name.startswith("FGSM-"):
-            from src.attacks.baseline.attack_fgsm import FGSM
-
-            eps = float(attack_name.split("-")[1])
-            attack_fn = lambda model: FGSM(model, eps=eps)
-        elif attack_name.startswith("FFGSM-"):
-            from src.attacks.baseline.attack_ffgsm import FFGSM
-
-            eps = float(attack_name.split("-")[1])
-            attack_fn = lambda model: FFGSM(model, eps=eps, alpha=0.02)
-        elif attack_name == "DeepFool":
-            from src.attacks.baseline.attack_deepfool import DeepFool
-
-            attack_fn = lambda model: DeepFool(model, steps=100, overshoot=0.05)
-        elif attack_name.startswith("CW-"):
-            from src.attacks.baseline.attack_cw import CW
-
-            kappa = float(attack_name.split("kappa")[1])
-            attack_fn = lambda model: CW(model, c=1.0, kappa=kappa, steps=100, lr=0.01)
-        else:
-            print(f"Attack {attack_name} not recognized")
+        # Check if results are available for this attack/model
+        if (
+            attack_name not in self.results
+            or model_name not in self.results[attack_name].get("untargeted", {})
+            and model_name not in self.results[attack_name].get("targeted", {})
+        ):
+            print(f"No results found for {attack_name} on {model_name}")
             return
 
-        # For both untargeted and targeted attacks
+        # Try to get successful examples from either untargeted or targeted results
+        examples = []
         for attack_type in ["untargeted", "targeted"]:
-            if attack_type == "targeted" and attack_name == "DeepFool":
-                print(f"DeepFool doesn't support targeted attacks, skipping")
-                continue
+            if attack_type in self.results[attack_name]:
+                if model_name in self.results[attack_name][attack_type]:
+                    if "examples" in self.results[attack_name][attack_type][model_name]:
+                        examples = self.results[attack_name][attack_type][model_name][
+                            "examples"
+                        ]
+                        if examples:
+                            break
 
-            print(f"Generating {attack_type} adversarial examples...")
+        if not examples:
+            print(f"No successful examples found for {attack_name} on {model_name}")
+            return
 
-            # Create a new attack instance with the same parameters
-            attack_instance = attack_fn(model)
+        # Use up to num_samples examples
+        examples = examples[:num_samples]
 
-            # Set attack mode
-            if attack_type == "targeted":
-                attack_instance.set_mode_targeted_least_likely()
-            else:
-                attack_instance.set_mode_default()
+        # Get class names if available
+        class_names = (
+            self.dataset.class_names if hasattr(self.dataset, "class_names") else None
+        )
 
-            # Generate adversarial examples
-            try:
-                adv_images = attack_instance(images, labels)
+        # Visualize each example
+        for i, example in enumerate(examples):
+            original = example["original"]
+            adversarial = example["adversarial"]
+            original_label = example["original_label"]
+            adversarial_label = example["adversarial_label"]
 
-                # Compute perturbations
-                perturbations = adv_images - images
+            # Get label text if class names are available
+            original_label_text = (
+                class_names[original_label] if class_names else str(original_label)
+            )
+            adversarial_label_text = (
+                class_names[adversarial_label]
+                if class_names
+                else str(adversarial_label)
+            )
 
-                # Convert to numpy for visualization
-                images_np = (
-                    images.cpu().detach().numpy().transpose(0, 2, 3, 1)
-                )  # NCHW -> NHWC
-                adv_images_np = adv_images.cpu().detach().numpy().transpose(0, 2, 3, 1)
-                perturbations_np = (
-                    perturbations.cpu().detach().numpy().transpose(0, 2, 3, 1)
-                )
+            # Plot the images with improved visualization
+            self.plot_adversarial_comparison(
+                original=original,
+                adversarial=adversarial,
+                attack_name=attack_name,
+                original_label=f"{original_label_text} ({original_label})",
+                adv_prediction=f"{adversarial_label_text} ({adversarial_label})",
+                save_path=(
+                    f"{output_dir}/{attack_name}_{attack_type}_{model_name}_example_{i+1}.png"
+                    if output_dir
+                    else None
+                ),
+            )
 
-                # Normalize perturbations for better visualization
-                perturbations_np = (perturbations_np - perturbations_np.min()) / (
-                    perturbations_np.max() - perturbations_np.min() + 1e-8
-                )
+    def plot_adversarial_comparison(
+        self,
+        original,
+        adversarial,
+        attack_name,
+        original_label,
+        adv_prediction,
+        save_path=None,
+    ):
+        """
+        Create an improved comparison plot between original and adversarial images.
 
-                # Get predictions for clean and adversarial images
-                with torch.no_grad():
-                    clean_outputs = base_model(images)  # Use base model directly
-                    clean_preds = clean_outputs.argmax(dim=1).cpu().numpy()
+        Args:
+            original: Original image tensor
+            adversarial: Adversarial image tensor
+            attack_name: Name of the attack
+            original_label: Original label
+            adv_prediction: Prediction on adversarial example
+            save_path: Path to save the figure
+        """
+        # Denormalize images for visualization
+        mean = (
+            torch.tensor([0.485, 0.456, 0.406], dtype=original.dtype)
+            .view(3, 1, 1)
+            .to(original.device)
+        )
+        std = (
+            torch.tensor([0.229, 0.224, 0.225], dtype=original.dtype)
+            .view(3, 1, 1)
+            .to(original.device)
+        )
 
-                    adv_outputs = base_model(adv_images)  # Use base model directly
-                    adv_preds = adv_outputs.argmax(dim=1).cpu().numpy()
+        def denormalize(x):
+            """Convert from normalized to [0,1] range for visualization"""
+            img = x.cpu().clone()
+            img = img * std + mean
+            img = torch.clamp(img, 0, 1)
+            return img
 
-                # Plot images
-                fig, axs = plt.subplots(num_samples, 3, figsize=(15, 3 * num_samples))
-                if num_samples == 1:
-                    axs = axs.reshape(1, -1)  # Handle case with single sample
+        # Get numpy versions for plotting
+        original_np = denormalize(original).permute(1, 2, 0).numpy()
+        adversarial_np = denormalize(adversarial).permute(1, 2, 0).numpy()
 
-                success_count = 0
-                for i in range(num_samples):
-                    # Original image
-                    clean_pred = clean_preds[i]
-                    true_label = labels[i].item()
+        # Calculate perturbation for visualization
+        perturbation = adversarial - original
 
-                    # Original image
-                    img_title = f"Original: {clean_pred}"
-                    if true_label != clean_pred:
-                        img_title += f" (True: {true_label})"
-                    axs[i, 0].imshow(images_np[i])
-                    axs[i, 0].set_title(img_title)
-                    axs[i, 0].axis("off")
+        # Sign/direction view (shows how values change: increase=red, decrease=blue)
+        # Create a diverging colormap visualization
+        perturbation_sign = perturbation.cpu()
+        # Scale the perturbation for better visualization, with diverging colors
+        max_pert = (
+            perturbation_sign.abs().max().item()
+            if perturbation_sign.abs().max().item() > 0
+            else 1.0
+        )
+        perturbation_sign = perturbation_sign / (
+            max_pert * 0.1
+        )  # Normalize and enhance
+        perturbation_sign = torch.clamp(perturbation_sign, -1, 1)
 
-                    # Perturbation
-                    axs[i, 1].imshow(perturbations_np[i])
-                    axs[i, 1].set_title("Perturbation")
-                    axs[i, 1].axis("off")
+        # Convert to a diverging colormap (red-white-blue)
+        # Red for positive changes, blue for negative
+        pert_rgb = torch.zeros(
+            (3, perturbation_sign.shape[1], perturbation_sign.shape[2]),
+            device=perturbation_sign.device,
+        )
+        pert_rgb[0] = torch.clamp(
+            perturbation_sign.mean(dim=0) * 0.5 + 0.5, 0, 1
+        )  # Red channel
+        pert_rgb[2] = torch.clamp(
+            -perturbation_sign.mean(dim=0) * 0.5 + 0.5, 0, 1
+        )  # Blue channel
+        pert_rgb[1] = torch.clamp(
+            1.0 - perturbation_sign.mean(dim=0).abs() * 0.5, 0, 1
+        )  # Green channel
 
-                    # Adversarial image
-                    adv_pred = adv_preds[i]
-                    success = (
-                        clean_pred != adv_pred
-                        if attack_type == "untargeted"
-                        else adv_pred
-                        == attack_instance._target_map_function(
-                            images[i : i + 1], labels[i : i + 1]
-                        ).item()
-                    )
-                    success_count += int(success)
+        # Convert to numpy
+        diverging_pert = pert_rgb.permute(1, 2, 0).numpy()
 
-                    adv_title = f"Adversarial: {adv_pred}"
-                    if success:
-                        adv_title += " ✓"
-                    else:
-                        adv_title += " ✗"
-                    axs[i, 2].imshow(adv_images_np[i])
-                    axs[i, 2].set_title(adv_title)
-                    axs[i, 2].axis("off")
+        # Create the figure
+        fig, ax = plt.subplots(1, 3, figsize=(15, 5))
 
-                # Add success rate to title
-                success_rate = 100 * success_count / num_samples
-                plt.tight_layout()
-                fig.suptitle(
-                    f"{attack_name} ({attack_type}) on {model_name} - Success Rate: {success_rate:.1f}%",
-                    fontsize=16,
-                )
-                plt.subplots_adjust(top=0.95)
+        # Plot original image
+        ax[0].imshow(original_np)
+        ax[0].set_title(f"Original\nLabel: {original_label}")
+        ax[0].axis("off")
 
-                if output_dir:
-                    save_path = os.path.join(
-                        output_dir, f"{attack_name}_{attack_type}_{model_name}.png"
-                    )
-                    plt.savefig(save_path)
-                    print(f"Saved visualization to {save_path}")
-                else:
-                    plt.show()
+        # Plot perturbation (sign)
+        ax[1].imshow(diverging_pert)
+        ax[1].set_title(f"Perturbation (Direction)\nRed=Increase, Blue=Decrease")
+        ax[1].axis("off")
 
-                plt.close()
+        # Plot adversarial image
+        ax[2].imshow(adversarial_np)
+        ax[2].set_title(f"Adversarial\nPredicted: {adv_prediction}")
+        ax[2].axis("off")
 
-            except Exception as e:
-                print(f"Error generating {attack_type} examples: {e}")
-                continue
+        # Add attack information
+        plt.suptitle(f"Adversarial Example - {attack_name}", fontsize=16)
+
+        plt.tight_layout()
+
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        else:
+            plt.show()
+
+        plt.close()

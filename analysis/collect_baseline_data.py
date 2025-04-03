@@ -5,6 +5,8 @@ This script evaluates baseline adversarial attacks on pretrained models
 and collects metrics for the paper tables, including success rates,
 perturbation metrics (L2, L-inf, SSIM), and computational metrics
 (iterations, gradient calls, runtime).
+
+Optimized for high-end GPUs like RTX 4090.
 """
 
 import os
@@ -12,8 +14,11 @@ import sys
 import argparse
 import torch
 import torch.multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import time
+import yaml
+import gc
+from functools import partial
 
 # Add project root to path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -33,177 +38,279 @@ from src.attacks.baseline.attack_cw import CW
 # Import evaluation framework
 from analysis.baseline_eval import AttackEvaluator
 
-# We don't need the class mapping when using the full dataset
-# with proper labels or when using simulation mode
+
+def load_config(config_path):
+    """Load configuration from YAML file."""
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    return config
 
 
-def get_models(device):
-    """Load pretrained models for evaluation using our custom wrappers."""
-    model_dict = {
-        "ResNet-18": get_model("resnet18").to(device),
-        "ResNet-50": get_model("resnet50").to(device),
-        "VGG-16": get_model("vgg16").to(device),
-        "EfficientNet-B0": get_model("efficientnet_b0").to(device),
-        "MobileNet-V3": get_model("mobilenet_v3_large").to(device),
+def detect_gpu_capabilities():
+    """Detect GPU capabilities to optimize settings."""
+    gpu_info = {
+        "device": torch.device("cpu"),
+        "high_end": False,
+        "mixed_precision": False,
+        "memory_gb": 0,
+        "batch_size": 32,
+        "parallel_mode": "thread",  # thread, process, or single
     }
-    return model_dict
 
+    if torch.cuda.is_available():
+        gpu_info["device"] = torch.device("cuda")
+        gpu_info["count"] = torch.cuda.device_count()
 
-def get_base_models(models_dict):
-    """
-    Extract the base torchvision models from our wrappers.
+        # Check capabilities of first GPU
+        props = torch.cuda.get_device_properties(0)
+        gpu_info["name"] = props.name
+        gpu_info["memory_gb"] = props.total_memory / (1024**3)
+        gpu_info["compute_capability"] = (props.major, props.minor)
 
-    This is kept for backwards compatibility with existing code,
-    but our wrappers now expect pre-normalized inputs directly.
-    """
-    base_models = {}
-    for name, model in models_dict.items():
-        # Access the underlying torchvision model if needed
-        if hasattr(model, "_model"):
-            base_model = model._model
+        # Check for high-end GPU (> 16GB VRAM)
+        if gpu_info["memory_gb"] > 16 or "RTX" in props.name:
+            gpu_info["high_end"] = True
+
+            # Higher batch size for high-end GPUs
+            if (
+                "3090" in props.name
+                or "4090" in props.name
+                or gpu_info["memory_gb"] > 20
+            ):
+                gpu_info["batch_size"] = 128
+            elif "3080" in props.name or gpu_info["memory_gb"] > 10:
+                gpu_info["batch_size"] = 64
+
+        # Check for mixed precision support
+        if props.major >= 7:  # Volta or newer architecture
+            gpu_info["mixed_precision"] = True
+
+        # Choose parallel mode based on GPU count
+        if gpu_info["count"] > 1:
+            # For multiple high-end GPUs, process-based parallelism can be better
+            if gpu_info["high_end"] and sys.platform != "win32":
+                gpu_info["parallel_mode"] = "process"
+            else:
+                gpu_info["parallel_mode"] = "thread"
         else:
-            base_model = model
+            gpu_info["parallel_mode"] = "single"
 
-        # Set to evaluation mode
-        base_model.eval()
-        base_model.to(model.device)
+    # Print detected capabilities
+    if gpu_info["device"].type == "cuda":
+        print(f"GPU: {gpu_info['name']} ({gpu_info['memory_gb']:.1f}GB)")
+        print(
+            f"Compute capability: {gpu_info['compute_capability'][0]}.{gpu_info['compute_capability'][1]}"
+        )
+        print(
+            f"Mixed precision: {'Enabled' if gpu_info['mixed_precision'] else 'Disabled'}"
+        )
+        print(f"Batch size: {gpu_info['batch_size']}")
+        print(f"Parallel mode: {gpu_info['parallel_mode']}")
+    else:
+        print("No GPU detected, running on CPU")
 
-        base_models[name] = base_model
-
-    return base_models
+    return gpu_info
 
 
-def prepare_dataset(data_dir, num_samples=200):
+def get_models(device, model_names=None):
+    """Load pretrained models for evaluation using our custom wrappers.
+
+    Args:
+        device: Device to load models on
+        model_names: Optional list of model names to load; if None, load all available models
+
+    Returns:
+        Dictionary mapping model names to model instances
+    """
+
+    # Move model loading to a separate function for better memory management
+    def load_model(name, model_type):
+        # Explicitly run garbage collection before loading a new model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        model = get_model(model_type).to(device)
+        return name, model
+
+    all_model_configs = {
+        "ResNet-18": "resnet18",
+        "ResNet-50": "resnet50",
+        "VGG-16": "vgg16",
+        "EfficientNet-B0": "efficientnet_b0",
+        "MobileNet-V3": "mobilenet_v3_large",
+    }
+
+    # Filter model configs if names are provided
+    if model_names:
+        model_configs = {
+            name: model_type
+            for name, model_type in all_model_configs.items()
+            if name in model_names
+        }
+    else:
+        model_configs = all_model_configs
+
+    # Load models one by one to avoid OOM
+    models = {}
+    for name, model_type in model_configs.items():
+        print(f"Loading model: {name}")
+        name, model = load_model(name, model_type)
+        models[name] = model
+
+    return models
+
+
+def prepare_dataset(data_dir, num_samples=200, gpu_info=None):
     """Load ImageNet dataset using our custom implementation."""
-    # Get the dataset using our custom implementation
+    print(f"Loading dataset from {data_dir}, samples={num_samples}")
+
     dataset = get_dataset(
         dataset_name="imagenet",
-        data_dir=os.path.dirname(
-            data_dir
-        ),  # The parent directory of the ImageNet folder
+        data_dir=data_dir,
         max_samples=num_samples,
     )
 
-    # No need to create a Subset as our implementation already handles max_samples
     return dataset
 
 
-def test_model_accuracy(models, dataset, device):
+def test_model_accuracy(models, dataset, device, batch_size=32):
     """Test the accuracy of models on the dataset to verify our setup."""
-    # Create a DataLoader with batch size matching dataset size
     dataloader = get_dataloader(
-        dataset, batch_size=min(len(dataset), 32), shuffle=False, num_workers=4
+        dataset,
+        batch_size=min(len(dataset), batch_size),
+        shuffle=False,
+        num_workers=min(8, os.cpu_count() or 4),
+        pin_memory=True,
     )
 
-    # Get a batch of images
     images, labels = next(iter(dataloader))
-    images, labels = images.to(device), labels.to(device)
+    images, labels = images.to(device, non_blocking=True).float(), labels.to(
+        device, non_blocking=True
+    )
 
     results = {}
     for model_name, model in models.items():
         model.eval()
 
         with torch.no_grad():
-            # Our models now expect pre-normalized inputs directly
             outputs = model(images)
             _, predicted = torch.max(outputs, 1)
 
-            # Calculate accuracy with original labels
             correct = (predicted == labels).sum().item()
             accuracy = 100 * correct / len(images)
 
-            results[model_name] = {"original_accuracy": accuracy}
-
+            results[model_name] = {"accuracy": accuracy}
             print(f"{model_name} accuracy: {accuracy:.2f}%")
 
     return results
 
 
-# DirectModelAttackWrapper is no longer needed since models expect normalized inputs
-# This class is kept for backward compatibility but just passes through
-class DirectModelAttackWrapper(torch.nn.Module):
-    """
-    Legacy wrapper that directly passes inputs to the model.
+def create_attack_config(config, args, gpu_info=None):
+    """Create attack configurations based on the provided YAML config."""
+    # Parse attack configurations from config file
+    attack_configs = []
 
-    NOTE: This wrapper is no longer necessary since our model wrappers
-    in src.models.wrappers have been updated to expect pre-normalized inputs.
-    It is kept for backward compatibility.
-    """
+    method = config["attack"]["method"]
+    params = config["attack"]["params"]
 
-    def __init__(self, model):
-        super().__init__()
-        # Just store the model directly
-        self.model = model
+    # Adjust parameters based on GPU capabilities
+    if gpu_info and gpu_info["high_end"]:
+        # For high-end GPUs, we can use more steps for optimization-based attacks
+        params["DeepFool"]["max_iter"] = min(100, params["DeepFool"]["max_iter"])
+        params["CW"]["max_iter"] = min(1000, params["CW"]["max_iter"])
 
-        # Set device attribute required by attacks
-        self.device = model.device if hasattr(model, "device") else torch.device("cuda")
+    if method == "all":
+        # Add all attack methods
+        for norm_type in config["attack"]["norm_types"]:
+            # FGSM with different epsilon values
+            for eps in params["FGSM"]["eps_values"][norm_type]:
+                attack_name = f"FGSM-{eps}-{norm_type}"
+                attack_fn = lambda model, eps=eps: FGSM(model, eps=eps)
+                attack_configs.append((attack_name, attack_fn))
 
-    def forward(self, x):
-        """Forward pass directly to model."""
-        return self.model(x)
+            # FFGSM with different epsilon values
+            for eps in params["FFGSM"]["eps_values"][norm_type]:
+                alpha = params["FFGSM"]["alpha"] * eps  # Scale alpha proportionally
+                attack_name = f"FFGSM-{eps}-{norm_type}"
+                attack_fn = lambda model, eps=eps, alpha=alpha: FFGSM(
+                    model, eps=eps, alpha=alpha
+                )
+                attack_configs.append((attack_name, attack_fn))
+
+        # DeepFool
+        attack_name = "DeepFool"
+        overshoot = params["DeepFool"]["overshoot"]
+        steps = params["DeepFool"]["max_iter"]
+        attack_fn = lambda model: DeepFool(model, steps=steps, overshoot=overshoot)
+        attack_configs.append((attack_name, attack_fn))
+
+        # CW with different confidence values
+        for conf in [0.0, 5.0]:
+            attack_name = f"CW-kappa{conf}"
+            c = params["CW"]["c_init"]
+            steps = params["CW"]["max_iter"]
+            lr = params["CW"]["learning_rate"]
+            attack_fn = lambda model, conf=conf: CW(
+                model, c=c, kappa=conf, steps=steps, lr=lr
+            )
+            attack_configs.append((attack_name, attack_fn))
+
+    elif method == "FGSM":
+        # Only FGSM attacks
+        for norm_type in config["attack"]["norm_types"]:
+            for eps in params["FGSM"]["eps_values"][norm_type]:
+                attack_name = f"FGSM-{eps}-{norm_type}"
+                attack_fn = lambda model, eps=eps: FGSM(model, eps=eps)
+                attack_configs.append((attack_name, attack_fn))
+
+    elif method == "FFGSM":
+        # Only FFGSM attacks
+        for norm_type in config["attack"]["norm_types"]:
+            for eps in params["FFGSM"]["eps_values"][norm_type]:
+                alpha = params["FFGSM"]["alpha"] * eps  # Scale alpha proportionally
+                attack_name = f"FFGSM-{eps}-{norm_type}"
+                attack_fn = lambda model, eps=eps, alpha=alpha: FFGSM(
+                    model, eps=eps, alpha=alpha
+                )
+                attack_configs.append((attack_name, attack_fn))
+
+    elif method == "DeepFool":
+        # Only DeepFool attack
+        attack_name = "DeepFool"
+        overshoot = params["DeepFool"]["overshoot"]
+        steps = params["DeepFool"]["max_iter"]
+        attack_fn = lambda model: DeepFool(model, steps=steps, overshoot=overshoot)
+        attack_configs.append((attack_name, attack_fn))
+
+    elif method == "CW":
+        # Only CW attacks
+        for conf in [0.0, 5.0]:
+            attack_name = f"CW-kappa{conf}"
+            c = params["CW"]["c_init"]
+            steps = params["CW"]["max_iter"]
+            lr = params["CW"]["learning_rate"]
+            attack_fn = lambda model, conf=conf: CW(
+                model, c=c, kappa=conf, steps=steps, lr=lr
+            )
+            attack_configs.append((attack_name, attack_fn))
+
+    # Add custom attacks if needed
+    if args.attack_names:
+        # Filter attacks by name if requested
+        filtered_configs = []
+        for attack_name, attack_fn in attack_configs:
+            base_name = attack_name.split("-")[0]
+            if base_name in args.attack_names:
+                filtered_configs.append((attack_name, attack_fn))
+        attack_configs = filtered_configs
+
+    return attack_configs
 
 
-def get_initial_predictions(models, dataset, device):
-    """Get initial model predictions to use as 'correct' labels for attack evaluation."""
-    # Create a DataLoader with small batch size
-    dataloader = get_dataloader(dataset, batch_size=32, shuffle=False, num_workers=4)
-
-    model_predictions = {}
-
-    # Store all initial predictions
-    for model_name, model in models.items():
-        print(f"Getting initial predictions for {model_name}...")
-        model.eval()
-
-        # Initialize tensor to store all predictions
-        all_preds = torch.zeros(len(dataset), dtype=torch.long).to(device)
-        all_scores = torch.zeros(len(dataset)).to(device)
-
-        with torch.no_grad():
-            for batch_idx, (images, labels) in enumerate(dataloader):
-                start_idx = batch_idx * dataloader.batch_size
-                end_idx = min(start_idx + dataloader.batch_size, len(dataset))
-
-                # Get model predictions using the model directly with normalized inputs
-                images = images.to(device)
-                outputs = model(images)
-
-                # Get class with highest confidence
-                scores, preds = torch.max(outputs, dim=1)
-
-                # Store predictions and confidence scores
-                all_preds[start_idx:end_idx] = preds
-                all_scores[start_idx:end_idx] = scores
-
-        # Store results for this model
-        model_predictions[model_name] = {
-            "predictions": all_preds,
-            "confidence": all_scores,
-        }
-
-    return model_predictions
-
-
-class SimulatedDataset(torch.utils.data.Dataset):
-    """A dataset wrapper that replaces original labels with model predictions."""
-
-    def __init__(self, base_dataset, model_predictions, model_name):
-        self.base_dataset = base_dataset
-        self.predictions = model_predictions[model_name]["predictions"]
-        self.class_names = base_dataset.class_names
-        self.image_paths = base_dataset.image_paths
-
-    def __len__(self):
-        return len(self.base_dataset)
-
-    def __getitem__(self, idx):
-        image, _ = self.base_dataset[idx]
-        # Use the model prediction as the "true" label
-        label = self.predictions[idx].item()
-        return image, label
-
-
-def evaluate_model(model_name, model, dataset, attack_configs, args, device_id=None):
+def evaluate_model(
+    model_name, model, dataset, attack_configs, args, config, gpu_info, device_id=None
+):
     """Evaluate all attacks for a single model.
     This function can be run in parallel for multiple models.
     """
@@ -214,7 +321,7 @@ def evaluate_model(model_name, model, dataset, attack_configs, args, device_id=N
                 f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
             )
         else:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = gpu_info["device"]
 
         print(f"\n\n{'#'*50}")
         print(f"Evaluating attacks on {model_name} (device: {device})")
@@ -223,38 +330,87 @@ def evaluate_model(model_name, model, dataset, attack_configs, args, device_id=N
         # Move model to the correct device
         model = model.to(device)
 
-        # For simplicity, create simulated dataset using original dataset
-        # This could be updated to use initial predictions if needed
-        model_dataset = dataset
+        # Enable cuDNN benchmarking for optimal performance
+        torch.backends.cudnn.benchmark = True
 
-        # No wrapper needed as our models now expect normalized inputs directly
+        # Create model dict with just this model
         model_dict = {model_name: model}
 
-        # Create evaluation framework with model-specific dataset
-        evaluator = AttackEvaluator(model_dict, model_dataset, device)
+        # Create evaluation framework with optimized batch size
+        batch_size = gpu_info["batch_size"] if gpu_info else 32
+        num_workers = (
+            min(16, os.cpu_count() or 8) if gpu_info and gpu_info["high_end"] else 8
+        )
+
+        evaluator = AttackEvaluator(
+            model_dict,
+            dataset,
+            device,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
 
         # Evaluate each attack in both untargeted and targeted modes
         results = {}
         for attack_name, attack_fn in attack_configs:
+            # Skip if this specific attack is excluded
+            if args.exclude_attacks and any(
+                ex in attack_name for ex in args.exclude_attacks
+            ):
+                print(f"Skipping {attack_name} (excluded by command line argument)")
+                continue
+
             attack_results = {}
 
+            # Use mixed precision for compatible attacks if supported
+            # (Note: some attacks may not work correctly with mixed precision)
+            use_amp = (
+                gpu_info
+                and gpu_info["mixed_precision"]
+                and not attack_name.startswith(("DeepFool", "CW"))
+            )
+
+            # Evaluate untargeted attack first
             print(f"\n{'='*50}")
             print(f"Evaluating {attack_name} (untargeted)...")
             start_time = time.time()
-            attack_results["untargeted"] = evaluator.evaluate_attack(
-                attack_name, attack_fn, targeted=False
-            )
+
+            # Explicitly run garbage collection before each evaluation
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            with (
+                torch.cuda.amp.autocast(enabled=use_amp) if use_amp else torch.no_grad()
+            ):
+                attack_results["untargeted"] = evaluator.evaluate_attack(
+                    attack_name, attack_fn, targeted=False
+                )
+
             attack_time = time.time() - start_time
             print(f"Completed in {attack_time:.2f}s")
 
-            # Skip evaluating targeted mode for DeepFool as it doesn't support it
-            if "DeepFool" not in attack_name:
+            # Skip targeted evaluation for DeepFool as it doesn't support it
+            if not attack_name.startswith("DeepFool"):
                 print(f"\n{'-'*50}")
                 print(f"Evaluating {attack_name} (targeted)...")
                 start_time = time.time()
-                attack_results["targeted"] = evaluator.evaluate_attack(
-                    attack_name, attack_fn, targeted=True
-                )
+
+                # Explicitly run garbage collection before each evaluation
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                with (
+                    torch.cuda.amp.autocast(enabled=use_amp)
+                    if use_amp
+                    else torch.no_grad()
+                ):
+                    attack_results["targeted"] = evaluator.evaluate_attack(
+                        attack_name, attack_fn, targeted=True
+                    )
+
                 attack_time = time.time() - start_time
                 print(f"Completed in {attack_time:.2f}s")
 
@@ -265,19 +421,33 @@ def evaluate_model(model_name, model, dataset, attack_configs, args, device_id=N
         os.makedirs(model_output_dir, exist_ok=True)
         evaluator.export_results_to_tables(model_output_dir)
 
-        # Visualize some example perturbations
+        # Visualize some example perturbations if results contain examples
         vis_dir = os.path.join(model_output_dir, "visualizations")
         os.makedirs(vis_dir, exist_ok=True)
 
-        # Visualize FGSM and CW examples
-        evaluator.visualize_perturbations(
-            "FGSM-0.03", model_name, num_samples=3, output_dir=vis_dir
-        )
-        evaluator.visualize_perturbations(
-            "CW-kappa0", model_name, num_samples=3, output_dir=vis_dir
-        )
+        # Try to visualize a few key attacks if they were run
+        key_attacks = [
+            attack_name
+            for attack_name, _ in attack_configs
+            if "FGSM-0.03" in attack_name
+            or "CW-kappa0" in attack_name
+            or attack_name == "DeepFool"
+        ]
+
+        for attack_name in key_attacks:
+            if attack_name in results:
+                evaluator.visualize_perturbations(
+                    attack_name, model_name, num_samples=3, output_dir=vis_dir
+                )
+
+        # Clear GPU memory before returning
+        model = model.cpu()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
         return {model_name: results}
+
     except Exception as e:
         print(f"Error evaluating model {model_name}: {e}")
         import traceback
@@ -288,102 +458,110 @@ def evaluate_model(model_name, model, dataset, attack_configs, args, device_id=N
 
 def main(args):
     """Main evaluation function."""
-    # Determine available devices
+    # Load configuration
+    config = load_config(args.config_file)
+    print(f"Loaded configuration from {args.config_file}")
+
+    # Get GPU capabilities for optimization
+    gpu_info = detect_gpu_capabilities()
+
+    # Determine available devices and parallelization strategy
     if torch.cuda.is_available():
         num_gpus = torch.cuda.device_count()
         print(f"Found {num_gpus} GPU(s) available")
 
         if num_gpus > 1:
-            print("Will use parallel evaluation across multiple GPUs")
+            print(
+                f"Will use parallel evaluation with {gpu_info['parallel_mode']} parallelism"
+            )
         else:
             print("Will use single GPU for evaluation")
     else:
         num_gpus = 0
         print("No GPUs found, using CPU")
 
-    # Load models and dataset
-    print("Loading models...")
-    all_models_dict = get_models(torch.device("cpu"))  # Initially load on CPU
+    # Set device for initial loading
+    device = gpu_info["device"]
 
-    # Filter models based on command-line argument
+    # Load models based on config
+    model_names = None
     if args.model_name:
-        if args.model_name not in all_models_dict:
-            print(
-                f"Error: Model '{args.model_name}' not found. Available models: {list(all_models_dict.keys())}"
-            )
-            sys.exit(1)
-        print(f"Evaluating only the {args.model_name} model as requested")
-        models_dict = {args.model_name: all_models_dict[args.model_name]}
-    else:
-        models_dict = all_models_dict
-        print(f"Evaluating all models: {list(models_dict.keys())}")
+        model_names = [args.model_name]
+    elif config["models"]:
+        # Map from config model names to our model class names
+        model_map = {
+            "resnet18": "ResNet-18",
+            "resnet50": "ResNet-50",
+            "vgg16": "VGG-16",
+            "efficientnet": "EfficientNet-B0",
+            "mobilenet": "MobileNet-V3",
+        }
+        model_names = [model_map.get(name, name) for name in config["models"]]
 
-    print(f"Loading dataset from {args.data_dir}...")
-    dataset = prepare_dataset(args.data_dir, args.num_samples)
+    print(f"Loading models: {model_names or 'all available'}")
+    models_dict = get_models(device, model_names)
 
-    # Print information about compatibility
-    print("\nNOTE: Using models that expect pre-normalized inputs")
-    print(
-        "This is compatible with our ImageNetDataset which outputs normalized tensors"
+    # Load dataset
+    data_dir = (
+        config["dataset"]["image_dir"]
+        if config["dataset"]["image_dir"]
+        else args.data_dir
     )
+    num_samples = args.num_samples or config["dataset"]["num_images"]
 
-    # Test model accuracy on one device first to see if we need simulation mode
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    first_model = next(iter(models_dict.values())).to(device)
+    dataset = prepare_dataset(data_dir, num_samples, gpu_info)
 
-    print("\nTesting model accuracy on sample batch...")
-    dataloader = get_dataloader(
-        dataset, batch_size=min(32, len(dataset)), shuffle=False
-    )
-    images, labels = next(iter(dataloader))
-    images, labels = images.to(device), labels.to(device)
+    # Test model accuracy to verify everything is working
+    batch_size = gpu_info["batch_size"] if gpu_info else 32
+    print("\nTesting model accuracy on dataset...")
+    model_accuracy = test_model_accuracy(models_dict, dataset, device, batch_size)
 
-    with torch.no_grad():
-        outputs = first_model(images)
-        _, preds = torch.max(outputs, 1)
-        accuracy = 100 * (preds == labels).sum().item() / len(labels)
-
-    print(f"Sample accuracy: {accuracy:.2f}%")
-
-    # If accuracy is very poor, warn about metrics but continue anyway
-    if accuracy < 25.0:
-        print("\nWARNING: Models show very low accuracy on this dataset!")
-        print("Attack metrics may be affected - some images are already misclassified.")
-        print("For best results, use a dataset the models can classify correctly.")
-        print("\nContinuing with evaluation...")
-
-    # Define attack configurations
-    all_attack_configs = [
-        # FGSM with different epsilon values
-        ("FGSM-0.01", lambda model: FGSM(model, eps=0.01)),
-        ("FGSM-0.03", lambda model: FGSM(model, eps=0.03)),
-        # FFGSM
-        ("FFGSM-0.03", lambda model: FFGSM(model, eps=0.03, alpha=0.02)),
-        # DeepFool
-        ("DeepFool", lambda model: DeepFool(model, steps=100, overshoot=0.05)),
-        # CW with different parameters
-        ("CW-kappa0", lambda model: CW(model, c=1.0, kappa=0.0, steps=100, lr=0.01)),
-        ("CW-kappa2", lambda model: CW(model, c=1.0, kappa=2.0, steps=100, lr=0.01)),
-    ]
-
-    # Filter attacks based on command-line argument
-    if args.attack_names:
-        filtered_attack_configs = []
-        for attack_name, attack_fn in all_attack_configs:
-            base_name = attack_name.split("-")[0]
-            if base_name in args.attack_names:
-                filtered_attack_configs.append((attack_name, attack_fn))
-        attack_configs = filtered_attack_configs
-        print(f"Evaluating only these attacks: {[name for name, _ in attack_configs]}")
-    else:
-        attack_configs = all_attack_configs
-        print(f"Evaluating all attacks: {[name for name, _ in attack_configs]}")
+    # Create attack configurations from config file
+    attack_configs = create_attack_config(config, args, gpu_info)
+    print(f"Created {len(attack_configs)} attack configurations")
 
     # Evaluate attacks on models (in parallel if multiple GPUs available)
-    if num_gpus > 1 and len(models_dict) > 1:
-        # Parallelize model evaluation across GPUs
+    if gpu_info["parallel_mode"] == "process" and len(models_dict) > 1:
+        # Process pool is better for heavy GPU workloads on multiple GPUs
         print(
-            f"\nRunning parallel evaluation across {min(num_gpus, len(models_dict))} GPUs"
+            f"\nRunning parallel evaluation with process pool across {min(num_gpus, len(models_dict))} GPUs"
+        )
+
+        # Function with preset arguments, only model_name and model will be provided later
+        worker_fn = partial(
+            evaluate_model,
+            dataset=dataset,
+            attack_configs=attack_configs,
+            args=args,
+            config=config,
+            gpu_info=gpu_info,
+        )
+
+        all_results = {}
+        with ProcessPoolExecutor(max_workers=num_gpus) as executor:
+            futures = []
+            for i, (model_name, model) in enumerate(models_dict.items()):
+                # Assign each model to a different GPU in round-robin fashion
+                device_id = i % num_gpus
+                futures.append(
+                    executor.submit(
+                        worker_fn,
+                        model_name,
+                        model,
+                        device_id=device_id,
+                    )
+                )
+
+            # Collect results as they complete
+            for future in futures:
+                result = future.result()
+                if result:
+                    all_results.update(result)
+
+    elif gpu_info["parallel_mode"] == "thread" and len(models_dict) > 1:
+        # Thread pool for lighter workloads or Windows
+        print(
+            f"\nRunning parallel evaluation with thread pool across {min(num_gpus, len(models_dict))} GPUs"
         )
 
         all_results = {}
@@ -400,6 +578,8 @@ def main(args):
                         dataset,
                         attack_configs,
                         args,
+                        config,
+                        gpu_info,
                         device_id,
                     )
                 )
@@ -419,6 +599,8 @@ def main(args):
                 dataset,
                 attack_configs,
                 args,
+                config,
+                gpu_info,
             )
             if result:
                 all_results.update(result)
@@ -426,14 +608,19 @@ def main(args):
     print(f"\nAll results saved to {args.output_dir}")
 
     # Return to reference device for cleanup
-    torch.cuda.set_device(0)
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
     # Fix multiprocessing issue in Windows
     if sys.platform == "win32":
         mp.set_start_method("spawn", force=True)
+
+    # Set environment variables for performance
+    os.environ["OMP_NUM_THREADS"] = str(min(8, os.cpu_count() or 4))
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
     parser = argparse.ArgumentParser(description="Collect data for paper tables.")
     parser.add_argument(
@@ -446,14 +633,23 @@ if __name__ == "__main__":
         help="Directory to save results",
     )
     parser.add_argument(
-        "--num_samples", type=int, default=200, help="Number of samples to evaluate"
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to evaluate (overrides config)",
+    )
+    parser.add_argument(
+        "--config_file",
+        type=str,
+        default="analysis/config.yaml",
+        help="Path to configuration file",
     )
     parser.add_argument(
         "--model-name",
         type=str,
         default=None,
         choices=["ResNet-18", "ResNet-50", "VGG-16", "EfficientNet-B0", "MobileNet-V3"],
-        help="Specify a single model to evaluate (default: evaluate all models)",
+        help="Specify a single model to evaluate (default: use models from config)",
     )
     parser.add_argument(
         "--attack-names",
@@ -461,7 +657,14 @@ if __name__ == "__main__":
         nargs="+",
         default=None,
         choices=["FGSM", "FFGSM", "DeepFool", "CW"],
-        help="Specify specific attacks to evaluate (default: evaluate all attacks)",
+        help="Specify specific attacks to evaluate (default: use attacks from config)",
+    )
+    parser.add_argument(
+        "--exclude-attacks",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Specify attacks to exclude (e.g., 'DeepFool' to exclude DeepFool)",
     )
     args = parser.parse_args()
 
