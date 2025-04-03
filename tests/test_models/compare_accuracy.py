@@ -9,13 +9,13 @@ This script runs inference on all available models and reports:
 - Confusion patterns
 
 # Basic usage (all samples)
-python tests/test_models/print_accuracy.py
+python tests/test_models/compare_accuracy.py
 
 # Limit samples (faster for testing)
-python tests/test_models/print_accuracy.py --max-samples 100
+python tests/test_models/compare_accuracy.py --max-samples 100
 
 # Save results to file
-python tests/test_models/print_accuracy.py --output results.json --visualize
+python tests/test_models/compare_accuracy.py --output results.json --visualize
 """
 
 import os
@@ -28,7 +28,6 @@ from tabulate import tabulate
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
-from torchvision import transforms
 
 # Add project root to path
 project_root = os.path.dirname(
@@ -46,21 +45,13 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def evaluate_with_direct_forward(model, dataloader, class_names, device):
+def evaluate_model(model, dataloader, class_names, device):
     """
-    Evaluate a model by directly accessing the underlying torchvision model,
-    bypassing our wrapper's normalization.
+    Evaluate a model on the given dataloader.
 
-    This is used to avoid double normalization when the dataset is already normalized.
+    Our model wrappers now expect pre-normalized inputs, so we use them directly.
     """
-    # Access the underlying model directly
-    if hasattr(model, "_model"):
-        base_model = model._model
-    else:
-        base_model = model
-
-    base_model.eval()
-    base_model.to(device)
+    model.eval()
 
     # Track metrics
     total = 0
@@ -85,8 +76,8 @@ def evaluate_with_direct_forward(model, dataloader, class_names, device):
 
             # Measure inference time
             start_time = time.time()
-            # Use the base model directly (skip our normalization)
-            logits = base_model(images)
+            # Use the model directly - it no longer applies normalization
+            logits = model(images)
             inference_time += time.time() - start_time
 
             # Calculate top-1 predictions
@@ -140,9 +131,7 @@ def evaluate_with_direct_forward(model, dataloader, class_names, device):
         "top1_accuracy": top1_accuracy,
         "top5_accuracy": top5_accuracy,
         "inference_time": avg_inference_time,
-        "parameters": count_parameters(
-            model if not hasattr(model, "_model") else model._model
-        ),
+        "parameters": count_parameters(model),
         "top_confusions": top_confusions,
     }
 
@@ -185,30 +174,24 @@ def main():
     # Load the ImageNet dataset
     print("Loading ImageNet dataset...")
 
-    # First, check the normalization of the dataset
-    custom_transform = transforms.Compose(
-        [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-
+    # Load dataset with default transformation (includes normalization)
     dataset = get_dataset(
         "imagenet",
         data_dir=args.data_dir,
         max_samples=args.max_samples,
-        transform=custom_transform,  # Use explicit transform
     )
     dataloader = get_dataloader(
         dataset, batch_size=args.batch_size, shuffle=False, num_workers=0
     )  # Set num_workers=0 for easier debugging
 
+    # Check for duplicate class names
+    if hasattr(dataset, "duplicate_classes") and dataset.duplicate_classes:
+        print("Detected duplicate class names:")
+        for name, indices in dataset.duplicate_classes.items():
+            print(f"  '{name}' appears at indices: {indices}")
+
     # Load class names
-    imagenet_dir = os.path.join(args.data_dir, "imagenet")
-    with open(os.path.join(imagenet_dir, "imagenet_classes.txt"), "r") as f:
-        class_names = [line.strip() for line in f.readlines()]
+    class_names = dataset.class_names
 
     # Define models to evaluate
     models_to_evaluate = [
@@ -237,12 +220,10 @@ def main():
         model.eval()
         model = model.to(device)
 
-        # Time the evaluation - use direct evaluation to avoid double normalization
+        # Time the evaluation - use model directly as it now expects normalized inputs
         with torch.no_grad():
             start_time = time.time()
-            metrics = evaluate_with_direct_forward(
-                model, dataloader, class_names, device
-            )
+            metrics = evaluate_model(model, dataloader, class_names, device)
             eval_time = time.time() - start_time
 
         # Add to results
