@@ -51,14 +51,14 @@ def get_models(device):
 
 def get_base_models(models_dict):
     """
-    Extract the base torchvision models from our wrappers to avoid double normalization.
+    Extract the base torchvision models from our wrappers.
 
-    This is crucial when working with datasets that are already normalized with
-    ImageNet normalization (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]).
+    This is kept for backwards compatibility with existing code,
+    but our wrappers now expect pre-normalized inputs directly.
     """
     base_models = {}
     for name, model in models_dict.items():
-        # Access the underlying torchvision model directly
+        # Access the underlying torchvision model if needed
         if hasattr(model, "_model"):
             base_model = model._model
         else:
@@ -88,7 +88,7 @@ def prepare_dataset(data_dir, num_samples=200):
     return dataset
 
 
-def test_model_accuracy(models, base_models, dataset, device):
+def test_model_accuracy(models, dataset, device):
     """Test the accuracy of models on the dataset to verify our setup."""
     # Create a DataLoader with batch size matching dataset size
     dataloader = get_dataloader(
@@ -101,12 +101,11 @@ def test_model_accuracy(models, base_models, dataset, device):
 
     results = {}
     for model_name, model in models.items():
-        base_model = base_models[model_name]
-        base_model.eval()
+        model.eval()
 
         with torch.no_grad():
-            # Use the base model directly to avoid double normalization
-            outputs = base_model(images)
+            # Our models now expect pre-normalized inputs directly
+            outputs = model(images)
             _, predicted = torch.max(outputs, 1)
 
             # Calculate accuracy with original labels
@@ -120,41 +119,31 @@ def test_model_accuracy(models, base_models, dataset, device):
     return results
 
 
+# DirectModelAttackWrapper is no longer needed since models expect normalized inputs
+# This class is kept for backward compatibility but just passes through
 class DirectModelAttackWrapper(torch.nn.Module):
     """
-    Wrapper that accesses the underlying model directly for attacks.
+    Legacy wrapper that directly passes inputs to the model.
 
-    This avoids double normalization when working with already normalized datasets.
+    NOTE: This wrapper is no longer necessary since our model wrappers
+    in src.models.wrappers have been updated to expect pre-normalized inputs.
+    It is kept for backward compatibility.
     """
 
     def __init__(self, model):
         super().__init__()
-        # Store the wrapped model
-        self.wrapped_model = model
-
-        # Access the base model directly
-        if hasattr(model, "_model"):
-            self.model = model._model
-        else:
-            self.model = model
-
-        # Set to evaluation mode
-        self.model.eval()
-        self.model.to(model.device if hasattr(model, "device") else "cuda")
+        # Just store the model directly
+        self.model = model
 
         # Set device attribute required by attacks
-        self.device = (
-            model.device
-            if hasattr(model, "device")
-            else next(self.model.parameters()).device
-        )
+        self.device = model.device if hasattr(model, "device") else torch.device("cuda")
 
     def forward(self, x):
-        """Forward pass directly to base model."""
+        """Forward pass directly to model."""
         return self.model(x)
 
 
-def get_initial_predictions(models, base_models, dataset, device):
+def get_initial_predictions(models, dataset, device):
     """Get initial model predictions to use as 'correct' labels for attack evaluation."""
     # Create a DataLoader with small batch size
     dataloader = get_dataloader(dataset, batch_size=32, shuffle=False, num_workers=4)
@@ -164,8 +153,7 @@ def get_initial_predictions(models, base_models, dataset, device):
     # Store all initial predictions
     for model_name, model in models.items():
         print(f"Getting initial predictions for {model_name}...")
-        base_model = base_models[model_name]
-        base_model.eval()
+        model.eval()
 
         # Initialize tensor to store all predictions
         all_preds = torch.zeros(len(dataset), dtype=torch.long).to(device)
@@ -176,9 +164,9 @@ def get_initial_predictions(models, base_models, dataset, device):
                 start_idx = batch_idx * dataloader.batch_size
                 end_idx = min(start_idx + dataloader.batch_size, len(dataset))
 
-                # Get model predictions using base model to avoid double normalization
+                # Get model predictions using the model directly with normalized inputs
                 images = images.to(device)
-                outputs = base_model(images)
+                outputs = model(images)
 
                 # Get class with highest confidence
                 scores, preds = torch.max(outputs, dim=1)
@@ -215,9 +203,7 @@ class SimulatedDataset(torch.utils.data.Dataset):
         return image, label
 
 
-def evaluate_model(
-    model_name, model, dataset, base_model, attack_configs, args, device_id=None
-):
+def evaluate_model(model_name, model, dataset, attack_configs, args, device_id=None):
     """Evaluate all attacks for a single model.
     This function can be run in parallel for multiple models.
     """
@@ -241,12 +227,11 @@ def evaluate_model(
         # This could be updated to use initial predictions if needed
         model_dataset = dataset
 
-        # Create a direct model wrapper for attacks to avoid double normalization
-        direct_model = DirectModelAttackWrapper(model)
-        direct_model.to(device)
+        # No wrapper needed as our models now expect normalized inputs directly
+        model_dict = {model_name: model}
 
         # Create evaluation framework with model-specific dataset
-        evaluator = AttackEvaluator({model_name: direct_model}, model_dataset, device)
+        evaluator = AttackEvaluator(model_dict, model_dataset, device)
 
         # Evaluate each attack in both untargeted and targeted modes
         results = {}
@@ -333,20 +318,18 @@ def main(args):
         models_dict = all_models_dict
         print(f"Evaluating all models: {list(models_dict.keys())}")
 
-    # Get base models for direct evaluation (avoid double normalization)
-    base_models = get_base_models(models_dict)
-
     print(f"Loading dataset from {args.data_dir}...")
     dataset = prepare_dataset(args.data_dir, args.num_samples)
 
-    # Print warning about normalization
-    print("\nNOTE: Using base models directly to avoid double normalization")
-    print("This is crucial when evaluating already-normalized datasets")
+    # Print information about compatibility
+    print("\nNOTE: Using models that expect pre-normalized inputs")
+    print(
+        "This is compatible with our ImageNetDataset which outputs normalized tensors"
+    )
 
     # Test model accuracy on one device first to see if we need simulation mode
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     first_model = next(iter(models_dict.values())).to(device)
-    first_base_model = next(iter(base_models.values())).to(device)
 
     print("\nTesting model accuracy on sample batch...")
     dataloader = get_dataloader(
@@ -356,7 +339,7 @@ def main(args):
     images, labels = images.to(device), labels.to(device)
 
     with torch.no_grad():
-        outputs = first_base_model(images)
+        outputs = first_model(images)
         _, preds = torch.max(outputs, 1)
         accuracy = 100 * (preds == labels).sum().item() / len(labels)
 
@@ -415,7 +398,6 @@ def main(args):
                         model_name,
                         model,
                         dataset,
-                        base_models[model_name],
                         attack_configs,
                         args,
                         device_id,
@@ -435,7 +417,6 @@ def main(args):
                 model_name,
                 model,
                 dataset,
-                base_models[model_name],
                 attack_configs,
                 args,
             )

@@ -48,12 +48,19 @@ def main():
 
         print(f"Loaded {len(images)} images with labels: {labels.tolist()}")
 
-        # Check if the labels are indeed 0 to num_samples-1 as expected
-        expected = list(range(min(num_samples, len(labels))))
-        if labels.tolist()[: len(expected)] == expected:
-            print("✓ Labels match expected sequential order")
-        else:
-            print("✗ Labels do not match expected sequential order")
+        # Check for duplicate class names in the dataset
+        if hasattr(dataset, "duplicate_classes") and dataset.duplicate_classes:
+            print("\nDetected duplicate class names:")
+            for name, indices in dataset.duplicate_classes.items():
+                print(f"  '{name}' appears at indices: {indices}")
+
+            # Check if any duplicated classes are in our sample
+            for name, indices in dataset.duplicate_classes.items():
+                for idx in indices:
+                    if idx in labels:
+                        print(
+                            f"  Sample contains duplicate class '{name}' (index {idx})"
+                        )
 
         # Get model predictions
         with torch.no_grad():
@@ -75,7 +82,11 @@ def main():
                 label = labels[i].item()
                 pred = predicted[i].item()
 
+                # Extract synset ID from filename if available
+                synset_id = filename.split("_")[0] if "_" in filename else "unknown"
+
                 print(f"  Image {i}: {filename}")
+                print(f"    Synset ID: {synset_id}")
                 print(f"    Label: {label} ({dataset.class_names[label]})")
                 print(f"    Predicted: {pred} ({dataset.class_names[pred]})")
 

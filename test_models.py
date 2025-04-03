@@ -17,21 +17,6 @@ if project_root not in sys.path:
 from src.datasets.imagenet import get_dataset
 from src.models.wrappers import get_model
 
-# Sample of ImageNet class indices for common objects
-# These are real classes the models were trained to recognize
-IMAGENET_SAMPLE_CLASSES = {
-    0: 491,  # strawberry
-    1: 285,  # Egyptian cat
-    2: 970,  # alp
-    3: 385,  # badger
-    4: 388,  # giant panda
-    5: 13,  # junco
-    6: 153,  # Maltese dog
-    7: 417,  # balloon
-    8: 497,  # church
-    9: 920,  # book jacket
-}
-
 
 def main():
     # Configuration
@@ -70,57 +55,46 @@ def main():
     images = images.to(device)
     labels = labels.to(device)
 
-    print(f"Loaded {len(images)} images with original labels: {labels.tolist()}")
+    print(f"Loaded {len(images)} images with labels: {labels.tolist()}")
 
-    # Convert our sequential labels to actual ImageNet class indices
-    # In a real attack, we would use these mapped labels
-    mapped_labels = torch.tensor(
-        [IMAGENET_SAMPLE_CLASSES[l.item()] for l in labels], device=device
-    )
-    print(f"Mapped to ImageNet classes: {mapped_labels.tolist()}")
+    # Check for duplicate class names in the dataset
+    if hasattr(dataset, "duplicate_classes") and dataset.duplicate_classes:
+        print("\nDetected duplicate class names:")
+        for name, indices in dataset.duplicate_classes.items():
+            print(f"  '{name}' appears at indices: {indices}")
 
     # Check model accuracy on clean images
     for model_name, model in models.items():
-        print(f"\nTesting {model_name} with original labels:")
+        print(f"\nTesting {model_name}:")
         with torch.no_grad():
             outputs = model(images)
             _, predicted = torch.max(outputs, 1)
 
-            # Calculate accuracy with original labels (should be poor)
+            # Calculate accuracy with labels from our dataset
             correct = (predicted == labels).sum().item()
             accuracy = 100 * correct / len(images)
 
-            print(f"Accuracy with original labels: {accuracy:.2f}%")
+            print(f"Accuracy: {accuracy:.2f}%")
             print(f"Predictions: {predicted.tolist()}")
-            print(f"Original labels: {labels.tolist()}")
+            print(f"Labels: {labels.tolist()}")
 
-        print(f"\nTesting {model_name} with mapped ImageNet labels:")
-        with torch.no_grad():
-            outputs = model(images)
-            _, predicted = torch.max(outputs, 1)
-
-            # Calculate accuracy with mapped labels (should be better)
-            correct = (predicted == mapped_labels).sum().item()
-            accuracy = 100 * correct / len(images)
-
-            print(f"Accuracy with mapped labels: {accuracy:.2f}%")
-            print(f"Predictions: {predicted.tolist()}")
-            print(f"Mapped labels: {mapped_labels.tolist()}")
-
-            # Print some sample class names to verify mapping
+            # Print some sample class names
             class_names = list(dataset.class_names)
-            print("\nSample class mappings:")
+            print("\nSample predictions:")
             for i in range(min(5, len(labels))):
-                orig_idx = labels[i].item()
-                mapped_idx = mapped_labels[i].item()
+                img_path = dataset.image_paths[i][0]
+                filename = os.path.basename(img_path)
+                label_idx = labels[i].item()
                 pred_idx = predicted[i].item()
 
-                print(f"Image {i}:")
-                print(f"  Original label {orig_idx}")
-                print(
-                    f"  Mapped to ImageNet class {mapped_idx} ({class_names[mapped_idx]})"
-                )
-                print(f"  Predicted as class {pred_idx} ({class_names[pred_idx]})")
+                # Extract synset ID from filename if available
+                synset_id = filename.split("_")[0] if "_" in filename else "unknown"
+
+                print(f"Image {i}: {filename}")
+                print(f"  Synset ID: {synset_id}")
+                print(f"  True label: {label_idx} ({class_names[label_idx]})")
+                print(f"  Predicted: {pred_idx} ({class_names[pred_idx]})")
+                print(f"  {'✓ Correct' if label_idx == pred_idx else '✗ Incorrect'}")
 
 
 if __name__ == "__main__":

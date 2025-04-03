@@ -8,8 +8,17 @@ in adversarial attack experiments. It includes:
 - Implementation classes for various model architectures.
 - get_model: Factory function to create model instances by name.
 
-The implementation focuses on making it easy to use pretrained models in a
-standardized way for adversarial attack evaluation.
+INPUT/OUTPUT SPECIFICATIONS:
+- Input: NORMALIZED tensors in range [-2.64, 2.64] (from ImageNet normalization)
+- Process: No additional normalization is applied
+- Output: Logits tensor of shape [batch_size, 1000] for ImageNet classes
+
+COMPATIBILITY:
+- These wrappers are designed to work directly with our dataset loaders (src/datasets/imagenet.py),
+  which output normalized tensors using ImageNet mean and std.
+- The dataset handles proper class index mapping from synset IDs to ImageNet indices.
+- For duplicate class names in ImageNet (like 'crane', 'maillot'), the dataset ensures
+  correct index assignment based on synset IDs.
 """
 
 import torch
@@ -25,6 +34,13 @@ class ImageNetModel(nn.Module, ABC):
 
     This abstract class defines the common interface that all model implementations
     must follow for consistency in the adversarial attack experiments.
+
+    NORMALIZATION BEHAVIOR:
+    These models expect ALREADY NORMALIZED inputs from our ImageNetDataset.
+    No additional normalization is applied in the forward() method.
+
+    Expected input range: [-2.64, 2.64] (after ImageNet normalization with
+    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     """
 
     def __init__(self):
@@ -33,6 +49,7 @@ class ImageNetModel(nn.Module, ABC):
         self._model = None
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._input_size = (224, 224)  # Default input size (height, width)
+        # These values are stored for reference but not applied in forward pass
         self._mean = [0.485, 0.456, 0.406]  # ImageNet mean
         self._std = [0.229, 0.224, 0.225]  # ImageNet std
 
@@ -48,12 +65,12 @@ class ImageNetModel(nn.Module, ABC):
 
     @property
     def mean(self) -> List[float]:
-        """Get the mean values for normalization."""
+        """Get the mean values used for normalization in the dataset."""
         return self._mean
 
     @property
     def std(self) -> List[float]:
-        """Get the standard deviation values for normalization."""
+        """Get the standard deviation values used for normalization in the dataset."""
         return self._std
 
     def to(self, device: Union[str, torch.device]) -> "ImageNetModel":
@@ -72,7 +89,8 @@ class ImageNetModel(nn.Module, ABC):
 
         Args:
             x: Input tensor of shape (batch_size, 3, height, width).
-               Expected to be in range [0, 1] and unnormalized.
+               Expected to be ALREADY NORMALIZED with ImageNet normalization
+               from the dataset loader.
 
         Returns:
             Tensor of logits with shape (batch_size, num_classes).
@@ -85,7 +103,8 @@ class ImageNetModel(nn.Module, ABC):
 
         Args:
             x: Input tensor of shape (batch_size, 3, height, width).
-               Expected to be in range [0, 1] and unnormalized.
+               Expected to be ALREADY NORMALIZED with ImageNet normalization
+               from the dataset loader.
 
         Returns:
             Tuple of (predicted_classes, probabilities) where:
@@ -107,6 +126,7 @@ class ImageNetModel(nn.Module, ABC):
 
         Args:
             x: Input tensor of shape (batch_size, 3, height, width).
+               Expected to be ALREADY NORMALIZED.
             target_class: Target class indices of shape (batch_size).
 
         Returns:
@@ -176,17 +196,9 @@ class ResNetModel(ImageNetModel):
         self._model.to(self.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with normalization."""
+        """Forward pass without normalization (expect pre-normalized inputs)."""
         x = x.to(self.device)
-        # Apply ImageNet normalization
-        x = self._normalize(x)
         return self._model(x)
-
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize input according to ImageNet standards."""
-        mean = torch.tensor(self.mean, device=x.device).view(1, 3, 1, 1)
-        std = torch.tensor(self.std, device=x.device).view(1, 3, 1, 1)
-        return (x - mean) / std
 
 
 class VGGModel(ImageNetModel):
@@ -227,17 +239,9 @@ class VGGModel(ImageNetModel):
         self._model.to(self.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with normalization."""
+        """Forward pass without normalization (expect pre-normalized inputs)."""
         x = x.to(self.device)
-        # Apply ImageNet normalization
-        x = self._normalize(x)
         return self._model(x)
-
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize input according to ImageNet standards."""
-        mean = torch.tensor(self.mean, device=x.device).view(1, 3, 1, 1)
-        std = torch.tensor(self.std, device=x.device).view(1, 3, 1, 1)
-        return (x - mean) / std
 
 
 class EfficientNetModel(ImageNetModel):
@@ -298,17 +302,9 @@ class EfficientNetModel(ImageNetModel):
         self._model.to(self.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with normalization."""
+        """Forward pass without normalization (expect pre-normalized inputs)."""
         x = x.to(self.device)
-        # Apply ImageNet normalization
-        x = self._normalize(x)
         return self._model(x)
-
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize input according to ImageNet standards."""
-        mean = torch.tensor(self.mean, device=x.device).view(1, 3, 1, 1)
-        std = torch.tensor(self.std, device=x.device).view(1, 3, 1, 1)
-        return (x - mean) / std
 
 
 class MobileNetModel(ImageNetModel):
@@ -341,17 +337,9 @@ class MobileNetModel(ImageNetModel):
         self._model.to(self.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with normalization."""
+        """Forward pass without normalization (expect pre-normalized inputs)."""
         x = x.to(self.device)
-        # Apply ImageNet normalization
-        x = self._normalize(x)
         return self._model(x)
-
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize input according to ImageNet standards."""
-        mean = torch.tensor(self.mean, device=x.device).view(1, 3, 1, 1)
-        std = torch.tensor(self.std, device=x.device).view(1, 3, 1, 1)
-        return (x - mean) / std
 
 
 def get_model(model_name: str, **kwargs) -> ImageNetModel:
@@ -364,10 +352,14 @@ def get_model(model_name: str, **kwargs) -> ImageNetModel:
         **kwargs: Additional arguments to pass to the model constructor.
 
     Returns:
-        An initialized model instance.
+        An initialized model instance that expects pre-normalized inputs.
 
     Raises:
         ValueError: If the specified model is not supported.
+
+    Note:
+        The returned model expects ALREADY NORMALIZED inputs from the dataset
+        loader. No additional normalization is applied.
     """
     # Parse architecture and variant from model_name
     model_map = {

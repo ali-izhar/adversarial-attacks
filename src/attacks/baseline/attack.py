@@ -1,6 +1,12 @@
 """Base class for all baseline attacks.
 
 Code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
+
+NORMALIZATION WARNING:
+When using these attacks with our framework:
+1. Our model wrappers now expect ALREADY NORMALIZED inputs from ImageNetDataset
+2. No additional normalization should be needed or applied
+3. Always ensure proper clamping of images to [0,1] range after perturbation
 """
 
 import time
@@ -40,6 +46,12 @@ class Attack(object):
         It automatically set device to the device where given model is.
         It basically changes training mode to eval during attack process.
         To change this, please see `set_model_training_mode`.
+
+    NORMALIZATION EXPECTATIONS:
+    - The attack methods assume inputs are in the range used by the models
+    - For our framework, this means normalized inputs from ImageNetDataset
+    - Our model wrappers have been updated to expect already normalized inputs
+    - No additional normalization is needed or applied by default
     """
 
     def __init__(self, name, model):
@@ -72,10 +84,10 @@ class Attack(object):
         )
 
         # Normalization settings for input preprocessing
+        # For our current framework, this should usually be None since
+        # inputs are already normalized and model wrappers expect normalized inputs
         self.normalization_used = None
         self._normalization_applied = None
-        if self.model.__class__.__name__ == "RobModel":
-            self._set_rmodel_normalization_used(model)
 
         # Model mode control during attack
         self._model_training = False
@@ -137,8 +149,7 @@ class Attack(object):
         # Track gradient call
         self.total_gradient_calls += inputs.size(0)
 
-        if self._normalization_applied is False:
-            inputs = self.normalize(inputs)
+        # Forward directly - normalization handled by model or dataset
         logits = self.model(inputs)
         return logits
 
@@ -286,7 +297,13 @@ class Attack(object):
 
     @wrapper_method
     def set_normalization_used(self, mean, std):
-        """Configure normalization parameters for input preprocessing."""
+        """
+        Configure normalization parameters for input preprocessing.
+
+        Note: For our current framework, this should not be needed since
+        inputs are already normalized from the dataset and models expect
+        normalized inputs directly.
+        """
         self.normalization_used = {}
         n_channels = len(mean)
         # Reshape mean and std for broadcasting across image dimensions
@@ -297,13 +314,23 @@ class Attack(object):
         self._set_normalization_applied(True)
 
     def normalize(self, inputs):
-        """Apply normalization to inputs using stored mean and std."""
+        """
+        Apply normalization to inputs using stored mean and std.
+
+        Note: For our current framework, this should rarely be needed since
+        inputs from the dataset are already normalized.
+        """
         mean = self.normalization_used["mean"].to(inputs.device)
         std = self.normalization_used["std"].to(inputs.device)
         return (inputs - mean) / std
 
     def inverse_normalize(self, inputs):
-        """Reverse normalization to get back to original input space."""
+        """
+        Reverse normalization to get back to original input space.
+
+        This is still needed when we want to visualize or save images
+        for humans to view.
+        """
         mean = self.normalization_used["mean"].to(inputs.device)
         std = self.normalization_used["std"].to(inputs.device)
         return inputs * std + mean
@@ -796,22 +823,22 @@ class Attack(object):
         return target_labels.long().to(self.device)
 
     def __call__(self, inputs, labels=None, *args, **kwargs):
-        """Main entry point for the attack. Handles model mode and normalization."""
+        """Main entry point for the attack. Handles model mode."""
         given_training = self.model.training
         self._change_model_mode(given_training)
 
-        if self._normalization_applied is True:
+        # Our models now expect normalized inputs directly
+        # Only apply normalization/inverse_normalization if explicitly set
+        if self._normalization_applied is True and self.normalization_used is not None:
             inputs = self.inverse_normalize(inputs)
             self._set_normalization_applied(False)
 
             adv_inputs = self.forward(inputs, labels, *args, **kwargs)
-            # adv_inputs = self.to_type(adv_inputs, self.return_type)
 
             adv_inputs = self.normalize(adv_inputs)
             self._set_normalization_applied(True)
         else:
             adv_inputs = self.forward(inputs, labels, *args, **kwargs)
-            # adv_inputs = self.to_type(adv_inputs, self.return_type)
 
         self._recover_model_mode(given_training)
 
