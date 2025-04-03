@@ -63,33 +63,72 @@ def plot_images(
         img = x.cpu().clone()
         img = img * std + mean
         img = torch.clamp(img, 0, 1)
-        return img.permute(1, 2, 0).numpy()
+        return img
+
+    # Get numpy versions for plotting
+    original_np = denormalize(original).permute(1, 2, 0).numpy()
+    adversarial_np = denormalize(adversarial).permute(1, 2, 0).numpy()
+
+    # Calculate perturbation for visualization
+    perturbation = adversarial - original
+
+    # Sign/direction view (shows how values change: increase=red, decrease=blue)
+    # Create a diverging colormap visualization
+    perturbation_sign = perturbation.cpu()
+    # Scale the perturbation for better visualization, with diverging colors
+    max_pert = (
+        perturbation_sign.abs().max().item()
+        if perturbation_sign.abs().max().item() > 0
+        else 1.0
+    )
+    perturbation_sign = perturbation_sign / (max_pert * 0.1)  # Normalize and enhance
+    perturbation_sign = torch.clamp(perturbation_sign, -1, 1)
+
+    # Convert to a diverging colormap (red-white-blue)
+    # Red for positive changes, blue for negative
+    pert_rgb = torch.zeros(
+        (3, perturbation_sign.shape[1], perturbation_sign.shape[2]),
+        device=perturbation_sign.device,
+    )
+    pert_rgb[0] = torch.clamp(
+        perturbation_sign.mean(dim=0) * 0.5 + 0.5, 0, 1
+    )  # Red channel
+    pert_rgb[2] = torch.clamp(
+        -perturbation_sign.mean(dim=0) * 0.5 + 0.5, 0, 1
+    )  # Blue channel
+    pert_rgb[1] = torch.clamp(
+        1.0 - perturbation_sign.mean(dim=0).abs() * 0.5, 0, 1
+    )  # Green channel
+
+    # Convert to numpy
+    diverging_pert = pert_rgb.permute(1, 2, 0).numpy()
 
     # Create the figure
     fig, ax = plt.subplots(1, 3, figsize=(15, 5))
 
     # Plot original image
-    ax[0].imshow(denormalize(original))
+    ax[0].imshow(original_np)
     ax[0].set_title(f"Original\nLabel: {original_label}")
     ax[0].axis("off")
 
-    # Plot adversarial image
-    ax[1].imshow(denormalize(adversarial))
-    ax[1].set_title(f"Adversarial\nPredicted: {adv_prediction}")
+    # Plot perturbation (sign)
+    ax[1].imshow(diverging_pert)
+    ax[1].set_title(f"Perturbation (Direction)\nRed=Increase, Blue=Decrease")
     ax[1].axis("off")
 
-    # Plot the difference (enhanced for visibility)
-    difference = (adversarial - original).abs().cpu()
-    difference = difference / difference.max()  # Normalize to [0, 1]
-    ax[2].imshow(difference.permute(1, 2, 0).numpy())
-    ax[2].set_title(f"Difference\n{attack_name}")
+    # Plot adversarial image
+    ax[2].imshow(adversarial_np)
+    ax[2].set_title(f"Adversarial\nPredicted: {adv_prediction}")
     ax[2].axis("off")
+
+    # Add attack information
+    plt.suptitle(f"Adversarial Example - {attack_name}", fontsize=16)
 
     plt.tight_layout()
 
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
     else:
         plt.show()
 
