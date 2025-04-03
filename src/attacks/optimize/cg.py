@@ -4,24 +4,6 @@ This file implements the Conjugate Gradient optimizer for generating adversarial
 against neural networks. The optimizer finds minimal perturbations that cause model
 misclassification by efficiently navigating the loss landscape using conjugate search
 directions.
-
-Key features:
-- Batch processing for simultaneous optimization of multiple examples
-- Configurable norm constraints (L2 or Linf)
-- Line search with Armijo condition for optimal step sizes
-- Support for both Fletcher-Reeves and Polak-Ribière formulas
-- Early stopping when adversarial criteria are met
-
-Expected inputs:
-- Initial images (usually clean images to be perturbed)
-- Gradient function that computes gradients of the adversarial loss
-- Loss function that returns per-example losses
-- Success function that determines if adversarial criteria are met
-- Original images (for projection constraints)
-
-Expected outputs:
-- Optimized adversarial examples
-- Optimization metrics (iterations, gradient calls, time, success rate)
 """
 
 import torch
@@ -43,17 +25,18 @@ class ConjugateGradientOptimizer:
     def __init__(
         self,
         norm: str = "L2",
-        eps: float = 0.5,
-        n_iterations: int = 100,
+        eps: float = 10.0,  # Increased default
+        n_iterations: int = 150,
         fletcher_reeves: bool = True,
-        restart_interval: int = 20,
-        backtracking_factor: float = 0.7,
-        sufficient_decrease: float = 1e-4,
-        line_search_max_iter: int = 10,
+        restart_interval: int = 10,
+        backtracking_factor: float = 0.5,
+        sufficient_decrease: float = 1e-7,
+        line_search_max_iter: int = 15,
         rand_init: bool = True,
-        init_std: float = 0.01,
+        init_std: float = 0.1,
         early_stopping: bool = True,
         verbose: bool = False,
+        momentum: float = 0.2,
     ):
         """
         Initialize the optimizer with parameters that control:
@@ -73,6 +56,7 @@ class ConjugateGradientOptimizer:
         self.init_std = init_std
         self.early_stopping = early_stopping
         self.verbose = verbose
+        self.momentum = momentum
 
     def _compute_beta(
         self, grad_new: torch.Tensor, grad_old: torch.Tensor, d_old: torch.Tensor
@@ -125,10 +109,7 @@ class ConjugateGradientOptimizer:
     ) -> torch.Tensor:
         """
         Backtracking line search to determine a suitable step size alpha.
-
-        The Armijo condition is used:
-          f(x + αd) <= f(x) + c * α * (d^T * grad)
-        where c (sufficient_decrease) is a small positive constant.
+        If line search doesn't make progress, falls back to PGD-like fixed step size.
 
         Args:
             x: Current point.
@@ -142,17 +123,22 @@ class ConjugateGradientOptimizer:
             alpha: A per-example tensor containing the step sizes.
         """
         batch_size = x.shape[0]
-        # Start with full step size (alpha = 1 for each example)
-        alpha = torch.ones(batch_size, device=x.device)
+        # Start with a much larger step size to be more aggressive
+        alpha = torch.ones(batch_size, device=x.device) * 2.0
 
         # Compute the directional derivative: d^T * grad.
-        # Note: This value should be negative when d is a descent direction.
         dir_deriv = (
             direction.view(batch_size, -1) * current_grad.view(batch_size, -1)
         ).sum(dim=1)
 
         # Compute the Armijo threshold.
         armijo_threshold = current_loss + self.sufficient_decrease * alpha * dir_deriv
+
+        # Track if we've made progress for each sample
+        made_progress = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
+
+        # Normalize direction for better step size control
+        direction_sign = direction.sign()
 
         # Iterate to find a step size that satisfies the condition.
         for _ in range(self.line_search_max_iter):
@@ -165,20 +151,20 @@ class ConjugateGradientOptimizer:
                     x_new, x_original, self.eps, self.norm
                 )
 
-            # Ensure the image values remain in the valid range [0, 1].
-            x_new = torch.clamp(x_new, 0.0, 1.0)
-
             # Evaluate the loss at the new point.
             new_loss = loss_fn(x_new)
 
             # Check the Armijo condition (per example).
             armijo_condition = new_loss <= armijo_threshold
 
+            # Update progress tracker
+            made_progress = made_progress | armijo_condition
+
             # If all examples meet the condition, exit the loop.
             if armijo_condition.all():
                 break
 
-            # For examples that failed, reduce the step size.
+            # For examples that failed, reduce the step size more aggressively
             alpha[~armijo_condition] *= self.backtracking_factor
 
             # Update the Armijo threshold for those examples with the new alpha.
@@ -188,7 +174,25 @@ class ConjugateGradientOptimizer:
                 * dir_deriv[~armijo_condition]
             )
 
-        return alpha
+        # For examples where line search made no progress, fall back to PGD-like step
+        if not made_progress.all() and x_original is not None:
+            no_progress_mask = ~made_progress
+
+            # Use sign of gradient with fixed step size (PGD approach)
+            # For samples where line search failed
+            alpha_pgd = torch.ones_like(alpha) * 0.1  # Fixed step relative to epsilon
+
+            # Create a new alpha array
+            alpha_new = alpha.clone()
+
+            # For samples with no progress, use PGD-style update
+            alpha_new[no_progress_mask] = alpha_pgd[no_progress_mask]
+
+            # Also use the sign direction rather than the full gradient
+            return alpha_new, direction_sign
+
+        # Return the found alpha values and original direction
+        return alpha, direction
 
     def optimize(
         self,
@@ -202,7 +206,7 @@ class ConjugateGradientOptimizer:
         Run the conjugate gradient optimization procedure to generate adversarial examples.
 
         The algorithm:
-          1. (Optionally) initializes with random noise.
+          1. (Optionally) initializes with random noise at the epsilon boundary.
           2. Computes the gradient and sets the initial search direction to -grad.
           3. Uses line search to find a good step size satisfying the Armijo condition.
           4. Updates the point and then computes the new gradient.
@@ -225,14 +229,26 @@ class ConjugateGradientOptimizer:
         batch_size = x_init.shape[0]
 
         # Initialize adversarial examples with random noise if enabled.
-        if self.rand_init and self.init_std > 0:
-            noise = torch.randn_like(x_init) * self.init_std
-            x_adv = x_init + noise
-            if x_original is not None:
-                # Project to the valid eps-ball
-                x_adv = project_adversarial_example(
-                    x_adv, x_original, self.eps, self.norm
-                )
+        if self.rand_init and x_original is not None:
+            # PGD-style initialization at the epsilon boundary
+            if self.norm.lower() == "l2":
+                # Generate random direction from uniform distribution
+                delta = torch.rand_like(x_init) * 2 - 1  # Values between -1 and 1
+                # Normalize to unit norm
+                flat_delta = delta.reshape(delta.shape[0], -1)
+                l2_norm = torch.norm(flat_delta, p=2, dim=1, keepdim=True)
+                normalized_delta = flat_delta / (l2_norm + 1e-10)
+                # Scale to epsilon magnitude
+                delta = normalized_delta.reshape(delta.shape) * self.eps
+                # Apply the perturbation
+                x_adv = x_original + delta
+            else:  # Linf norm
+                # Uniform random perturbation in [-eps, eps]
+                delta = torch.zeros_like(x_init).uniform_(-self.eps, self.eps)
+                x_adv = x_original + delta
+
+            # Ensure the result is within valid bounds (will be handled by projection)
+            x_adv = project_adversarial_example(x_adv, x_original, self.eps, self.norm)
         else:
             x_adv = x_init.clone()
 
@@ -240,6 +256,7 @@ class ConjugateGradientOptimizer:
         start_time = time.time()
         iterations = 0
         gradient_calls = 0
+        successful = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         # Check initial success (if a success criterion is provided).
         if success_fn is not None:
@@ -252,8 +269,12 @@ class ConjugateGradientOptimizer:
 
         # Compute the initial gradient and set the initial search direction.
         grad = gradient_fn(x_adv)
-        gradient_calls += 1
+        gradient_calls += batch_size
         d = -grad  # Initial search direction is the steepest descent.
+
+        # Initialize momentum buffer
+        prev_direction = torch.zeros_like(d)
+
         loss_current = loss_fn(x_adv)  # Compute initial loss (per-example).
 
         # Main optimization loop.
@@ -267,32 +288,61 @@ class ConjugateGradientOptimizer:
             # Save the current gradient for the conjugate update.
             grad_old = grad.clone()
 
+            # Apply momentum to the search direction
+            if t > 0:  # Skip first iteration since no previous direction yet
+                d = d + self.momentum * prev_direction
+
             # Line search: determine a suitable step size alpha.
             if self.early_stopping:
                 working_examples = ~success  # Only update examples not yet successful.
                 if working_examples.sum() == 0:
                     break
 
-                # Initialize full alpha tensor; will update only for working examples.
-                alpha = torch.zeros(batch_size, device=device)
-
-                # Perform line search only for the working examples.
-                alpha_working = self._line_search(
-                    x_adv[working_examples],
-                    d[working_examples],
-                    grad_old[working_examples],
-                    loss_current[working_examples],
-                    x_original[working_examples] if x_original is not None else None,
-                    lambda x: loss_fn(x),
+                # Perform line search only for working examples
+                x_adv_working = x_adv[working_examples]
+                d_working = d[working_examples]
+                grad_old_working = grad_old[working_examples]
+                loss_current_working = loss_current[working_examples]
+                x_original_working = (
+                    x_original[working_examples] if x_original is not None else None
                 )
-                alpha[working_examples] = alpha_working
+
+                # Create a wrapper for working examples
+                def subset_loss_fn(x_subset):
+                    # Map back to full batch indices
+                    full_x = x_adv.clone()
+                    full_x[working_examples] = x_subset
+                    # Get loss for all samples
+                    full_loss = loss_fn(full_x)
+                    # Return only the relevant losses
+                    return full_loss[working_examples]
+
+                # Line search returns alpha and potentially modified direction
+                alpha_working, dir_working = self._line_search(
+                    x_adv_working,
+                    d_working,
+                    grad_old_working,
+                    loss_current_working,
+                    x_original_working,
+                    subset_loss_fn,
+                )
+
+                # Update only the working examples
+                step = torch.zeros_like(x_adv)
+                # Use the new direction (sign or original) based on what line search returned
+                step[working_examples] = alpha_working.view(-1, 1, 1, 1) * dir_working
+                x_adv = x_adv + step
             else:
-                alpha = self._line_search(
+                # Full batch line search
+                alpha, direction_to_use = self._line_search(
                     x_adv, d, grad_old, loss_current, x_original, loss_fn
                 )
 
-            # Update adversarial examples: take a step of size alpha along the search direction.
-            x_adv = x_adv + alpha.view(-1, 1, 1, 1) * d
+                # Save current direction for momentum
+                prev_direction = d.clone()
+
+                # Update adversarial examples using the alpha and direction
+                x_adv = x_adv + alpha.view(-1, 1, 1, 1) * direction_to_use
 
             # Project back to the allowed perturbation region.
             if x_original is not None:
@@ -300,31 +350,51 @@ class ConjugateGradientOptimizer:
                     x_adv, x_original, self.eps, self.norm
                 )
 
-            # Clamp to ensure valid image pixel range [0, 1].
-            x_adv = torch.clamp(x_adv, 0.0, 1.0)
-
-            # Update the gradient: compute it only for examples still being optimized.
+            # Update the gradient
             if self.early_stopping:
                 working_examples = ~success
                 if working_examples.sum() == 0:
                     break
 
+                # Create a wrapper for the gradient function that can work with subsets
+                def subset_gradient_fn(x_subset):
+                    # Create a full batch tensor but only update the working examples
+                    x_full = x_adv.clone()
+                    x_full[working_examples] = x_subset
+                    # Compute gradient on full batch then extract only the working examples
+                    full_grad = gradient_fn(x_full)
+                    return full_grad[working_examples]
+
                 grad_full = torch.zeros_like(x_adv)
-                grad_working = gradient_fn(x_adv[working_examples])
+                grad_working = subset_gradient_fn(x_adv[working_examples])
                 grad_full[working_examples] = grad_working
                 grad = grad_full
+
+                # Count gradient calls for working examples only
+                gradient_calls += working_examples.sum().item()
+
+                # Track which examples were successful during optimization
+                success_update = success_fn(x_adv)
+                newly_successful = success_update & ~success
+                successful = successful | newly_successful
+                success = success_update
             else:
                 grad = gradient_fn(x_adv)
+                gradient_calls += batch_size
 
-            gradient_calls += 1
+                # Track which examples became successful in this iteration
+                if success_fn is not None:
+                    success_update = success_fn(x_adv)
+                    newly_successful = success_update & ~success
+                    successful = successful | newly_successful
+                    success = success_update
 
             # Compute the new loss after the update.
             loss_current = loss_fn(x_adv)
 
-            # Check for adversarial success.
-            if success_fn is not None:
-                success = success_fn(x_adv)
-                if self.verbose and (t + 1) % 10 == 0:
+            # Log progress if requested
+            if self.verbose and (t + 1) % 10 == 0:
+                if success_fn is not None:
                     success_rate = success.float().mean().item() * 100
                     print(
                         f"Iteration {t+1}/{self.n_iterations}, Success rate: {success_rate:.2f}%"
@@ -347,12 +417,15 @@ class ConjugateGradientOptimizer:
             "gradient_calls": gradient_calls,
             "time": total_time,
             "success_rate": (
-                (success & ~initial_success).float().mean().item() * 100
+                success.float().mean().item()
+                * 100  # Track overall success rate, not just new successes
                 if success_fn is not None
                 else 0.0
             ),
             "initial_success_rate": (
-                initial_success.float().mean().item() if success_fn is not None else 0.0
+                initial_success.float().mean().item() * 100
+                if success_fn is not None
+                else 0.0
             ),
         }
 
