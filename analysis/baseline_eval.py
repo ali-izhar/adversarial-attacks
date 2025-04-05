@@ -119,6 +119,16 @@ class AttackEvaluator:
             # Process each batch
             total_samples = 0
             successful_examples = []
+            total_attacked = 0
+            total_success = 0
+
+            # Initialize aggregate metrics
+            total_l2 = 0.0
+            total_linf = 0.0
+            total_ssim = 0.0
+            total_time = 0.0
+            total_iterations = 0.0
+            total_grad_calls = 0.0
 
             # Use CUDA profiler to optimize performance
             with torch.autograd.profiler.emit_nvtx():
@@ -157,6 +167,7 @@ class AttackEvaluator:
                             continue
 
                     # Attack only the correctly classified samples
+                    total_attacked += len(correct_inputs)
                     attack_start = time.time()
 
                     # Use CUDA events for more accurate timing
@@ -170,6 +181,9 @@ class AttackEvaluator:
                     # Synchronize CUDA to wait for attack to complete
                     torch.cuda.synchronize()
                     attack_time_ms = start_event.elapsed_time(end_event)
+                    total_time += (
+                        attack_time_ms / 1000.0 * len(correct_inputs)
+                    )  # convert to seconds per sample
 
                     # Explicitly evaluate attack success and update metrics
                     batch_success_rate, success_mask, (orig_preds, adv_preds) = (
@@ -178,10 +192,29 @@ class AttackEvaluator:
                         )
                     )
 
+                    batch_success_count = success_mask.sum().item()
+                    total_success += batch_success_count
+
                     # Explicitly compute perturbation metrics
                     perturbation_metrics = attack.compute_perturbation_metrics(
                         correct_inputs, adversarial
                     )
+
+                    # Update aggregate metrics
+                    if batch_success_count > 0:
+                        total_l2 += (
+                            perturbation_metrics["l2_norm"] * batch_success_count
+                        )
+                        total_linf += (
+                            perturbation_metrics["linf_norm"] * batch_success_count
+                        )
+                        total_ssim += perturbation_metrics["ssim"] * batch_success_count
+
+                    # Get iteration and gradient call counts from attack
+                    if hasattr(attack, "iterations"):
+                        total_iterations += attack.iterations * len(correct_inputs)
+                    if hasattr(attack, "gradient_calls"):
+                        total_grad_calls += attack.gradient_calls * len(correct_inputs)
 
                     # Display batch results
                     print(
@@ -211,35 +244,105 @@ class AttackEvaluator:
                             if len(successful_examples) >= 3:  # Limit to 3 examples
                                 break
 
-            # Get metrics from the attack
+            # Calculate final metrics
+            # Use attack's metrics if available, otherwise use our own calculations
             attack_metrics = attack.get_metrics()
-            self.results[attack_name][attack_type][model_name] = attack_metrics
+
+            # If no successful attacks, set metrics to reasonable defaults
+            if total_attacked == 0:
+                print("  Warning: No samples were attacked!")
+                success_rate = 0.0
+                l2_norm = 0.0
+                linf_norm = 0.0
+                ssim = 0.0
+                time_per_sample = 0.0
+                iterations = 0.0
+                gradient_calls = 0.0
+            else:
+                # Calculate success rate as percentage
+                success_rate = (total_success / total_attacked) * 100.0
+
+                # Average perturbation metrics across successful examples only
+                if total_success > 0:
+                    l2_norm = total_l2 / total_success
+                    linf_norm = total_linf / total_success
+                    ssim = total_ssim / total_success
+                else:
+                    l2_norm = 0.0
+                    linf_norm = 0.0
+                    ssim = 0.0
+
+                # Calculate per-sample time and complexity metrics
+                time_per_sample = total_time / total_attacked
+                iterations = total_iterations / total_attacked
+                gradient_calls = total_grad_calls / total_attacked
+
+            # Replace attack metrics with our calculations
+            final_metrics = {
+                "success_rate": success_rate,
+                "l2_norm": l2_norm,
+                "linf_norm": linf_norm,
+                "ssim": ssim,
+                "time_per_sample": time_per_sample,
+                "iterations": iterations,
+                "gradient_calls": gradient_calls,
+                "total_samples": total_attacked,
+                "successful_samples": total_success,
+            }
+
+            # Store the metrics and examples
+            self.results[attack_name][attack_type][model_name] = final_metrics
+            self.results[attack_name][attack_type][model_name][
+                "examples"
+            ] = successful_examples
 
             # Print summary metrics
             print(
                 f"\nSummary metrics for {attack_name} ({attack_type}) on {model_name}:"
             )
-            print(f"  Success Rate: {attack_metrics['success_rate']:.2f}%")
-            print(f"  L2 Norm: {attack_metrics['l2_norm']:.4f}")
-            print(f"  L∞ Norm: {attack_metrics['linf_norm']:.4f}")
-            print(f"  SSIM: {attack_metrics['ssim']:.4f}")
-            print(f"  Time per sample: {attack_metrics['time_per_sample']*1000:.2f} ms")
-            print(f"  Average iterations: {attack_metrics['iterations']:.2f}")
-            print(f"  Average gradient calls: {attack_metrics['gradient_calls']:.2f}")
-
-            # Store successful examples for later visualization
-            self.results[attack_name][attack_type][model_name][
-                "examples"
-            ] = successful_examples
+            print(f"  Success Rate: {final_metrics['success_rate']:.2f}%")
+            print(f"  L2 Norm: {final_metrics['l2_norm']:.4f}")
+            print(f"  L∞ Norm: {final_metrics['linf_norm']:.4f}")
+            print(f"  SSIM: {final_metrics['ssim']:.4f}")
+            print(f"  Time per sample: {final_metrics['time_per_sample']*1000:.2f} ms")
+            print(f"  Average iterations: {final_metrics['iterations']:.2f}")
+            print(f"  Average gradient calls: {final_metrics['gradient_calls']:.2f}")
 
             # Explicitly free memory after each model evaluation
             torch.cuda.empty_cache()
+
+        # Debug: print the results structure
+        print(f"\nResults for {attack_name}:")
+        for attack_type in self.results[attack_name]:
+            print(f"  {attack_type}:")
+            for model_name in self.results[attack_name][attack_type]:
+                metrics = self.results[attack_name][attack_type][model_name]
+                if isinstance(metrics, dict):
+                    print(
+                        f"    {model_name}: Success Rate={metrics.get('success_rate', 'N/A')}%"
+                    )
+                else:
+                    print(f"    {model_name}: {metrics}")
 
         return self.results[attack_name]
 
     def export_results_to_tables(self, output_dir):
         """Export results in a format suitable for the paper tables."""
         os.makedirs(output_dir, exist_ok=True)
+
+        if not self.results:
+            print("Warning: No results to export!")
+            # Create empty placeholder files
+            pd.DataFrame().to_csv(
+                os.path.join(output_dir, "table2_attack_effectiveness.csv")
+            )
+            pd.DataFrame().to_csv(
+                os.path.join(output_dir, "table3_perturbation_efficiency.csv")
+            )
+            pd.DataFrame().to_csv(
+                os.path.join(output_dir, "table4_computational_efficiency.csv")
+            )
+            return
 
         # Table 2: Attack Effectiveness (Success Rates)
         effectiveness_data = []
@@ -261,7 +364,15 @@ class AttackEvaluator:
                         model_results = self.results[attack_name]["untargeted"][
                             model_name
                         ]
-                        row[f"{model_name}"] = f"{model_results['success_rate']:.1f}"
+                        if (
+                            isinstance(model_results, dict)
+                            and "success_rate" in model_results
+                        ):
+                            row[f"{model_name}"] = (
+                                f"{model_results['success_rate']:.1f}"
+                            )
+                        else:
+                            row[f"{model_name}"] = "N/A"
                     else:
                         row[f"{model_name}"] = "N/A"
             else:
@@ -288,7 +399,13 @@ class AttackEvaluator:
             for model_name in self.models:
                 if model_name in self.results[attack_name]["targeted"]:
                     model_results = self.results[attack_name]["targeted"][model_name]
-                    row[f"{model_name}"] = f"{model_results['success_rate']:.1f}"
+                    if (
+                        isinstance(model_results, dict)
+                        and "success_rate" in model_results
+                    ):
+                        row[f"{model_name}"] = f"{model_results['success_rate']:.1f}"
+                    else:
+                        row[f"{model_name}"] = "N/A"
                 else:
                     row[f"{model_name}"] = "N/A"
 
@@ -296,9 +413,19 @@ class AttackEvaluator:
 
         # Convert to DataFrame and save
         effectiveness_df = pd.DataFrame(effectiveness_data)
-        effectiveness_df.to_csv(
-            os.path.join(output_dir, "table2_attack_effectiveness.csv"), index=False
-        )
+        if not effectiveness_df.empty:
+            effectiveness_df.to_csv(
+                os.path.join(output_dir, "table2_attack_effectiveness.csv"), index=False
+            )
+            print(f"Saved effectiveness table with {len(effectiveness_df)} rows")
+        else:
+            print("Warning: Effectiveness table is empty!")
+            # Create empty placeholder file
+            pd.DataFrame(
+                columns=["Category", "Method"] + list(self.models.keys())
+            ).to_csv(
+                os.path.join(output_dir, "table2_attack_effectiveness.csv"), index=False
+            )
 
         if targeted_data:
             targeted_df = pd.DataFrame(targeted_data)
@@ -306,6 +433,9 @@ class AttackEvaluator:
                 os.path.join(output_dir, "table2b_targeted_effectiveness.csv"),
                 index=False,
             )
+            print(f"Saved targeted effectiveness table with {len(targeted_df)} rows")
+        else:
+            print("No targeted attack data to save")
 
         # Table 3: Perturbation Efficiency
         perturbation_data = []
@@ -332,9 +462,13 @@ class AttackEvaluator:
                             model_results = self.results[attack_name][attack_type][
                                 model_name
                             ]
-                            l2_values.append(model_results["l2_norm"])
-                            linf_values.append(model_results["linf_norm"])
-                            ssim_values.append(model_results["ssim"])
+                            if isinstance(model_results, dict):
+                                if "l2_norm" in model_results:
+                                    l2_values.append(model_results["l2_norm"])
+                                if "linf_norm" in model_results:
+                                    linf_values.append(model_results["linf_norm"])
+                                if "ssim" in model_results:
+                                    ssim_values.append(model_results["ssim"])
 
                     # Calculate averages
                     if l2_values:
@@ -354,9 +488,19 @@ class AttackEvaluator:
 
         # Convert to DataFrame and save
         perturbation_df = pd.DataFrame(perturbation_data)
-        perturbation_df.to_csv(
-            os.path.join(output_dir, "table3_perturbation_efficiency.csv"), index=False
-        )
+        if not perturbation_df.empty:
+            perturbation_df.to_csv(
+                os.path.join(output_dir, "table3_perturbation_efficiency.csv"),
+                index=False,
+            )
+            print(f"Saved perturbation table with {len(perturbation_df)} rows")
+        else:
+            print("Warning: Perturbation table is empty!")
+            # Create empty placeholder file
+            pd.DataFrame(columns=["Category", "Method"]).to_csv(
+                os.path.join(output_dir, "table3_perturbation_efficiency.csv"),
+                index=False,
+            )
 
         # Table 4: Computational Efficiency
         computational_data = []
@@ -375,9 +519,13 @@ class AttackEvaluator:
                         model_results = self.results[attack_name]["untargeted"][
                             model_name
                         ]
-                        iterations.append(model_results["iterations"])
-                        gradient_calls.append(model_results["gradient_calls"])
-                        runtime.append(model_results["time_per_sample"])
+                        if isinstance(model_results, dict):
+                            if "iterations" in model_results:
+                                iterations.append(model_results["iterations"])
+                            if "gradient_calls" in model_results:
+                                gradient_calls.append(model_results["gradient_calls"])
+                            if "time_per_sample" in model_results:
+                                runtime.append(model_results["time_per_sample"])
 
                 if iterations:
                     row["Iterations (Untargeted)"] = f"{np.mean(iterations):.1f}"
@@ -405,9 +553,13 @@ class AttackEvaluator:
                         model_results = self.results[attack_name]["targeted"][
                             model_name
                         ]
-                        iterations.append(model_results["iterations"])
-                        gradient_calls.append(model_results["gradient_calls"])
-                        runtime.append(model_results["time_per_sample"])
+                        if isinstance(model_results, dict):
+                            if "iterations" in model_results:
+                                iterations.append(model_results["iterations"])
+                            if "gradient_calls" in model_results:
+                                gradient_calls.append(model_results["gradient_calls"])
+                            if "time_per_sample" in model_results:
+                                runtime.append(model_results["time_per_sample"])
 
                 if iterations:
                     row["Iterations (Targeted)"] = f"{np.mean(iterations):.1f}"
@@ -426,9 +578,19 @@ class AttackEvaluator:
 
         # Convert to DataFrame and save
         computational_df = pd.DataFrame(computational_data)
-        computational_df.to_csv(
-            os.path.join(output_dir, "table4_computational_efficiency.csv"), index=False
-        )
+        if not computational_df.empty:
+            computational_df.to_csv(
+                os.path.join(output_dir, "table4_computational_efficiency.csv"),
+                index=False,
+            )
+            print(f"Saved computational table with {len(computational_df)} rows")
+        else:
+            print("Warning: Computational table is empty!")
+            # Create empty placeholder file
+            pd.DataFrame(columns=["Attack Method"]).to_csv(
+                os.path.join(output_dir, "table4_computational_efficiency.csv"),
+                index=False,
+            )
 
         print(f"Results exported to {output_dir}")
 

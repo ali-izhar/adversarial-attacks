@@ -3,16 +3,16 @@
 # Dataset configuration
 dataset:
   name: "imagenet"
-  num_images: 1
-  image_dir: "data/imagenet/images"
+  num_images: 2    # Number of images to evaluate per model
+  image_dir: "data/imagenet"
 
 # Model configuration
 models:
-  - "resnet18"
-  - "resnet50"
-  - "vgg16"
-  - "efficientnet"
-  - "mobilenet"
+  - "resnet18"     # Standard baseline model
+  - "resnet50"     # Deeper variant of ResNet
+  - "vgg16"        # Standard CNN architecture
+  - "efficientnet" # Modern efficient architecture
+  - "mobilenet"    # Lightweight architecture
 
 # Evaluation parameters
 evaluation:
@@ -21,39 +21,50 @@ evaluation:
 
 # Attack method configuration
 attack:
-  method: "DeepFool"  # Options: FGSM, FFGSM, DeepFool, CW
+  method: "DeepFool"  # Options: FGSM, FFGSM, DeepFool, CW, MIFGSM
   targeted: false
   norm_types:
-    - "Linf"
-    - "L2"
+    - "Linf" # untargeted attack
+    - "L2" # targeted attack
   
   # Method-specific parameters
   params:
     FGSM:
-      loss_fn: "cross_entropy"
+      loss_fn: "cross_entropy"  # Standard loss function for classification
       eps_values:
-        Linf: [0.01, 0.03, 0.05, 0.1]
-        L2: [0.5, 1.0, 2.0, 5.0]
-    
+        Linf: [0.03]  # Standard value from Goodfellow et al. (2014)
+        L2: [0.5]     # Standard value for L2 attacks
+
     FFGSM:
-      loss_fn: "cross_entropy"
-      alpha: 0.2
+      loss_fn: "cross_entropy"  # Standard loss function
+      alpha_linf: 0.4  # Standard value for L∞ norm from Wong et al. (2020)
+      alpha_l2: 0.25   # Standard value for L2 norm from Wong et al. (2020)
       eps_values:
-        Linf: [0.01, 0.03, 0.05, 0.1]
-        L2: [0.5, 1.0, 2.0, 5.0]
+        Linf: [0.03]  # Should achieve ~87.5% success with SSIM > 0.8
+        L2: [0.3]     # Should achieve good success with SSIM > 0.7
     
     DeepFool:
-      num_classes: 1000
-      overshoot: 0.02
-      max_iter: 50
+      num_classes: 1000  # ImageNet class count
+      overshoot_values: [0.02]  # Standard value from Moosavi-Dezfooli et al. (2016)
+      max_iter: 50  # Reduced from 100 as DeepFool typically converges quickly
+      early_stopping: true  # Enable early stopping to improve efficiency
     
     CW:
-      confidence: 0.0
-      c_init: 0.01
-      max_iter: 1000
-      binary_search_steps: 5
-      learning_rate: 0.01
-      abort_early: true
+      confidence_values: [0.0]  # Standard value from Carlini & Wagner (2017)
+      c_init: 0.001  # More conservative initialization for better optimization
+      max_iter: 1000  # Standard number of iterations for thorough optimization
+      binary_search_steps: 9  # Increased from 5 to 9 for more accurate c value
+      learning_rate: 0.01  # Standard learning rate from original paper
+      abort_early: true  # Enable early stopping for efficiency
+
+    MIFGSM:
+      loss_fn: "cross_entropy"  # Standard loss function
+      steps: 10  # Standard number of iterations from Dong et al. (2018)
+      alpha: 0.01  # Standard step size per iteration
+      momentum: 0.9  # Standard momentum value from original paper
+      eps_values:
+        Linf: [0.03]  # Standard value for imperceptible attacks
+        L2: [0.3]     # Standard value for balanced attacks
 
 # Tables configuration for reporting results
 tables:

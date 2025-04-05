@@ -34,6 +34,7 @@ from src.attacks.baseline.attack_fgsm import FGSM
 from src.attacks.baseline.attack_ffgsm import FFGSM
 from src.attacks.baseline.attack_deepfool import DeepFool
 from src.attacks.baseline.attack_cw import CW
+from src.attacks.baseline.attack_mifgsm import MIFGSM
 
 # Import evaluation framework
 from analysis.baseline_eval import AttackEvaluator
@@ -165,9 +166,17 @@ def prepare_dataset(data_dir, num_samples=200, gpu_info=None):
     """Load ImageNet dataset using our custom implementation."""
     print(f"Loading dataset from {data_dir}, samples={num_samples}")
 
+    # If data_dir includes 'imagenet', extract the base directory
+    base_dir = data_dir
+    if "imagenet" in data_dir.lower():
+        # Find the part of the path before 'imagenet'
+        base_dir = data_dir.split("imagenet")[0].rstrip("/\\")
+        if not base_dir:  # If empty, use the current directory
+            base_dir = "."
+
     dataset = get_dataset(
         dataset_name="imagenet",
-        data_dir=data_dir,
+        data_dir=base_dir,
         max_samples=num_samples,
     )
 
@@ -181,7 +190,6 @@ def test_model_accuracy(models, dataset, device, batch_size=32):
         batch_size=min(len(dataset), batch_size),
         shuffle=False,
         num_workers=min(8, os.cpu_count() or 4),
-        pin_memory=True,
     )
 
     images, labels = next(iter(dataloader))
@@ -211,7 +219,11 @@ def create_attack_config(config, args, gpu_info=None):
     # Parse attack configurations from config file
     attack_configs = []
 
-    method = config["attack"]["method"]
+    # Use command line specified attack type if provided, else use config
+    method = args.attack_names[0] if args.attack_names else config["attack"]["method"]
+
+    print(f"Creating attack configurations for method: {method}")
+
     params = config["attack"]["params"]
 
     # Adjust parameters based on GPU capabilities
@@ -219,91 +231,118 @@ def create_attack_config(config, args, gpu_info=None):
         # For high-end GPUs, we can use more steps for optimization-based attacks
         params["DeepFool"]["max_iter"] = min(100, params["DeepFool"]["max_iter"])
         params["CW"]["max_iter"] = min(1000, params["CW"]["max_iter"])
+        if "MIFGSM" in params:
+            params["MIFGSM"]["steps"] = min(20, params["MIFGSM"].get("steps", 10))
 
-    if method == "all":
-        # Add all attack methods
-        for norm_type in config["attack"]["norm_types"]:
-            # FGSM with different epsilon values
-            for eps in params["FGSM"]["eps_values"][norm_type]:
-                attack_name = f"FGSM-{eps}-{norm_type}"
-                attack_fn = lambda model, eps=eps: FGSM(model, eps=eps)
-                attack_configs.append((attack_name, attack_fn))
+    # Create attack configs based on method (case-insensitive)
+    method = method.upper()
 
-            # FFGSM with different epsilon values
-            for eps in params["FFGSM"]["eps_values"][norm_type]:
-                alpha = params["FFGSM"]["alpha"] * eps  # Scale alpha proportionally
-                attack_name = f"FFGSM-{eps}-{norm_type}"
-                attack_fn = lambda model, eps=eps, alpha=alpha: FFGSM(
-                    model, eps=eps, alpha=alpha
-                )
-                attack_configs.append((attack_name, attack_fn))
-
-        # DeepFool
-        attack_name = "DeepFool"
-        overshoot = params["DeepFool"]["overshoot"]
-        steps = params["DeepFool"]["max_iter"]
-        attack_fn = lambda model: DeepFool(model, steps=steps, overshoot=overshoot)
-        attack_configs.append((attack_name, attack_fn))
-
-        # CW with different confidence values
-        for conf in [0.0, 5.0]:
-            attack_name = f"CW-kappa{conf}"
-            c = params["CW"]["c_init"]
-            steps = params["CW"]["max_iter"]
-            lr = params["CW"]["learning_rate"]
-            attack_fn = lambda model, conf=conf: CW(
-                model, c=c, kappa=conf, steps=steps, lr=lr
-            )
-            attack_configs.append((attack_name, attack_fn))
-
-    elif method == "FGSM":
-        # Only FGSM attacks
+    if method in ["ALL", "FGSM"]:
+        # Add FGSM attacks
         for norm_type in config["attack"]["norm_types"]:
             for eps in params["FGSM"]["eps_values"][norm_type]:
                 attack_name = f"FGSM-{eps}-{norm_type}"
                 attack_fn = lambda model, eps=eps: FGSM(model, eps=eps)
                 attack_configs.append((attack_name, attack_fn))
 
-    elif method == "FFGSM":
-        # Only FFGSM attacks
+    if method in ["ALL", "FFGSM"]:
+        # Add FFGSM attacks
         for norm_type in config["attack"]["norm_types"]:
+            # Use separate alpha for L2 and Linf norms
+            alpha_param = params["FFGSM"].get(
+                f"alpha_{norm_type.lower()}", params["FFGSM"].get("alpha_linf", 0.2)
+            )
+
             for eps in params["FFGSM"]["eps_values"][norm_type]:
-                alpha = params["FFGSM"]["alpha"] * eps  # Scale alpha proportionally
+                alpha = alpha_param * eps  # Scale alpha proportionally
                 attack_name = f"FFGSM-{eps}-{norm_type}"
                 attack_fn = lambda model, eps=eps, alpha=alpha: FFGSM(
                     model, eps=eps, alpha=alpha
                 )
                 attack_configs.append((attack_name, attack_fn))
 
-    elif method == "DeepFool":
-        # Only DeepFool attack
-        attack_name = "DeepFool"
-        overshoot = params["DeepFool"]["overshoot"]
-        steps = params["DeepFool"]["max_iter"]
-        attack_fn = lambda model: DeepFool(model, steps=steps, overshoot=overshoot)
-        attack_configs.append((attack_name, attack_fn))
+    if method in ["ALL", "DEEPFOOL"]:
+        # Add DeepFool attack with multiple overshoot values
+        overshoot_values = params["DeepFool"].get("overshoot_values", [0.02])
+        if isinstance(overshoot_values, (int, float)):
+            overshoot_values = [overshoot_values]
 
-    elif method == "CW":
-        # Only CW attacks
-        for conf in [0.0, 5.0]:
-            attack_name = f"CW-kappa{conf}"
-            c = params["CW"]["c_init"]
-            steps = params["CW"]["max_iter"]
-            lr = params["CW"]["learning_rate"]
-            attack_fn = lambda model, conf=conf: CW(
-                model, c=c, kappa=conf, steps=steps, lr=lr
+        steps = params["DeepFool"]["max_iter"]
+        early_stopping = params["DeepFool"].get("early_stopping", True)
+
+        for overshoot in overshoot_values:
+            attack_name = f"DeepFool-over{overshoot}"
+            attack_fn = lambda model, overshoot=overshoot: DeepFool(
+                model, steps=steps, overshoot=overshoot, early_stopping=early_stopping
             )
             attack_configs.append((attack_name, attack_fn))
 
-    # Add custom attacks if needed
-    if args.attack_names:
-        # Filter attacks by name if requested
+    if method in ["ALL", "CW"]:
+        # Add CW attacks with multiple confidence values
+        confidence_values = params["CW"].get("confidence_values", [0.0])
+        if isinstance(confidence_values, (int, float)):
+            confidence_values = [confidence_values]
+
+        c = params["CW"]["c_init"]
+        steps = params["CW"]["max_iter"]
+        lr = params["CW"]["learning_rate"]
+        binary_search_steps = params["CW"].get("binary_search_steps", 5)
+
+        for conf in confidence_values:
+            attack_name = f"CW-kappa{conf}"
+            attack_fn = lambda model, conf=conf, bss=binary_search_steps: CW(
+                model, c=c, kappa=conf, steps=steps, lr=lr, binary_search_steps=bss
+            )
+            attack_configs.append((attack_name, attack_fn))
+
+    if method in ["ALL", "MIFGSM"] and "MIFGSM" in params:
+        # Add MIFGSM (Momentum Iterative FGSM) attacks
+        try:
+            steps = params["MIFGSM"]["steps"]
+            momentum = params["MIFGSM"].get("momentum", 0.9)
+            step_size = params["MIFGSM"].get("alpha", 0.01)
+
+            for norm_type in config["attack"]["norm_types"]:
+                for eps in params["MIFGSM"]["eps_values"][norm_type]:
+                    attack_name = f"MIFGSM-{eps}-{norm_type}"
+                    attack_fn = lambda model, eps=eps: MIFGSM(
+                        model,
+                        eps=eps,
+                        steps=steps,
+                        alpha=step_size,
+                        decay_factor=momentum,
+                    )
+                    attack_configs.append((attack_name, attack_fn))
+        except ImportError:
+            print("MIFGSM attack is configured but not implemented yet. Skipping.")
+
+    # Filter based on command line if provided
+    if args.attack_names and len(attack_configs) > 0:
         filtered_configs = []
         for attack_name, attack_fn in attack_configs:
-            base_name = attack_name.split("-")[0]
-            if base_name in args.attack_names:
+            # Extract the base attack name (case-insensitive matching)
+            base_name = attack_name.split("-")[0].upper()
+            if any(
+                base_name == requested_name.upper()
+                for requested_name in args.attack_names
+            ):
                 filtered_configs.append((attack_name, attack_fn))
-        attack_configs = filtered_configs
+
+        if filtered_configs:
+            attack_configs = filtered_configs
+        else:
+            print(
+                f"Warning: No configurations matched the requested attack names: {args.attack_names}"
+            )
+
+    print(f"Created {len(attack_configs)} attack configurations")
+    # Print the attack names that were created
+    if attack_configs:
+        print("Attack configurations:")
+        for attack_name, _ in attack_configs:
+            print(f"  - {attack_name}")
+    else:
+        print("WARNING: No attack configurations were created! Check your attack name.")
 
     return attack_configs
 
@@ -329,6 +368,7 @@ def evaluate_model(
 
         # Move model to the correct device
         model = model.to(device)
+        model.eval()  # Ensure model is in evaluation mode
 
         # Enable cuDNN benchmarking for optimal performance
         torch.backends.cudnn.benchmark = True
@@ -353,6 +393,9 @@ def evaluate_model(
 
         # Evaluate each attack in both untargeted and targeted modes
         results = {}
+        attack_count = 0
+
+        print(f"Starting evaluation of {len(attack_configs)} attack configurations")
         for attack_name, attack_fn in attack_configs:
             # Skip if this specific attack is excluded
             if args.exclude_attacks and any(
@@ -361,6 +404,7 @@ def evaluate_model(
                 print(f"Skipping {attack_name} (excluded by command line argument)")
                 continue
 
+            attack_count += 1
             attack_results = {}
 
             # Use mixed precision for compatible attacks if supported
@@ -380,6 +424,10 @@ def evaluate_model(
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            # Move model back to device in case it was moved
+            model = model.to(device)
+            model.eval()
 
             with (
                 torch.cuda.amp.autocast(enabled=use_amp) if use_amp else torch.no_grad()
@@ -402,6 +450,10 @@ def evaluate_model(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
+                # Move model back to device in case it was moved
+                model = model.to(device)
+                model.eval()
+
                 with (
                     torch.cuda.amp.autocast(enabled=use_amp)
                     if use_amp
@@ -416,9 +468,18 @@ def evaluate_model(
 
             results[attack_name] = attack_results
 
-        # Export results for this model
+        # Export results for this model - only if we have results
         model_output_dir = os.path.join(args.output_dir, model_name)
         os.makedirs(model_output_dir, exist_ok=True)
+
+        print(f"\nExporting results for {model_name}, processed {attack_count} attacks")
+        if attack_count > 0:
+            print(f"Results structure has {len(results)} attack entries")
+            for attack_name in results:
+                print(f"  {attack_name}: {list(results[attack_name].keys())}")
+        else:
+            print("Warning: No attacks were evaluated, results will be empty")
+
         evaluator.export_results_to_tables(model_output_dir)
 
         # Visualize some example perturbations if results contain examples
@@ -512,13 +573,12 @@ def main(args):
     dataset = prepare_dataset(data_dir, num_samples, gpu_info)
 
     # Test model accuracy to verify everything is working
-    batch_size = gpu_info["batch_size"] if gpu_info else 32
-    print("\nTesting model accuracy on dataset...")
-    model_accuracy = test_model_accuracy(models_dict, dataset, device, batch_size)
+    # batch_size = gpu_info["batch_size"] if gpu_info else 32
+    # print("\nTesting model accuracy on dataset...")
+    # model_accuracy = test_model_accuracy(models_dict, dataset, device, batch_size)
 
     # Create attack configurations from config file
     attack_configs = create_attack_config(config, args, gpu_info)
-    print(f"Created {len(attack_configs)} attack configurations")
 
     # Evaluate attacks on models (in parallel if multiple GPUs available)
     if gpu_info["parallel_mode"] == "process" and len(models_dict) > 1:
@@ -656,7 +716,7 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=None,
-        choices=["FGSM", "FFGSM", "DeepFool", "CW"],
+        choices=["FGSM", "FFGSM", "DeepFool", "CW", "MIFGSM"],
         help="Specify specific attacks to evaluate (default: use attacks from config)",
     )
     parser.add_argument(

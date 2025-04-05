@@ -4,5 +4,6 @@ from .attack_cw import CW
 from .attack_deepfool import DeepFool
 from .attack_ffgsm import FFGSM
 from .attack_fgsm import FGSM
+from .attack_mifgsm import MIFGSM
 
-__all__ = ["CW", "DeepFool", "FFGSM", "FGSM"]
+__all__ = ["CW", "DeepFool", "FFGSM", "FGSM", "MIFGSM"]
