@@ -43,7 +43,7 @@ class MIFGSM(Attack):
         targeted=False,
         norm_type="Linf",
     ):
-        super().__init__(model)
+        super().__init__("MIFGSM", model)
         self.eps = eps
         self.steps = steps
         self.alpha = alpha
