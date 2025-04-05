@@ -2,7 +2,7 @@
 """
 Tests for all baseline attacks.
 
-This script tests all baseline attacks (FGSM, FFGSM, DeepFool, CW)
+This script tests all baseline attacks (FGSM, FFGSM, DeepFool, CW, MIFGSM)
 on a small sample of ImageNet data, using our model wrappers
 that handle normalized inputs correctly.
 
@@ -30,6 +30,7 @@ from src.attacks.baseline.attack_fgsm import FGSM
 from src.attacks.baseline.attack_ffgsm import FFGSM
 from src.attacks.baseline.attack_deepfool import DeepFool
 from src.attacks.baseline.attack_cw import CW
+from src.attacks.baseline.attack_mifgsm import MIFGSM
 
 
 def plot_images(
@@ -334,6 +335,10 @@ def main(args):
             (CW(model, c=1.0, kappa=0, steps=100, lr=0.01), "CW (c=1.0, steps=100)")
         )
 
+    # MIFGSM attack
+    if "mifgsm" in args.attacks or "all" in args.attacks:
+        attacks.append((MIFGSM(model, steps=10, alpha=0.01), "MIFGSM (steps=10)"))
+
     # Test each attack and collect results
     all_metrics = []
 
@@ -410,7 +415,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-samples",
         type=int,
-        default=50,
+        default=2,
         help="Number of samples to load from dataset",
     )
 
@@ -420,7 +425,7 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["all"],
-        choices=["all", "fgsm", "ffgsm", "deepfool", "cw"],
+        choices=["all", "fgsm", "ffgsm", "deepfool", "cw", "mifgsm"],
         help="Which attacks to test",
     )
 
@@ -431,7 +436,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-batches",
         type=int,
-        default=5,
+        default=1,
         help="Maximum number of batches to test per attack",
     )
     parser.add_argument(

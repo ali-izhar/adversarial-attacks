@@ -175,7 +175,14 @@ class AttackEvaluator:
                     end_event = torch.cuda.Event(enable_timing=True)
 
                     start_event.record()
-                    adversarial = attack(correct_inputs, correct_labels)
+                    # Check if this is a gradient-based attack that needs gradients
+                    if attack_name.startswith(("DeepFool", "CW")):
+                        # For DeepFool and CW, run without no_grad context
+                        adversarial = attack(correct_inputs, correct_labels)
+                    else:
+                        # For other attacks like FGSM, FFGSM, etc., use no_grad for efficiency
+                        with torch.no_grad():
+                            adversarial = attack(correct_inputs, correct_labels)
                     end_event.record()
 
                     # Synchronize CUDA to wait for attack to complete

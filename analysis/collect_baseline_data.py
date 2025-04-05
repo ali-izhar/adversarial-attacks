@@ -19,6 +19,7 @@ import time
 import yaml
 import gc
 from functools import partial
+from contextlib import nullcontext  # Add nullcontext for context management
 
 # Add project root to path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -272,7 +273,8 @@ def create_attack_config(config, args, gpu_info=None):
 
         for overshoot in overshoot_values:
             attack_name = f"DeepFool-over{overshoot}"
-            attack_fn = lambda model, overshoot=overshoot: DeepFool(
+            # Use the exact parameter names from the DeepFool constructor
+            attack_fn = lambda model, overshoot=overshoot, steps=steps, early_stopping=early_stopping: DeepFool(
                 model, steps=steps, overshoot=overshoot, early_stopping=early_stopping
             )
             attack_configs.append((attack_name, attack_fn))
@@ -415,6 +417,9 @@ def evaluate_model(
                 and not attack_name.startswith(("DeepFool", "CW"))
             )
 
+            # Check if this is a gradient-based attack that needs gradients
+            needs_grads = attack_name.startswith(("DeepFool", "CW"))
+
             # Evaluate untargeted attack first
             print(f"\n{'='*50}")
             print(f"Evaluating {attack_name} (untargeted)...")
@@ -429,8 +434,11 @@ def evaluate_model(
             model = model.to(device)
             model.eval()
 
+            # Use appropriate context based on attack type
             with (
-                torch.cuda.amp.autocast(enabled=use_amp) if use_amp else torch.no_grad()
+                torch.cuda.amp.autocast(enabled=use_amp)
+                if use_amp
+                else (nullcontext() if needs_grads else torch.no_grad())
             ):
                 attack_results["untargeted"] = evaluator.evaluate_attack(
                     attack_name, attack_fn, targeted=False
@@ -454,10 +462,11 @@ def evaluate_model(
                 model = model.to(device)
                 model.eval()
 
+                # Use appropriate context based on attack type
                 with (
                     torch.cuda.amp.autocast(enabled=use_amp)
                     if use_amp
-                    else torch.no_grad()
+                    else (nullcontext() if needs_grads else torch.no_grad())
                 ):
                     attack_results["targeted"] = evaluator.evaluate_attack(
                         attack_name, attack_fn, targeted=True

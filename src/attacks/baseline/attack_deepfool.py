@@ -33,17 +33,21 @@ class DeepFool(Attack):
         bounded to valid normalized image values.
     """
 
-    def __init__(self, model, steps=50, overshoot=0.02):
+    def __init__(self, model, steps=50, overshoot=0.02, early_stopping=True):
         """Initialize DeepFool attack.
 
         Args:
             model: Target model to attack
             steps: Maximum number of iterations for finding adversarial examples
             overshoot: Parameter to enhance the noise (default: 0.02)
+            early_stopping: Whether to stop early when all samples are fooled (default: True)
         """
         super().__init__("DeepFool", model)
         self.steps = steps  # Maximum number of iterations
         self.overshoot = overshoot  # Parameter to enhance the noise
+        self.early_stopping = (
+            early_stopping  # Whether to stop early when all samples are fooled
+        )
         # DeepFool only supports untargeted attacks
         self.supported_mode = ["default"]
 
@@ -117,8 +121,8 @@ class DeepFool(Attack):
                 target_labels[newly_fooled] = curr_preds[newly_fooled]
                 active_samples = torch.logical_not(newly_fooled) & active_samples
 
-                # Exit early if all samples are fooled
-                if not active_samples.any():
+                # Exit early if all samples are fooled and early_stopping is enabled
+                if self.early_stopping and not active_samples.any():
                     break
 
             # For active samples, compute gradients for all classes in parallel
