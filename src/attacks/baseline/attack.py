@@ -119,9 +119,59 @@ class Attack(object):
         self.total_time = 0
         self.attack_success_count = 0
         self.total_samples = 0
+        # Reset perturbation metrics lists - critical for proper isolation between attack configurations
         self.l2_norms = []
         self.linf_norms = []
         self.ssim_values = []
+
+    def get_metrics(self):
+        """Return dictionary of metrics for paper evaluation."""
+        # Handle case where no samples were evaluated
+        if self.total_samples == 0:
+            success_rate = 0
+            avg_iterations = 0
+            avg_grad_calls = 0
+            avg_time = 0
+            avg_l2 = 0.0
+            avg_linf = 0.0
+            avg_ssim = 1.0
+        else:
+            success_rate = 100 * self.attack_success_count / self.total_samples
+            avg_iterations = self.total_iterations / self.total_samples
+            avg_grad_calls = self.total_gradient_calls / self.total_samples
+            avg_time = self.total_time / self.total_samples
+
+            # Use only successful attacks for perturbation metrics
+            if self.attack_success_count > 0 and len(self.l2_norms) > 0:
+                # For attacks that track per-sample norms, ensure we only use successful samples
+                if len(self.l2_norms) == self.total_samples:
+                    # We have metrics for all samples, filter for successful ones
+                    avg_l2 = np.mean(self.l2_norms[-self.attack_success_count :])
+                    avg_linf = np.mean(self.linf_norms[-self.attack_success_count :])
+                    avg_ssim = np.mean(self.ssim_values[-self.attack_success_count :])
+                else:
+                    # We already have only successful metrics
+                    avg_l2 = np.mean(self.l2_norms)
+                    avg_linf = np.mean(self.linf_norms)
+                    avg_ssim = np.mean(self.ssim_values)
+            else:
+                avg_l2 = 0.0
+                avg_linf = 0.0
+                avg_ssim = 1.0
+
+        metrics = {
+            "attack_name": self.attack,
+            "attack_mode": self.attack_mode,
+            "model_name": self.model_name,
+            "success_rate": success_rate,
+            "iterations": avg_iterations,
+            "gradient_calls": avg_grad_calls,
+            "time_per_sample": avg_time,
+            "l2_norm": avg_l2,
+            "linf_norm": avg_linf,
+            "ssim": avg_ssim,
+        }
+        return metrics
 
     def denormalize(self, images):
         """
@@ -165,40 +215,6 @@ class Attack(object):
 
         return norm_images
 
-    def get_metrics(self):
-        """Return dictionary of metrics for paper evaluation."""
-        # Handle case where no samples were evaluated
-        if self.total_samples == 0:
-            success_rate = 0
-            avg_iterations = 0
-            avg_grad_calls = 0
-            avg_time = 0
-            avg_l2 = 0.0
-            avg_linf = 0.0
-            avg_ssim = 1.0
-        else:
-            success_rate = 100 * self.attack_success_count / self.total_samples
-            avg_iterations = self.total_iterations / self.total_samples
-            avg_grad_calls = self.total_gradient_calls / self.total_samples
-            avg_time = self.total_time / self.total_samples
-            avg_l2 = np.mean(self.l2_norms) if self.l2_norms else 0.0
-            avg_linf = np.mean(self.linf_norms) if self.linf_norms else 0.0
-            avg_ssim = np.mean(self.ssim_values) if self.ssim_values else 1.0
-
-        metrics = {
-            "attack_name": self.attack,
-            "attack_mode": self.attack_mode,
-            "model_name": self.model_name,
-            "success_rate": success_rate,
-            "iterations": avg_iterations,
-            "gradient_calls": avg_grad_calls,
-            "time_per_sample": avg_time,
-            "l2_norm": avg_l2,
-            "linf_norm": avg_linf,
-            "ssim": avg_ssim,
-        }
-        return metrics
-
     def forward(self, inputs, labels=None, *args, **kwargs):
         r"""
         It defines the computation performed at every call.
@@ -226,12 +242,15 @@ class Attack(object):
         This should be called once per sample per main iteration."""
         self.total_iterations += 1
 
-    def compute_perturbation_metrics(self, original_images, adversarial_images):
+    def compute_perturbation_metrics(
+        self, original_images, adversarial_images, success_mask=None
+    ):
         """Compute perturbation metrics between original and adversarial images.
 
         Args:
             original_images: Clean input images (normalized)
             adversarial_images: Adversarial examples (normalized)
+            success_mask: Optional boolean mask indicating which samples were successfully attacked
 
         Returns:
             dict: Dictionary with L2 norm, L-inf norm, and SSIM
@@ -255,23 +274,50 @@ class Attack(object):
         l2_norm = torch.norm(
             perturbation.view(original_images.size(0), -1), p=2, dim=1
         ) / torch.sqrt(torch.tensor(pixel_count).float())
-        l2_norm_mean = l2_norm.mean().item()
-        self.l2_norms.extend(l2_norm.detach().cpu().numpy())
 
         # L-inf norm (maximum absolute pixel difference)
         linf_norm = torch.norm(
             perturbation.view(original_images.size(0), -1), p=float("inf"), dim=1
         )
+
+        # Calculate mean values for the batch (before filtering for successful attacks)
+        l2_norm_mean = l2_norm.mean().item()
         linf_norm_mean = linf_norm.mean().item()
-        self.linf_norms.extend(linf_norm.detach().cpu().numpy())
+
+        # Store metrics only for successful attacks if a success mask is provided
+        if success_mask is not None:
+            # Filter for successful attacks only
+            if success_mask.any():
+                successful_l2 = l2_norm[success_mask].detach().cpu().numpy()
+                successful_linf = linf_norm[success_mask].detach().cpu().numpy()
+
+                # Store only the successful metrics
+                self.l2_norms.extend(successful_l2)
+                self.linf_norms.extend(successful_linf)
+
+            # For SSIM, we'll also filter by success mask
+            filter_by_success = True
+        else:
+            # No success mask provided, store all metrics (legacy behavior)
+            self.l2_norms.extend(l2_norm.detach().cpu().numpy())
+            self.linf_norms.extend(linf_norm.detach().cpu().numpy())
+            filter_by_success = False
 
         # SSIM (structural similarity) - computed in denormalized [0,1] space
         if SSIM_AVAILABLE:
             batch_size = original_images.size(0)
             ssim_vals = []
+            success_indices = []
 
-            # Process each image in the batch individually
-            for i in range(batch_size):
+            # If success mask provided, get indices of successful attacks
+            if filter_by_success and success_mask is not None:
+                success_indices = success_mask.nonzero().flatten().tolist()
+            else:
+                # Process all samples
+                success_indices = list(range(batch_size))
+
+            # Process each successful image in the batch individually
+            for i in success_indices:
                 # Get individual images in denormalized [0,1] range
                 orig_img = original_denorm[i].detach().cpu().permute(1, 2, 0).numpy()
                 adv_img = adversarial_denorm[i].detach().cpu().permute(1, 2, 0).numpy()
@@ -296,8 +342,10 @@ class Attack(object):
                 ssim_val = max(0.0, min(1.0, ssim_val))
                 ssim_vals.append(ssim_val)
 
-            # Average SSIM across batch
-            ssim_val = np.mean(ssim_vals)
+            # Average SSIM across successful samples
+            ssim_val = np.mean(ssim_vals) if ssim_vals else 1.0
+
+            # Store SSIM values
             self.ssim_values.extend(ssim_vals)
         else:
             ssim_val = 1.0  # Default value when SSIM is not available

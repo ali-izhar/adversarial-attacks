@@ -54,6 +54,8 @@ class PGDOptimizer:
         early_stopping: bool = True,
         verbose: bool = False,
         maximize: bool = True,  # Default to maximization for adversarial attacks
+        normalize_grad: bool = True,  # Whether to normalize gradient for better convergence
+        debug: bool = False,  # Enable debugging output
     ):
         """
         Initialize the PGD optimizer with parameters controlling:
@@ -72,6 +74,17 @@ class PGDOptimizer:
         self.early_stopping = early_stopping
         self.verbose = verbose
         self.maximize = maximize  # For adversarial attacks, typically True
+        self.normalize_grad = (
+            normalize_grad  # Normalize gradient for better step control
+        )
+        self.debug = debug
+
+        # Ensure step size is not larger than epsilon for Linf attacks
+        if self.norm.lower() == "linf" and self.alpha_init > self.eps:
+            print(
+                f"WARNING: step size ({self.alpha_init}) is larger than epsilon ({self.eps}); reducing to epsilon/10"
+            )
+            self.alpha_init = self.eps / 10.0
 
     def _get_step_size(self, t: int) -> float:
         """
@@ -136,7 +149,7 @@ class PGDOptimizer:
             if x_original is not None:
                 # Project the initial noisy example back into the allowed eps-ball.
                 x_adv = project_adversarial_example(
-                    x_adv, x_original, self.eps, self.norm
+                    x_adv, x_original, self.eps, self.norm, debug=self.debug
                 )
         else:
             # Use a copy of the original inputs if no random initialization.
@@ -184,6 +197,12 @@ class PGDOptimizer:
                     # Calculate gradient only for working examples
                     grad_working = gradient_fn(x_working)
 
+                    # Normalize gradient if required for L2 attack
+                    if self.normalize_grad and self.norm.lower() == "l2":
+                        grad_flat = grad_working.view(grad_working.size(0), -1)
+                        grad_norm = torch.norm(grad_flat, p=2, dim=1).view(-1, 1, 1, 1)
+                        grad_working = grad_working / (grad_norm + 1e-12)
+
                     # Count only the gradient computations for working examples
                     gradient_calls += working_examples.sum().item()
 
@@ -195,15 +214,34 @@ class PGDOptimizer:
                 else:
                     # If all examples are being processed, compute gradient for all
                     grad = gradient_fn(x_adv)
+
+                    # Normalize gradient if required for L2 attack
+                    if self.normalize_grad and self.norm.lower() == "l2":
+                        grad_flat = grad.view(grad.size(0), -1)
+                        grad_norm = torch.norm(grad_flat, p=2, dim=1).view(-1, 1, 1, 1)
+                        grad = grad / (grad_norm + 1e-12)
+
                     # Count gradient calls for all examples in the batch
                     gradient_calls += batch_size
             else:
                 grad = gradient_fn(x_adv)
+
+                # Normalize gradient if required for L2 attack
+                if self.normalize_grad and self.norm.lower() == "l2":
+                    grad_flat = grad.view(grad.size(0), -1)
+                    grad_norm = torch.norm(grad_flat, p=2, dim=1).view(-1, 1, 1, 1)
+                    grad = grad / (grad_norm + 1e-12)
+
                 # Count gradient calls for all examples in the batch
                 gradient_calls += batch_size
 
             # Step 3: Determine the step size for the current iteration.
             alpha = self._get_step_size(t)
+
+            # For Linf attack, use sign gradient and ensure step size <= epsilon
+            if self.norm.lower() == "linf":
+                grad = torch.sign(grad)
+                alpha = min(alpha, self.eps)
 
             # PGD update: take a step in the gradient direction or opposite direction
             # Maximize: move in gradient direction (increase loss)
@@ -216,7 +254,7 @@ class PGDOptimizer:
             # Step 4: Project the updated example back onto the eps-ball (and ensure valid pixel range).
             if x_original is not None:
                 x_adv = project_adversarial_example(
-                    x_adv, x_original, self.eps, self.norm
+                    x_adv, x_original, self.eps, self.norm, debug=self.debug
                 )
             x_adv = torch.clamp(x_adv, 0.0, 1.0)
 
@@ -241,6 +279,7 @@ class PGDOptimizer:
             "iterations": iterations,
             "gradient_calls": gradient_calls,
             "time": total_time,
+            "time_per_sample": total_time / batch_size,
             "success_rate": (
                 (success & ~initial_success).float().mean().item() * 100
                 if success_fn is not None

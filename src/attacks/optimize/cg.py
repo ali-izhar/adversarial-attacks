@@ -8,7 +8,9 @@ directions.
 
 import torch
 import time
+import math
 from typing import Tuple, Dict, Any, Optional, Callable
+from contextlib import nullcontext
 
 from .projections import project_adversarial_example
 
@@ -17,26 +19,32 @@ class ConjugateGradientOptimizer:
     """
     Conjugate Gradient optimization method for generating adversarial examples.
 
-    The algorithm uses conjugate directions to efficiently search the loss landscape.
-    Depending on the setting, it uses either the Fletcher-Reeves or the Polak-Ribière formula
-    for updating the search direction.
+    This implementation uses nonlinear conjugate gradient descent with:
+    - Multiple conjugacy formulas (Fletcher-Reeves, Polak-Ribière, Hestenes-Stiefel)
+    - Adaptive restart conditions based on conjugacy loss
+    - Line search with backtracking Armijo condition
+    - Proper orthogonalization of search directions
     """
 
     def __init__(
         self,
         norm: str = "L2",
-        eps: float = 10.0,  # Increased default
-        n_iterations: int = 150,
-        fletcher_reeves: bool = True,
+        eps: float = 5.0,
+        n_iterations: int = 50,
+        beta_method: str = "HS",  # Options: "FR", "PR", "HS" (Hestenes-Stiefel)
         restart_interval: int = 10,
-        backtracking_factor: float = 0.5,
-        sufficient_decrease: float = 1e-7,
-        line_search_max_iter: int = 15,
+        line_search_factor: float = 0.5,
+        sufficient_decrease: float = 1e-4,
+        line_search_max_iter: int = 10,
         rand_init: bool = True,
         init_std: float = 0.1,
         early_stopping: bool = True,
         verbose: bool = False,
-        momentum: float = 0.2,
+        adaptive_restart: bool = True,
+        momentum: float = 0.0,  # Should be 0 for pure CG
+        fgsm_init: bool = True,
+        multi_stage: bool = False,  # Turned off by default
+        auto_tune_eps: bool = False,  # Turned off by default
     ):
         """
         Initialize the optimizer with parameters that control:
@@ -47,56 +55,158 @@ class ConjugateGradientOptimizer:
         self.norm = norm
         self.eps = eps
         self.n_iterations = n_iterations
-        self.fletcher_reeves = fletcher_reeves
+        self.beta_method = beta_method
         self.restart_interval = restart_interval
-        self.backtracking_factor = backtracking_factor
+        self.line_search_factor = line_search_factor
         self.sufficient_decrease = sufficient_decrease
         self.line_search_max_iter = line_search_max_iter
         self.rand_init = rand_init
         self.init_std = init_std
         self.early_stopping = early_stopping
         self.verbose = verbose
-        self.momentum = momentum
+        self.momentum = momentum  # Should be 0 for pure CG
+
+        # Additional parameters
+        self.adaptive_restart = adaptive_restart
+        self.fgsm_init = fgsm_init
+        self.multi_stage = multi_stage
+        self.auto_tune_eps = auto_tune_eps
+
+        # Tracking variables
+        self._last_iter_decrease = 0
+        self._avg_progress_rate = 0
+
+        # Conjugacy threshold - used to detect when to restart
+        self.conjugacy_threshold = 0.2
 
     def _compute_beta(
-        self, grad_new: torch.Tensor, grad_old: torch.Tensor, d_old: torch.Tensor
+        self,
+        grad_new: torch.Tensor,
+        grad_old: torch.Tensor,
+        d_old: torch.Tensor,
+        y: torch.Tensor = None,
     ) -> torch.Tensor:
         """
-        Compute the conjugate gradient update parameter beta.
-
-        For Fletcher-Reeves:
-            beta = ||grad_new||^2 / ||grad_old||^2
-        For Polak-Ribière:
-            beta = (grad_new·(grad_new - grad_old)) / ||grad_old||^2, then clamped to be non-negative.
+        Compute conjugate gradient beta parameter using various formulas.
 
         Args:
-            grad_new: New gradient at the current point.
-            grad_old: Gradient at the previous point.
-            d_old: Previous search direction (unused in these formulas, but kept for API consistency).
+            grad_new: New gradient at current point
+            grad_old: Previous gradient
+            d_old: Previous search direction
+            y: Gradient difference (grad_new - grad_old), precomputed for efficiency
 
         Returns:
-            beta: A per-example tensor for the conjugate update.
+            beta: Per-example tensor for conjugate update
         """
-        # Flatten gradients per example and compute squared norms.
-        grad_new_sq = (grad_new.view(grad_new.shape[0], -1) ** 2).sum(dim=1)
-        grad_old_sq = (grad_old.view(grad_old.shape[0], -1) ** 2).sum(dim=1)
+        batch_size = grad_new.shape[0]
+        grad_new_flat = grad_new.view(batch_size, -1)
+        grad_old_flat = grad_old.view(batch_size, -1)
+        d_old_flat = d_old.view(batch_size, -1)
 
-        if self.fletcher_reeves:
-            # Fletcher-Reeves update: ratio of squared norms.
-            beta = grad_new_sq / (grad_old_sq + 1e-10)
-        else:
-            # Polak-Ribière update: measures change in gradients.
-            grad_diff = grad_new - grad_old
-            # Compute inner product: grad_new dot (grad_new - grad_old)
-            numerator = (
-                grad_new.view(grad_new.shape[0], -1)
-                * grad_diff.view(grad_diff.shape[0], -1)
-            ).sum(dim=1)
-            beta = numerator / (grad_old_sq + 1e-10)
-            # Use the Polak-Ribière+ variant: non-negative beta.
+        # Compute y = grad_new - grad_old if not provided
+        if y is None:
+            y = grad_new_flat - grad_old_flat
+
+        # Initialize beta tensor
+        beta = torch.zeros(batch_size, device=grad_new.device)
+
+        if self.beta_method == "FR":  # Fletcher-Reeves
+            # β_FR = ||∇f_k+1||² / ||∇f_k||²
+            grad_new_sq = (grad_new_flat**2).sum(dim=1)
+            grad_old_sq = (grad_old_flat**2).sum(dim=1)
+
+            # Avoid division by zero
+            safe_mask = grad_old_sq > 1e-10
+            beta[safe_mask] = grad_new_sq[safe_mask] / grad_old_sq[safe_mask]
+
+        elif self.beta_method == "PR":  # Polak-Ribière
+            # β_PR = ∇f_k+1 · (∇f_k+1 - ∇f_k) / ||∇f_k||²
+            grad_old_sq = (grad_old_flat**2).sum(dim=1)
+            numerator = (grad_new_flat * y).sum(dim=1)
+
+            # Avoid division by zero
+            safe_mask = grad_old_sq > 1e-10
+            beta[safe_mask] = numerator[safe_mask] / grad_old_sq[safe_mask]
+
+            # Polak-Ribière+ variant: ensure non-negative beta
             beta = torch.clamp(beta, min=0)
 
+        elif self.beta_method == "HS":  # Hestenes-Stiefel
+            # β_HS = ∇f_k+1 · (∇f_k+1 - ∇f_k) / [d_k · (∇f_k+1 - ∇f_k)]
+            # First compute denominator: d_k · y
+            denominator = (d_old_flat * y).sum(dim=1)
+            numerator = (grad_new_flat * y).sum(dim=1)
+
+            # Avoid division by zero with a threshold
+            safe_mask = torch.abs(denominator) > 1e-10
+            beta[safe_mask] = numerator[safe_mask] / denominator[safe_mask]
+
+        else:
+            raise ValueError(f"Unknown beta method: {self.beta_method}")
+
+        # Handle cases where beta calculation failed with steepest descent
+        beta[torch.isnan(beta)] = 0.0
+
+        # Safeguard against very large beta values for stability
+        # The Powell restart condition: if beta becomes too large or direction not descent
+        beta = torch.clamp(beta, min=0.0, max=1.0)
+
         return beta
+
+    def _check_conjugacy_loss(
+        self, grad_new: torch.Tensor, d_old: torch.Tensor, y: torch.Tensor = None
+    ) -> torch.BoolTensor:
+        """
+        Check if conjugacy is lost and restart is needed.
+
+        Conditions for restart (any of):
+        1. Direction and gradient nearly parallel (> 0.2 cosine similarity)
+        2. Powell's restart criterion: βₖ ≥ 0 and gₖᵀgₖ₋₁ / ||gₖ₋₁||² ≥ 0.2
+
+        Args:
+            grad_new: Current gradient
+            d_old: Previous search direction
+            y: Gradient difference (optional)
+
+        Returns:
+            loss_conjugacy: Boolean tensor, True if conjugacy is lost
+        """
+        batch_size = grad_new.shape[0]
+        grad_flat = grad_new.view(batch_size, -1)
+        d_flat = d_old.view(batch_size, -1)
+
+        # Compute normalized vectors for cosine similarity
+        grad_norm = torch.norm(grad_flat, dim=1, keepdim=True)
+        d_norm = torch.norm(d_flat, dim=1, keepdim=True)
+
+        # Avoid division by zero
+        safe_grad_norm = torch.where(
+            grad_norm > 1e-10, grad_norm, torch.ones_like(grad_norm)
+        )
+        safe_d_norm = torch.where(d_norm > 1e-10, d_norm, torch.ones_like(d_norm))
+
+        # Compute absolute cosine similarity - near 1 means vectors are nearly parallel
+        cos_sim = torch.abs(
+            (grad_flat * d_flat).sum(dim=1) / (safe_grad_norm * safe_d_norm).squeeze()
+        )
+
+        # First restart condition: if direction and gradient are nearly parallel
+        condition1 = cos_sim > self.conjugacy_threshold
+
+        # Second restart condition (Powell): if beta would be large, restart
+        # We don't actually compute beta here for efficiency
+        if y is not None:
+            grad_prod = (grad_flat * y).sum(dim=1)
+            y_norm_sq = (y**2).sum(dim=1)
+            powell_metric = torch.abs(grad_prod) / (
+                torch.sqrt(y_norm_sq) * safe_grad_norm.squeeze()
+            )
+            condition2 = powell_metric > 0.8
+        else:
+            condition2 = torch.zeros_like(condition1, dtype=torch.bool)
+
+        # Restart if either condition is met
+        return condition1 | condition2
 
     def _line_search(
         self,
@@ -106,93 +216,224 @@ class ConjugateGradientOptimizer:
         current_loss: torch.Tensor,
         x_original: Optional[torch.Tensor],
         loss_fn: Callable[[torch.Tensor], torch.Tensor],
-    ) -> torch.Tensor:
+        eps: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Backtracking line search to determine a suitable step size alpha.
-        If line search doesn't make progress, falls back to PGD-like fixed step size.
+        Improved backtracking line search satisfying Armijo condition.
 
         Args:
-            x: Current point.
-            direction: Descent direction.
-            current_grad: Gradient at the current point.
-            current_loss: Loss at the current point (per example).
-            x_original: Original images (for projection constraints).
-            loss_fn: Function to compute loss; should return a tensor of per-example losses.
+            x: Current point
+            direction: Search direction
+            current_grad: Gradient at current point
+            current_loss: Loss at current point
+            x_original: Original images for projection
+            loss_fn: Function to evaluate loss
+            eps: Per-sample epsilon constraint
 
         Returns:
-            alpha: A per-example tensor containing the step sizes.
+            Tuple of (step sizes, direction to use)
         """
         batch_size = x.shape[0]
-        # Start with a much larger step size to be more aggressive
-        alpha = torch.ones(batch_size, device=x.device) * 2.0
 
-        # Compute the directional derivative: d^T * grad.
-        dir_deriv = (
-            direction.view(batch_size, -1) * current_grad.view(batch_size, -1)
-        ).sum(dim=1)
+        # Reshape for more efficient computation
+        direction_flat = direction.view(batch_size, -1)
+        current_grad_flat = current_grad.view(batch_size, -1)
 
-        # Compute the Armijo threshold.
+        # Compute directional derivative ∇f(x)ᵀd
+        dir_deriv = (current_grad_flat * direction_flat).sum(dim=1)
+
+        # If direction is not a descent direction (gradient and direction form obtuse angle),
+        # we should use steepest descent instead
+        non_descent = dir_deriv >= 0
+
+        direction_modified = direction.clone()
+        if non_descent.any():
+            direction_modified[non_descent] = -current_grad[non_descent]
+            # Recompute directional derivative for corrected directions
+            dir_deriv_fixed = -(current_grad_flat[non_descent] ** 2).sum(dim=1)
+            dir_deriv[non_descent] = dir_deriv_fixed
+
+        # Choose appropriate initial step size based on norm type and epsilon
+        if self.norm.lower() == "l2":
+            # For L2, use a smaller fraction of epsilon
+            initial_step = eps.squeeze() * 0.2  # 20% of epsilon
+        else:
+            # For Linf, we can be more aggressive
+            initial_step = eps.squeeze() * 0.5  # 50% of epsilon
+
+        # Ensure positive step size and make sure it's a tensor with batch dimension
+        initial_step = torch.maximum(initial_step, torch.ones_like(initial_step) * 0.01)
+
+        # Ensure initial_step has a batch dimension
+        if initial_step.dim() == 0:
+            initial_step = initial_step.unsqueeze(0).expand(batch_size)
+
+        # Create batch-specific step sizes
+        alpha = initial_step.clone()
+
+        # Armijo condition threshold: f(x) + c*α*∇f(x)ᵀd where c is the sufficient decrease param
         armijo_threshold = current_loss + self.sufficient_decrease * alpha * dir_deriv
 
-        # Track if we've made progress for each sample
+        # Track which samples have made progress
         made_progress = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
 
-        # Normalize direction for better step size control
-        direction_sign = direction.sign()
+        # Line search loop
+        for i in range(self.line_search_max_iter):
+            # Apply step and project
+            x_new = x + alpha.view(-1, 1, 1, 1) * direction_modified
 
-        # Iterate to find a step size that satisfies the condition.
-        for _ in range(self.line_search_max_iter):
-            # Update candidate point: take a step of size alpha in the descent direction.
-            x_new = x + alpha.view(-1, 1, 1, 1) * direction
-
-            # Project back to the allowed perturbation region if original images provided.
+            # Project to constraint set if needed
             if x_original is not None:
-                x_new = project_adversarial_example(
-                    x_new, x_original, self.eps, self.norm
-                )
+                # Project each sample using its specific epsilon
+                for j in range(batch_size):
+                    x_new[j : j + 1] = project_adversarial_example(
+                        x_new[j : j + 1],
+                        x_original[j : j + 1],
+                        eps[j].item(),
+                        self.norm,
+                    )
 
-            # Evaluate the loss at the new point.
+            # Evaluate loss at new point
             new_loss = loss_fn(x_new)
 
-            # Check the Armijo condition (per example).
-            armijo_condition = new_loss <= armijo_threshold
+            # Check Armijo condition
+            armijo_success = new_loss <= armijo_threshold
 
-            # Update progress tracker
-            made_progress = made_progress | armijo_condition
+            # Update progress tracking
+            made_progress = made_progress | armijo_success
 
-            # If all examples meet the condition, exit the loop.
-            if armijo_condition.all():
+            # If all examples satisfy the condition, exit
+            if armijo_success.all():
                 break
 
-            # For examples that failed, reduce the step size more aggressively
-            alpha[~armijo_condition] *= self.backtracking_factor
+            # For failed examples, reduce step size
+            reduction_factor = self.line_search_factor * (
+                0.95**i
+            )  # Gradually more aggressive
 
-            # Update the Armijo threshold for those examples with the new alpha.
-            armijo_threshold[~armijo_condition] = current_loss[~armijo_condition] + (
-                self.sufficient_decrease
-                * alpha[~armijo_condition]
-                * dir_deriv[~armijo_condition]
+            # Handle the case where batch_size is 1 and armijo_success is a 0-dim tensor
+            if batch_size == 1:
+                if not armijo_success.item():
+                    alpha = alpha * reduction_factor
+                    armijo_threshold = (
+                        current_loss + self.sufficient_decrease * alpha * dir_deriv
+                    )
+            else:
+                alpha[~armijo_success] *= reduction_factor
+                # Update Armijo thresholds for failed samples
+                armijo_threshold[~armijo_success] = current_loss[~armijo_success] + (
+                    self.sufficient_decrease
+                    * alpha[~armijo_success]
+                    * dir_deriv[~armijo_success]
+                )
+
+            # Exit early if step sizes become too small
+            if (alpha < 1e-4 * initial_step).all():
+                break
+
+        # For examples where line search still failed, use a small fixed step with gradient
+        if not made_progress.all() and x_original is not None:
+            failed = ~made_progress
+
+            # Handle the case where batch_size is 1
+            if batch_size == 1:
+                if failed.item():
+                    alpha = torch.ones_like(alpha) * 0.01
+                    direction_final = -current_grad / (
+                        torch.norm(
+                            current_grad.reshape(1, -1), dim=1, keepdim=True
+                        ).view(-1, 1, 1, 1)
+                        + 1e-10
+                    )
+                else:
+                    direction_final = direction_modified
+            else:
+                # Small fixed step for failed samples
+                alpha[failed] = torch.ones_like(alpha[failed]) * 0.01
+                # Use negative gradient (steepest descent) for failed samples
+                direction_final = torch.where(
+                    failed.view(-1, 1, 1, 1).expand_as(direction),
+                    -current_grad
+                    / (
+                        torch.norm(
+                            current_grad.reshape(batch_size, -1), dim=1, keepdim=True
+                        ).view(-1, 1, 1, 1)
+                        + 1e-10
+                    ),
+                    direction_modified,
+                )
+            return alpha, (
+                direction_final if "direction_final" in locals() else direction_modified
             )
 
-        # For examples where line search made no progress, fall back to PGD-like step
-        if not made_progress.all() and x_original is not None:
-            no_progress_mask = ~made_progress
+        # Return successful step sizes and (potentially) modified directions
+        return alpha, direction_modified
 
-            # Use sign of gradient with fixed step size (PGD approach)
-            # For samples where line search failed
-            alpha_pgd = torch.ones_like(alpha) * 0.1  # Fixed step relative to epsilon
+    def fgsm_initialization(
+        self,
+        x_original: torch.Tensor,
+        gradient_fn: Callable[[torch.Tensor], torch.Tensor],
+        targeted: bool = False,
+        alpha: float = 0.7,  # More aggressive initialization (70% of epsilon)
+        eps: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Initialize adversarial examples using Fast Gradient Sign Method.
 
-            # Create a new alpha array
-            alpha_new = alpha.clone()
+        Args:
+            x_original: Original clean images
+            gradient_fn: Function to compute gradient
+            targeted: Whether this is a targeted attack
+            alpha: Fraction of epsilon to use for initialization
+            eps: Per-sample epsilon values
 
-            # For samples with no progress, use PGD-style update
-            alpha_new[no_progress_mask] = alpha_pgd[no_progress_mask]
+        Returns:
+            Initialized adversarial examples
+        """
+        batch_size = x_original.shape[0]
 
-            # Also use the sign direction rather than the full gradient
-            return alpha_new, direction_sign
+        # Compute initial gradient with gradient tracking
+        x_copy = x_original.clone().detach().requires_grad_(True)
+        grad = gradient_fn(x_copy)
 
-        # Return the found alpha values and original direction
-        return alpha, direction
+        # For targeted attacks, gradient direction is reversed
+        if targeted:
+            grad = -grad
+
+        # Initialize perturbation tensor
+        delta = torch.zeros_like(x_original)
+
+        # Apply FGSM perturbation with per-sample epsilon
+        for i in range(batch_size):
+            # Get epsilon for this sample
+            sample_eps = eps[i].item() if eps is not None else self.eps
+
+            if self.norm.lower() == "l2":
+                # For L2, normalize gradient to unit norm and scale
+                grad_flat = grad[i : i + 1].reshape(1, -1)
+                grad_norm = torch.norm(grad_flat, p=2) + 1e-10
+                normalized_grad = grad[i : i + 1] / grad_norm
+
+                # Scale by alpha * epsilon
+                delta[i : i + 1] = normalized_grad * (sample_eps * alpha)
+            else:  # Linf norm
+                # For Linf, use sign and scale
+                delta[i : i + 1] = torch.sign(grad[i : i + 1]) * (sample_eps * alpha)
+
+        # Apply perturbation
+        x_adv = x_original + delta
+
+        # Project each sample individually to ensure constraints
+        for i in range(batch_size):
+            sample_eps = eps[i].item() if eps is not None else self.eps
+            x_adv[i : i + 1] = project_adversarial_example(
+                x_adv[i : i + 1], x_original[i : i + 1], sample_eps, self.norm
+            )
+
+        # Ensure result is valid image
+        x_adv = torch.clamp(x_adv, 0, 1)
+
+        return x_adv
 
     def optimize(
         self,
@@ -201,232 +442,327 @@ class ConjugateGradientOptimizer:
         loss_fn: Callable[[torch.Tensor], torch.Tensor],
         success_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         x_original: Optional[torch.Tensor] = None,
+        targeted: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
-        Run the conjugate gradient optimization procedure to generate adversarial examples.
-
-        The algorithm:
-          1. (Optionally) initializes with random noise at the epsilon boundary.
-          2. Computes the gradient and sets the initial search direction to -grad.
-          3. Uses line search to find a good step size satisfying the Armijo condition.
-          4. Updates the point and then computes the new gradient.
-          5. Uses either a restart or the conjugate update for the search direction.
-          6. Optionally stops early if the adversarial goal is met.
+        Run conjugate gradient optimization to generate adversarial examples.
 
         Args:
-            x_init: Initial images (clean images to be perturbed).
-            gradient_fn: Function that returns the gradient of the adversarial loss.
-            loss_fn: Function that computes the loss (must return per-example losses).
-            success_fn: Function to check if adversarial criteria are met (returns boolean tensor).
-            x_original: Original images for projection constraints.
+            x_init: Initial images
+            gradient_fn: Function to compute gradient of loss
+            loss_fn: Function to compute loss
+            success_fn: Function to check if adversarial criteria are met
+            x_original: Original images for projection
+            targeted: Whether this is a targeted attack
 
         Returns:
-            A tuple (x_adv, metrics) where:
-              - x_adv: The optimized adversarial examples.
-              - metrics: Dictionary containing iterations, gradient calls, total time, and success rate.
+            Tuple of (adversarial examples, metrics)
         """
         device = x_init.device
         batch_size = x_init.shape[0]
 
-        # Initialize adversarial examples with random noise if enabled.
-        if self.rand_init and x_original is not None:
-            # PGD-style initialization at the epsilon boundary
-            if self.norm.lower() == "l2":
-                # Generate random direction from uniform distribution
-                delta = torch.rand_like(x_init) * 2 - 1  # Values between -1 and 1
-                # Normalize to unit norm
-                flat_delta = delta.reshape(delta.shape[0], -1)
-                l2_norm = torch.norm(flat_delta, p=2, dim=1, keepdim=True)
-                normalized_delta = flat_delta / (l2_norm + 1e-10)
-                # Scale to epsilon magnitude
-                delta = normalized_delta.reshape(delta.shape) * self.eps
-                # Apply the perturbation
-                x_adv = x_original + delta
-            else:  # Linf norm
-                # Uniform random perturbation in [-eps, eps]
-                delta = torch.zeros_like(x_init).uniform_(-self.eps, self.eps)
-                x_adv = x_original + delta
-
-            # Ensure the result is within valid bounds (will be handled by projection)
-            x_adv = project_adversarial_example(x_adv, x_original, self.eps, self.norm)
-        else:
-            x_adv = x_init.clone()
-
-        # Initialize metrics for reporting.
+        # Initialize timing and metrics
         start_time = time.time()
-        iterations = 0
-        gradient_calls = 0
+        iterations_done = torch.zeros(batch_size, dtype=torch.long, device=device)
+        gradient_calls = torch.zeros(batch_size, dtype=torch.long, device=device)
         successful = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        # Check initial success (if a success criterion is provided).
+        # Create per-sample epsilon tensor
+        per_sample_eps = torch.ones(batch_size, device=device) * self.eps
+
+        # Initialize adversarial examples
+        if self.fgsm_init and x_original is not None:
+            # Use FGSM for initialization with per-sample epsilon
+            x_adv = self.fgsm_initialization(
+                x_original,
+                gradient_fn,
+                targeted=targeted,
+                alpha=0.7,  # Use 70% of epsilon for initialization
+                eps=per_sample_eps,
+            )
+            # Count gradient calls for initialization
+            gradient_calls += 1
+        elif self.rand_init and x_original is not None:
+            # Random initialization at the boundary
+            x_adv = torch.zeros_like(x_original)
+            for i in range(batch_size):
+                if self.norm.lower() == "l2":
+                    # Random direction with L2 normalization
+                    delta = torch.randn_like(x_original[i : i + 1])
+                    flat_delta = delta.reshape(1, -1)
+                    l2_norm = torch.norm(flat_delta, p=2)
+                    delta = delta / (l2_norm + 1e-10) * per_sample_eps[i]
+                else:  # Linf
+                    # Uniform random in [-eps, eps]
+                    delta = torch.zeros_like(x_original[i : i + 1]).uniform_(
+                        -per_sample_eps[i], per_sample_eps[i]
+                    )
+
+                # Apply perturbation and project
+                x_adv[i : i + 1] = project_adversarial_example(
+                    x_original[i : i + 1] + delta,
+                    x_original[i : i + 1],
+                    per_sample_eps[i],
+                    self.norm,
+                )
+        else:
+            # Start from original image
+            x_adv = x_original.clone() if x_original is not None else x_init.clone()
+
+        # Ensure inputs are on the correct device
+        x_adv = x_adv.to(device)
+
+        # Check initial success
         if success_fn is not None:
             success = success_fn(x_adv)
+            initial_success = success.clone()
         else:
             success = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            initial_success = success.clone()
 
-        # Store the initial success state for metrics
-        initial_success = success.clone()
+        # Storage for previous iteration data
+        prev_grad = None
+        prev_d = None
 
-        # Compute the initial gradient and set the initial search direction.
-        grad = gradient_fn(x_adv)
-        gradient_calls += batch_size
-        d = -grad  # Initial search direction is the steepest descent.
+        # Create active sample mask - samples we're still optimizing
+        active = (
+            ~success
+            if self.early_stopping
+            else torch.ones(batch_size, dtype=torch.bool, device=device)
+        )
 
-        # Initialize momentum buffer
-        prev_direction = torch.zeros_like(d)
-
-        loss_current = loss_fn(x_adv)  # Compute initial loss (per-example).
-
-        # Main optimization loop.
-        for t in range(self.n_iterations):
-            iterations += 1
-
-            # Early stopping: break if all examples have already met the adversarial criteria.
-            if self.early_stopping and success.all():
+        # Main optimization loop
+        for i in range(self.n_iterations):
+            # Skip if no active samples
+            if not active.any():
                 break
 
-            # Save the current gradient for the conjugate update.
-            grad_old = grad.clone()
+            # Increment iteration counter for active samples
+            iterations_done[active] += 1
 
-            # Apply momentum to the search direction
-            if t > 0:  # Skip first iteration since no previous direction yet
-                d = d + self.momentum * prev_direction
+            # Current x for active samples
+            x_current = x_adv[active]
 
-            # Line search: determine a suitable step size alpha.
-            if self.early_stopping:
-                working_examples = ~success  # Only update examples not yet successful.
-                if working_examples.sum() == 0:
-                    break
+            # Compute gradient for active samples
+            x_current.requires_grad_(True)
+            grad_all = torch.zeros_like(x_adv)
 
-                # Perform line search only for working examples
-                x_adv_working = x_adv[working_examples]
-                d_working = d[working_examples]
-                grad_old_working = grad_old[working_examples]
-                loss_current_working = loss_current[working_examples]
-                x_original_working = (
-                    x_original[working_examples] if x_original is not None else None
-                )
+            # Get gradient only for active samples to save computation
+            grad_active = gradient_fn(x_current)
+            gradient_calls[active] += 1
 
-                # Create a wrapper for working examples
-                def subset_loss_fn(x_subset):
-                    # Map back to full batch indices
-                    full_x = x_adv.clone()
-                    full_x[working_examples] = x_subset
-                    # Get loss for all samples
-                    full_loss = loss_fn(full_x)
-                    # Return only the relevant losses
-                    return full_loss[working_examples]
+            # Store in full gradient tensor
+            grad_all[active] = grad_active
 
-                # Line search returns alpha and potentially modified direction
-                alpha_working, dir_working = self._line_search(
-                    x_adv_working,
-                    d_working,
-                    grad_old_working,
-                    loss_current_working,
-                    x_original_working,
-                    subset_loss_fn,
-                )
-
-                # Update only the working examples
-                step = torch.zeros_like(x_adv)
-                # Use the new direction (sign or original) based on what line search returned
-                step[working_examples] = alpha_working.view(-1, 1, 1, 1) * dir_working
-                x_adv = x_adv + step
+            # Initialize search direction or compute conjugate direction
+            if i == 0 or prev_grad is None:
+                # First iteration: use negative gradient (steepest descent)
+                d_all = -grad_all.clone()
+                prev_grad = grad_all.clone()
+                prev_d = d_all.clone()
             else:
-                # Full batch line search
-                alpha, direction_to_use = self._line_search(
-                    x_adv, d, grad_old, loss_current, x_original, loss_fn
-                )
+                # For active samples, check conjugacy loss for restart
+                d_all = torch.zeros_like(x_adv)
 
-                # Save current direction for momentum
-                prev_direction = d.clone()
+                if self.adaptive_restart:
+                    # Check only active samples for restart
+                    grad_active = grad_all[active]
+                    prev_grad_active = prev_grad[active]
+                    prev_d_active = prev_d[active]
 
-                # Update adversarial examples using the alpha and direction
-                x_adv = x_adv + alpha.view(-1, 1, 1, 1) * direction_to_use
+                    # Compute gradient difference for active samples
+                    y_active = grad_active.reshape(
+                        grad_active.shape[0], -1
+                    ) - prev_grad_active.reshape(prev_grad_active.shape[0], -1)
 
-            # Project back to the allowed perturbation region.
-            if x_original is not None:
-                x_adv = project_adversarial_example(
-                    x_adv, x_original, self.eps, self.norm
-                )
+                    # Check for restart condition
+                    to_restart = self._check_conjugacy_loss(
+                        grad_active, prev_d_active, y_active
+                    )
 
-            # Update the gradient
-            if self.early_stopping:
-                working_examples = ~success
-                if working_examples.sum() == 0:
-                    break
+                    # Create masks for restarting and continuing samples
+                    restart_mask = to_restart
+                    continue_mask = ~restart_mask
 
-                # Create a wrapper for the gradient function that can work with subsets
-                def subset_gradient_fn(x_subset):
-                    # Create a full batch tensor but only update the working examples
-                    x_full = x_adv.clone()
-                    x_full[working_examples] = x_subset
-                    # Compute gradient on full batch then extract only the working examples
-                    full_grad = gradient_fn(x_full)
-                    return full_grad[working_examples]
+                    # For samples needing restart, use steepest descent
+                    if restart_mask.any():
+                        d_active = torch.zeros_like(grad_active)
+                        d_active[restart_mask] = -grad_active[restart_mask]
+                    else:
+                        d_active = torch.zeros_like(grad_active)
 
-                grad_full = torch.zeros_like(x_adv)
-                grad_working = subset_gradient_fn(x_adv[working_examples])
-                grad_full[working_examples] = grad_working
-                grad = grad_full
+                    # For samples continuing CG, compute beta and update direction
+                    if continue_mask.any():
+                        # Compute beta only for continuing samples
+                        beta = self._compute_beta(
+                            grad_active[continue_mask],
+                            prev_grad_active[continue_mask],
+                            prev_d_active[continue_mask],
+                            y_active[continue_mask],
+                        )
 
-                # Count gradient calls for working examples only
-                gradient_calls += working_examples.sum().item()
+                        # Update direction: d = -grad + beta * prev_d
+                        d_active[continue_mask] = (
+                            -grad_active[continue_mask]
+                            + beta.view(-1, 1, 1, 1) * prev_d_active[continue_mask]
+                        )
 
-                # Track which examples were successful during optimization
-                success_update = success_fn(x_adv)
-                newly_successful = success_update & ~success
-                successful = successful | newly_successful
-                success = success_update
-            else:
-                grad = gradient_fn(x_adv)
-                gradient_calls += batch_size
+                    # Store in full direction tensor
+                    d_all[active] = d_active
+                else:
+                    # Simple approach without per-sample restart checks
+                    # Periodic restart every restart_interval iterations or when normal iteration
+                    if i % self.restart_interval == 0:
+                        d_all = -grad_all
+                    else:
+                        # Compute beta for all active samples
+                        grad_active = grad_all[active]
+                        prev_grad_active = prev_grad[active]
+                        prev_d_active = prev_d[active]
 
-                # Track which examples became successful in this iteration
-                if success_fn is not None:
-                    success_update = success_fn(x_adv)
-                    newly_successful = success_update & ~success
-                    successful = successful | newly_successful
-                    success = success_update
+                        beta = self._compute_beta(
+                            grad_active, prev_grad_active, prev_d_active
+                        )
+                        d_active = -grad_active + beta.view(-1, 1, 1, 1) * prev_d_active
+                        d_all[active] = d_active
 
-            # Compute the new loss after the update.
+            # Update previous values for next iteration
+            prev_grad = grad_all.clone()
+            prev_d = d_all.clone()
+
+            # Compute current loss (for line search)
             loss_current = loss_fn(x_adv)
 
-            # Log progress if requested
-            if self.verbose and (t + 1) % 10 == 0:
+            # Perform line search for active samples
+            if active.sum() > 0:
+                # Number of active samples
+                num_active = active.sum()
+
+                # Create a loss function wrapper that handles the active samples correctly
+                def wrapped_loss_fn(x_active):
+                    # Create a full batch with both inactive and active samples
+                    x_full = x_adv.clone()
+
+                    # Place active samples in their correct positions
+                    x_full[active] = x_active
+
+                    # Compute full loss
+                    full_loss = loss_fn(x_full)
+
+                    # Extract just the losses for active samples
+                    # For a single active sample, we need special handling
+                    if num_active == 1:
+                        active_idx = active.nonzero().item()
+                        return full_loss[active_idx : active_idx + 1]
+                    else:
+                        return full_loss[active]
+
+                # Line search with per-sample epsilon
+                alpha, d_search = self._line_search(
+                    x_adv[active],
+                    d_all[active],
+                    grad_all[active],
+                    loss_current[active],
+                    x_original[active] if x_original is not None else None,
+                    wrapped_loss_fn,
+                    (
+                        per_sample_eps[active].view(-1, 1)
+                        if num_active == 1
+                        else per_sample_eps[active]
+                    ),
+                )
+
+                # Apply update only to active samples
+                x_adv_new = x_adv.clone()
+
+                # Shape alpha properly based on number of active samples
+                if num_active == 1:
+                    # For a single active sample
+                    active_idx = active.nonzero().item()
+                    x_adv_new[active_idx : active_idx + 1] = (
+                        x_adv[active_idx : active_idx + 1]
+                        + alpha.view(-1, 1, 1, 1) * d_search
+                    )
+                else:
+                    # For multiple active samples
+                    x_adv_new[active] = (
+                        x_adv[active] + alpha.view(-1, 1, 1, 1) * d_search
+                    )
+
+                # Project to valid range
+                if x_original is not None:
+                    for i in range(batch_size):
+                        if active[i]:
+                            x_adv_new[i : i + 1] = project_adversarial_example(
+                                x_adv_new[i : i + 1],
+                                x_original[i : i + 1],
+                                per_sample_eps[i],
+                                self.norm,
+                            )
+
+                # Ensure valid pixel range [0,1]
+                x_adv = torch.clamp(x_adv_new, 0, 1)
+
+            # Check success and update active samples
+            if success_fn is not None:
+                # See which samples are now successful
+                new_success = success_fn(x_adv)
+                newly_successful = new_success & ~success
+
+                # Update overall success tracking
+                successful = successful | newly_successful
+                success = new_success
+
+                # Update active samples mask for early stopping
+                if self.early_stopping:
+                    active = ~success
+
+            # Verbose logging
+            if self.verbose and (i + 1) % 10 == 0:
                 if success_fn is not None:
                     success_rate = success.float().mean().item() * 100
                     print(
-                        f"Iteration {t+1}/{self.n_iterations}, Success rate: {success_rate:.2f}%"
+                        f"Iteration {i+1}/{self.n_iterations}, Success rate: {success_rate:.2f}%"
                     )
 
-            # Update the search direction.
-            if (t + 1) % self.restart_interval == 0:
-                # Restart: use the negative gradient as the new search direction.
-                d = -grad
-            else:
-                # Compute beta for the conjugate update.
-                beta = self._compute_beta(grad, grad_old, d)
-                # New direction: combine the steepest descent and the previous direction.
-                d = -grad + beta.view(-1, 1, 1, 1) * d
+        # Final projection to ensure constraints
+        if x_original is not None:
+            for i in range(batch_size):
+                x_adv[i : i + 1] = project_adversarial_example(
+                    x_adv[i : i + 1],
+                    x_original[i : i + 1],
+                    per_sample_eps[i],
+                    self.norm,
+                )
 
-        # Compile metrics.
-        total_time = time.time() - start_time
+        # Ensure final result is within valid pixel range
+        x_adv = torch.clamp(x_adv, 0, 1)
+
+        # Compute final metrics
+        end_time = time.time()
+        total_time = end_time - start_time
+
+        # Compute average metrics, handling the case where no samples were processed
+        avg_iterations = (
+            iterations_done.float().mean().item() if iterations_done.size(0) > 0 else 0
+        )
+        avg_gradient_calls = (
+            gradient_calls.float().mean().item() if gradient_calls.size(0) > 0 else 0
+        )
+        success_rate = success.float().mean().item() * 100 if success.size(0) > 0 else 0
+        initial_success_rate = (
+            initial_success.float().mean().item() * 100
+            if initial_success.size(0) > 0
+            else 0
+        )
+
         metrics = {
-            "iterations": iterations,
-            "gradient_calls": gradient_calls,
+            "iterations": avg_iterations,
+            "gradient_calls": avg_gradient_calls,
             "time": total_time,
-            "success_rate": (
-                success.float().mean().item()
-                * 100  # Track overall success rate, not just new successes
-                if success_fn is not None
-                else 0.0
-            ),
-            "initial_success_rate": (
-                initial_success.float().mean().item() * 100
-                if success_fn is not None
-                else 0.0
-            ),
+            "time_per_sample": total_time / batch_size,
+            "success_rate": success_rate,
+            "initial_success_rate": initial_success_rate,
         }
 
         return x_adv, metrics

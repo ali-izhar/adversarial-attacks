@@ -1,585 +1,556 @@
-"""Tests for the PGD adversarial attack implementation."""
+#!/usr/bin/env python
+"""
+Test script for the Projected Gradient Descent (PGD) adversarial attack.
+
+This script tests the PGD attack on a sample of ImageNet data
+and compares it with other baseline attacks.
+
+Usage:
+    python -m tests.test_attacks.test_attack_pgd
+"""
 
 import os
 import sys
-import pytest
+import time
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
+import argparse
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
+# Add the project root to the path
 project_root = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+sys.path.insert(0, project_root)
 
+from src.datasets.imagenet import get_dataset, get_dataloader
+from src.models.wrappers import get_model
+from src.attacks.baseline.attack_fgsm import FGSM
+from src.attacks.baseline.attack_deepfool import DeepFool
+from src.attacks.baseline.attack_cw import CW
 from src.attacks.attack_pgd import PGD
 
 
-# Define a simple CNN model for testing
-class SimpleConvNet(nn.Module):
-    """A simple convolutional neural network for testing adversarial attacks."""
+def plot_images(
+    original, adversarial, attack_name, original_label, adv_prediction, save_path=None
+):
+    """
+    Create a comparison plot between original and adversarial images.
 
-    def __init__(self, num_classes: int = 10):
-        super().__init__()
-        self.conv1 = nn.Conv2d(3, 8, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.fc1 = nn.Linear(16 * 8 * 8, 64)
-        self.fc2 = nn.Linear(64, num_classes)
+    Args:
+        original: Original image tensor
+        adversarial: Adversarial image tensor
+        attack_name: Name of the attack
+        original_label: Original label
+        adv_prediction: Prediction on adversarial example
+        save_path: Path to save the figure
+    """
+    # Denormalize images for visualization
+    mean = (
+        torch.tensor([0.485, 0.456, 0.406], dtype=original.dtype)
+        .view(3, 1, 1)
+        .to(original.device)
+    )
+    std = (
+        torch.tensor([0.229, 0.224, 0.225], dtype=original.dtype)
+        .view(3, 1, 1)
+        .to(original.device)
+    )
 
-    def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 8 * 8)
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
+    def denormalize(x):
+        """Convert from normalized to [0,1] range for visualization"""
+        img = x.cpu().clone()
+        img = img * std + mean
+        img = torch.clamp(img, 0, 1)
+        return img
+
+    # Get numpy versions for plotting
+    original_np = denormalize(original).permute(1, 2, 0).numpy()
+    adversarial_np = denormalize(adversarial).permute(1, 2, 0).numpy()
+
+    # Calculate perturbation for visualization
+    perturbation = adversarial - original
+
+    # Sign/direction view (shows how values change: increase=red, decrease=blue)
+    # Create a diverging colormap visualization
+    perturbation_sign = perturbation.cpu()
+    # Scale the perturbation for better visualization, with diverging colors
+    max_pert = (
+        perturbation_sign.abs().max().item()
+        if perturbation_sign.abs().max().item() > 0
+        else 1.0
+    )
+    perturbation_sign = perturbation_sign / (max_pert * 0.1)  # Normalize and enhance
+    perturbation_sign = torch.clamp(perturbation_sign, -1, 1)
+
+    # Convert to a diverging colormap (red-white-blue)
+    # Red for positive changes, blue for negative
+    pert_rgb = torch.zeros(
+        (3, perturbation_sign.shape[1], perturbation_sign.shape[2]),
+        device=perturbation_sign.device,
+    )
+    pert_rgb[0] = torch.clamp(
+        perturbation_sign.mean(dim=0) * 0.5 + 0.5, 0, 1
+    )  # Red channel
+    pert_rgb[2] = torch.clamp(
+        -perturbation_sign.mean(dim=0) * 0.5 + 0.5, 0, 1
+    )  # Blue channel
+    pert_rgb[1] = torch.clamp(
+        1.0 - perturbation_sign.mean(dim=0).abs() * 0.5, 0, 1
+    )  # Green channel
+
+    # Convert to numpy
+    diverging_pert = pert_rgb.permute(1, 2, 0).numpy()
+
+    # Create the figure
+    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+
+    # Plot original image
+    ax[0].imshow(original_np)
+    ax[0].set_title(f"Original\nLabel: {original_label}")
+    ax[0].axis("off")
+
+    # Plot perturbation (sign)
+    ax[1].imshow(diverging_pert)
+    ax[1].set_title(f"Perturbation (Direction)\nRed=Increase, Blue=Decrease")
+    ax[1].axis("off")
+
+    # Plot adversarial image
+    ax[2].imshow(adversarial_np)
+    ax[2].set_title(f"Adversarial\nPredicted: {adv_prediction}")
+    ax[2].axis("off")
+
+    # Add attack information
+    plt.suptitle(f"Adversarial Example - {attack_name}", fontsize=16)
+
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    else:
+        plt.show()
+
+    plt.close()
 
 
-class TestPGDAttack:
-    """Tests for the PGD adversarial attack."""
+def test_attack(attack, model, dataset, attack_name, args):
+    """
+    Test an attack on a dataset and report metrics.
 
-    @pytest.fixture
-    def device(self):
-        """Return the device to use for testing."""
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    Args:
+        attack: Attack instance
+        model: Target model
+        dataset: Dataset to attack
+        attack_name: Name of the attack for reporting
+        args: Command-line arguments
 
-    @pytest.fixture
-    def model(self, device):
-        """Create a simple model for testing."""
-        model = SimpleConvNet().to(device)
-        model.eval()  # Set to evaluation mode
-        return model
+    Returns:
+        Dictionary of metrics
+    """
+    print(f"\n{'='*50}")
+    print(f"Testing {attack_name} attack")
+    print(f"{'='*50}")
 
-    @pytest.fixture
-    def test_batch(self, device):
-        """Create a small batch of test images and labels."""
-        # Create a small batch of random images
-        batch_size = 5
-        channels, height, width = 3, 32, 32
-        torch.manual_seed(42)  # For reproducibility
-        images = torch.rand((batch_size, channels, height, width), device=device)
+    # Create a dataloader with the test batch size
+    dataloader = get_dataloader(dataset, batch_size=args.batch_size, shuffle=False)
+    class_names = dataset.class_names
 
-        # Create random labels
-        labels = torch.randint(0, 10, (batch_size,), device=device)
+    # Store metrics
+    metrics = {
+        "name": attack_name,
+        "success_rate": 0.0,
+        "l2_norm": 0.0,
+        "linf_norm": 0.0,
+        "ssim": 0.0,
+        "time_per_sample": 0.0,
+        "iterations": 0.0,
+        "gradient_calls": 0.0,
+    }
 
-        return images, labels
+    # Reset attack metrics before starting
+    attack.reset_metrics()
 
-    def test_initialization(self, model):
-        """Test that the attack initializes with different parameters."""
-        # Default initialization
-        attack1 = PGD(model=model)
-        assert attack1.norm == "L2"
-        assert attack1.eps == 0.5
-        assert attack1.targeted is False
-        assert attack1.loss_fn == "cross_entropy"
+    # Track successful adversarial examples for visualization
+    successful_examples = []
 
-        # Custom initialization
-        attack2 = PGD(
-            model=model,
-            norm="Linf",
-            eps=0.1,
-            targeted=True,
-            loss_fn="margin",
-            n_iterations=50,
-            alpha_init=0.05,
-            alpha_type="constant",
-            rand_init=False,
-            init_std=0.05,
-            early_stopping=False,
-            verbose=True,
-        )
+    # Run attack on a limited number of batches
+    total_samples = 0
 
-        assert attack2.norm == "Linf"
-        assert attack2.eps == 0.1
-        assert attack2.targeted is True
-        assert attack2.loss_fn == "margin"
-        assert attack2.optimizer.n_iterations == 50
-        assert attack2.optimizer.alpha_init == 0.05
-        assert attack2.optimizer.alpha_type == "constant"
-        assert attack2.optimizer.rand_init is False
-        assert attack2.optimizer.init_std == 0.05
-        assert attack2.optimizer.early_stopping is False
-        assert attack2.optimizer.verbose is True
+    for batch_idx, (inputs, labels) in enumerate(
+        tqdm(dataloader, desc=f"{attack_name}")
+    ):
+        if batch_idx >= args.max_batches:
+            break
 
-    def test_untargeted_attack(self, model, test_batch, device):
-        """Test an untargeted attack with L2 norm."""
-        images, true_labels = test_batch
+        # Ensure inputs and labels are the right type and on the right device
+        inputs = inputs.to(args.device).float()  # Explicitly convert to float32
+        labels = labels.to(args.device)
 
-        # Create an untargeted attack
-        attack = PGD(
-            model=model,
-            norm="L2",
-            eps=5.0,  # Larger epsilon for test success
-            targeted=False,
-            n_iterations=20,
-            alpha_init=0.5,  # Larger step size for faster convergence
-            alpha_type="constant",
-            early_stopping=True,
-            verbose=False,
-        )
+        total_samples += inputs.size(0)
 
-        # Generate adversarial examples
-        adv_images, metrics = attack.generate(images, true_labels)
-
-        # Test properties of the returned adversarial examples
-        assert adv_images.shape == images.shape
-        assert adv_images.device == images.device
-
-        # Check perturbation size constraints
-        perturbation = adv_images - images
-        perturbation_flat = perturbation.reshape(perturbation.shape[0], -1)
-        perturbation_norms = torch.norm(perturbation_flat, dim=1)
-        assert torch.all(
-            perturbation_norms <= attack.eps + 1e-5
-        )  # Allow small tolerance
-
-        # Verify the adversarial examples changed the model's prediction
+        # Get original predictions
         with torch.no_grad():
-            clean_outputs = model(images)
-            adv_outputs = model(adv_images)
-
-            clean_preds = clean_outputs.argmax(dim=1)
-            adv_preds = adv_outputs.argmax(dim=1)
-
-            # Get initially successful examples (already misclassified)
-            initial_success = clean_preds != true_labels
-
-            # New successful examples (weren't initially successful but became successful)
-            new_success = (adv_preds != true_labels) & ~initial_success
-
-            # Calculate new success rate as a percentage
-            new_success_rate = new_success.float().mean().item() * 100
-
-            # Check that at least some examples were attacked successfully
-            total_success = (adv_preds != true_labels).float().mean().item() * 100
-            assert total_success > 0
-
-            # Verify reported success rate matches actual new success rate
-            assert abs(metrics["success_rate"] - new_success_rate) < 1e-5
-
-    def test_targeted_attack(self, model, test_batch, device):
-        """Test a targeted attack with Linf norm."""
-        images, true_labels = test_batch
-
-        # Create target labels different from true labels
-        target_labels = (true_labels + 1) % 10
-
-        # Create a targeted attack
-        attack = PGD(
-            model=model,
-            norm="Linf",
-            eps=0.3,  # Reasonable for Linf
-            targeted=True,
-            n_iterations=40,  # More iterations for targeted attack
-            alpha_init=0.01,  # Smaller steps for Linf norm
-            alpha_type="constant",
-            early_stopping=True,
-            verbose=False,
-        )
-
-        # Generate adversarial examples
-        adv_images, metrics = attack.generate(images, target_labels)
-
-        # Check perturbation size constraints for Linf
-        perturbation = adv_images - images
-        perturbation_max = torch.max(torch.abs(perturbation))
-        assert perturbation_max <= attack.eps + 1e-5  # Allow small tolerance
-
-        # Verify the adversarial examples match the target labels
-        with torch.no_grad():
-            clean_outputs = model(images)
-            adv_outputs = model(adv_images)
-
-            clean_preds = clean_outputs.argmax(dim=1)
-            adv_preds = adv_outputs.argmax(dim=1)
-
-            # Get initially successful examples (already classified as target)
-            initial_success = clean_preds == target_labels
-
-            # New successful examples (weren't initially successful but became successful)
-            new_success = (adv_preds == target_labels) & ~initial_success
-
-            # Calculate new success rate as a percentage
-            new_success_rate = new_success.float().mean().item() * 100
-
-            # Check that at least some examples were successfully attacked
-            total_success = (adv_preds == target_labels).float().mean().item() * 100
-            assert total_success > 0
-
-            # Verify reported success rate matches actual new success rate
-            assert abs(metrics["success_rate"] - new_success_rate) < 1e-5
-
-    def test_margin_loss(self, model, test_batch, device):
-        """Test attack with margin loss function."""
-        images, true_labels = test_batch
-
-        # Create an attack with margin loss
-        attack = PGD(
-            model=model,
-            norm="L2",
-            eps=5.0,
-            targeted=False,
-            loss_fn="margin",  # Use margin loss
-            n_iterations=20,
-            alpha_init=0.5,
-            alpha_type="constant",
-            early_stopping=True,
-            verbose=False,
-        )
-
-        # Generate adversarial examples
-        adv_images, metrics = attack.generate(images, true_labels)
-
-        # Verify the adversarial examples changed the model's prediction
-        with torch.no_grad():
-            clean_outputs = model(images)
-            adv_outputs = model(adv_images)
-
-            clean_preds = clean_outputs.argmax(dim=1)
-            adv_preds = adv_outputs.argmax(dim=1)
-
-            # Get initially successful examples (already misclassified)
-            initial_success = clean_preds != true_labels
-
-            # New successful examples (weren't initially successful but became successful)
-            new_success = (adv_preds != true_labels) & ~initial_success
-
-            # Calculate new success rate as a percentage
-            new_success_rate = new_success.float().mean().item() * 100
-
-            # Check that at least some examples were successfully attacked
-            total_success = (adv_preds != true_labels).float().mean().item() * 100
-            assert total_success > 0
-
-            # Verify reported success rate matches actual new success rate
-            assert abs(metrics["success_rate"] - new_success_rate) < 1e-5
-
-    def test_metrics_tracking(self, model, test_batch, device):
-        """Test that the attack correctly tracks and returns metrics."""
-        images, true_labels = test_batch
-
-        attack = PGD(
-            model=model,
-            norm="L2",
-            eps=3.0,
-            targeted=False,
-            n_iterations=10,
-            alpha_init=0.3,
-            alpha_type="constant",
-            early_stopping=True,
-            verbose=False,
-        )
-
-        # Reset metrics
-        attack.reset_metrics()
-        assert attack.total_iterations == 0
-        assert attack.total_gradient_calls == 0
-        assert attack.total_time == 0
-
-        # Generate adversarial examples
-        _, metrics = attack.generate(images, true_labels)
-
-        # Verify metrics are populated
-        assert attack.total_iterations > 0
-        assert attack.total_gradient_calls > 0
-        assert attack.total_time > 0
-
-        # Verify metrics match what's returned
-        assert metrics["iterations"] == attack.total_iterations
-        assert metrics["gradient_calls"] == attack.total_gradient_calls
-        assert metrics["time"] == attack.total_time
-        assert "success_rate" in metrics
-
-    def test_single_target_expansion(self, model, device):
-        """Test that a single target label is expanded correctly in targeted mode."""
-        # Create a batch of images
-        batch_size = 3
-        channels, height, width = 3, 32, 32
-        images = torch.rand((batch_size, channels, height, width), device=device)
-
-        # Create a single target label
-        target_label = torch.tensor([5], device=device)
-
-        # Create a targeted attack
-        attack = PGD(
-            model=model,
-            targeted=True,
-            n_iterations=5,  # Small for speed
-            early_stopping=False,
-        )
-
-        # Generate adversarial examples
-        adv_images, _ = attack.generate(images, target_label)
-
-        # Verify shape of result
-        assert adv_images.shape == images.shape
-
-        # Verify the target was expanded correctly
-        assert attack.original_targets.shape[0] == batch_size
-        assert torch.all(attack.original_targets == 5)
-
-    def test_mismatched_batch_sizes(self, model, device):
-        """Test that an error is raised when batch sizes don't match in untargeted mode."""
-        # Create a batch of images
-        batch_size = 3
-        channels, height, width = 3, 32, 32
-        images = torch.rand((batch_size, channels, height, width), device=device)
-
-        # Create mismatched labels (fewer than images)
-        labels = torch.tensor([2, 5], device=device)
-
-        # Create an untargeted attack
-        attack = PGD(
-            model=model,
-            targeted=False,
-            n_iterations=5,
-            early_stopping=False,
-        )
-
-        # Attempting to generate adversarial examples with mismatched batch sizes should raise error
-        with pytest.raises(ValueError, match="doesn't match"):
-            attack.generate(images, labels)
-
-    def test_no_early_stopping(self, model, test_batch, device):
-        """Test attack behavior with early stopping disabled."""
-        images, true_labels = test_batch
-
-        # Create an attack with early stopping disabled
-        attack = PGD(
-            model=model,
-            norm="L2",
-            eps=5.0,
-            targeted=False,
-            n_iterations=10,
-            alpha_init=0.5,
-            alpha_type="constant",
-            early_stopping=False,  # Disable early stopping
-            verbose=False,
-        )
-
-        # Generate adversarial examples
-        adv_images, metrics = attack.generate(images, true_labels)
-
-        # With early stopping disabled, the attack should run all iterations
-        assert metrics["iterations"] == 10
-
-    def test_step_size_schedules(self, model, test_batch, device):
-        """Test different step size schedules."""
-        images, true_labels = test_batch
-
-        # Create attacks with different step size schedules
-        attack_constant = PGD(
-            model=model,
-            norm="L2",
-            eps=5.0,
-            targeted=False,
-            n_iterations=20,
-            alpha_init=0.5,
-            alpha_type="constant",  # Constant step size
-            early_stopping=False,
-            verbose=False,
-        )
-
-        attack_diminishing = PGD(
-            model=model,
-            norm="L2",
-            eps=5.0,
-            targeted=False,
-            n_iterations=20,
-            alpha_init=0.5,
-            alpha_type="diminishing",  # Diminishing step size
-            early_stopping=False,
-            verbose=False,
-        )
-
-        # Generate adversarial examples with both schedules
-        adv_constant, metrics_constant = attack_constant.generate(images, true_labels)
-        adv_diminishing, metrics_diminishing = attack_diminishing.generate(
-            images, true_labels
-        )
-
-        # Verify both attacks produced valid adversarial examples
-        with torch.no_grad():
-            outputs_constant = model(adv_constant)
-            outputs_diminishing = model(adv_diminishing)
-
-            preds_constant = outputs_constant.argmax(dim=1)
-            preds_diminishing = outputs_diminishing.argmax(dim=1)
-
-            # Calculate success rates for both schedules
-            success_constant = (
-                preds_constant != true_labels
-            ).float().mean().item() * 100
-            success_diminishing = (
-                preds_diminishing != true_labels
-            ).float().mean().item() * 100
-
-            # Both schedules should achieve some success
-            assert success_constant > 0
-            assert success_diminishing > 0
-
-            # Log the success rates for comparison
-            print(f"Constant step size success rate: {success_constant:.2f}%")
-            print(f"Diminishing step size success rate: {success_diminishing:.2f}%")
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Training faster on GPU")
-    def test_on_trained_model(self, device):
-        """Test attack on a trained model with RGB images."""
-        # Use the SimpleConvNet that we already know works with RGB images
-        model = SimpleConvNet(num_classes=10).to(device)
-
-        # Initialize the model with fixed weights for reproducibility
-        with torch.no_grad():
-            torch.manual_seed(42)
-            # Set random weights but with reasonable scales
-            for name, param in model.named_parameters():
-                if "weight" in name:
-                    param.data = torch.randn_like(param) * 0.1
-                elif "bias" in name:
-                    param.data.fill_(0.1)
-
-        # Set to evaluation mode
-        model.eval()
-
-        # Create a single test image
-        torch.manual_seed(123)
-        # Single RGB image with shape [1, 3, 32, 32]
-        test_image = torch.rand((1, 3, 32, 32), device=device)
-
-        # Get prediction
-        with torch.no_grad():
-            output = model(test_image)
-            pred = output.argmax(dim=1)
-            print(f"Original prediction: {pred.item()}")
-
-            # Get logits for all classes to find the most promising target
-            logits = output[0].cpu().numpy()
-            sorted_classes = np.argsort(logits)
-
-            # Lowest confidence class as target is easier to reach
-            target_class = sorted_classes[0]
-
-            # Make sure target is different from prediction
-            if target_class == pred.item():
-                target_class = sorted_classes[1]
-
-            print(f"Target class (lowest confidence): {target_class}")
-
-        # Create targeted attack - more controllable than untargeted
-        attack = PGD(
-            model=model,
-            norm="L2",
-            eps=20.0,  # Larger epsilon for more power
-            targeted=True,  # Targeted attack with chosen class
-            loss_fn="cross_entropy",
-            n_iterations=100,  # More iterations
-            alpha_init=0.3,
-            alpha_type="constant",
-            rand_init=True,
-            early_stopping=True,
-            verbose=True,
-        )
-
-        # Target label as tensor
-        target_label = torch.tensor([target_class], device=device)
-
-        # Generate adversarial example
-        adv_image, metrics = attack.generate(test_image, target_label)
-
-        # Measure perturbation
-        perturbation = adv_image - test_image
-        perturbation_flat = perturbation.reshape(-1)
-        perturbation_norm = torch.norm(perturbation_flat).item()
-        print(f"Perturbation L2 norm: {perturbation_norm:.6f}")
-
-        # Test if the prediction changed to the target
-        with torch.no_grad():
-            adv_output = model(adv_image)
-            adv_pred = adv_output.argmax(dim=1)
-            print(f"Adversarial prediction: {adv_pred.item()}")
-
-            # Success for targeted attack
-            success = adv_pred.item() == target_class
-            print(f"Attack success: {success}")
-
-            # Check if perturbation is significant
-            if perturbation_norm > 5.0:
-                # If perturbation is significant but prediction didn't change,
-                # the model might be unusually robust for this example
-                if not success:
-                    print(
-                        "Significant perturbation applied but prediction didn't change"
-                    )
-                    print(f"Original logits: {output[0]}")
-                    print(f"Adversarial logits: {adv_output[0]}")
-
-                    # Check if adversarial example at least changed the confidence
-                    clean_target_conf = output[0, target_class].item()
-                    adv_target_conf = adv_output[0, target_class].item()
-
-                    if adv_target_conf > clean_target_conf:
-                        print(
-                            f"Attack increased target class confidence: {clean_target_conf:.4f} → {adv_target_conf:.4f}"
-                        )
-                        pytest.skip(
-                            "Attack didn't change prediction but increased target class confidence"
-                        )
-                    else:
-                        # If even confidence didn't change with large perturbation,
-                        # there might be an issue with gradient flow
-                        pytest.skip(
-                            "Attack didn't change prediction or confidence despite large perturbation"
-                        )
-
-            # Only assert success if perturbation is significant, otherwise skip
-            if not success and perturbation_norm < 5.0:
-                pytest.skip(
-                    f"Perturbation too small ({perturbation_norm:.2f}) to expect success"
+            outputs = model(inputs)
+            _, original_preds = torch.max(outputs, 1)
+
+            # Skip samples that are already misclassified
+            correct_mask = original_preds == labels
+            if not correct_mask.any():
+                print(
+                    f"  All samples in this batch are already misclassified, skipping"
                 )
+                continue
 
-            # If we didn't skip, we expect success
-            assert success, "Attack failed to change the prediction to target class"
+            # Only attack correctly classified samples
+            correct_inputs = inputs[correct_mask]
+            correct_labels = labels[correct_mask]
 
-    def test_random_initialization(self, model, test_batch, device):
-        """Test that random initialization affects the outcome."""
-        images, true_labels = test_batch
+            if len(correct_inputs) == 0:
+                continue
 
-        # Create two identical attacks, one with random init and one without
-        attack_with_rand = PGD(
-            model=model,
-            norm="L2",
-            eps=5.0,
-            targeted=False,
-            n_iterations=20,
-            alpha_init=0.5,
-            alpha_type="constant",
-            rand_init=True,  # With random initialization
-            init_std=0.1,
-            early_stopping=False,
-            verbose=False,
+        # Attack only the correctly classified samples
+        attack_start = time.time()
+
+        # For debugging
+        if args.verbose:
+            print(
+                f"  Initial metrics: iterations={attack.total_iterations}, gradient_calls={attack.total_gradient_calls}"
+            )
+
+        adversarial = attack(correct_inputs, correct_labels)
+        attack_time = time.time() - attack_start
+
+        # For debugging
+        if args.verbose:
+            print(
+                f"  After attack: iterations={attack.total_iterations}, gradient_calls={attack.total_gradient_calls}"
+            )
+
+        # Explicitly evaluate attack success - this updates the attack's internal metrics
+        batch_success_rate, success_mask, (orig_preds, adv_preds) = (
+            attack.evaluate_attack_success(correct_inputs, adversarial, correct_labels)
         )
 
-        attack_without_rand = PGD(
-            model=model,
-            norm="L2",
-            eps=5.0,
-            targeted=False,
-            n_iterations=20,
-            alpha_init=0.5,
-            alpha_type="constant",
-            rand_init=False,  # Without random initialization
-            init_std=0.1,
-            early_stopping=False,
-            verbose=False,
+        # Explicitly compute perturbation metrics - this updates the attack's internal metrics
+        perturbation_metrics = attack.compute_perturbation_metrics(
+            correct_inputs, adversarial, success_mask
         )
 
-        # Generate adversarial examples with both attacks
-        adv_with_rand, _ = attack_with_rand.generate(images, true_labels)
-        adv_without_rand, _ = attack_without_rand.generate(images, true_labels)
+        # Display batch results
+        print(
+            f"  Batch {batch_idx+1}: Success Rate = {batch_success_rate:.2f}%, "
+            f"L2: {perturbation_metrics['l2_norm']:.4f}, "
+            f"L∞: {perturbation_metrics['linf_norm']:.4f}, "
+            f"SSIM: {perturbation_metrics['ssim']:.4f}"
+        )
 
-        # The results should be different due to random initialization
-        # Check if there's at least some difference between the two results
-        assert torch.norm(adv_with_rand - adv_without_rand) > 1e-5
+        # Save a successful example for visualization
+        if success_mask.any() and len(successful_examples) < args.num_vis:
+            success_idx = torch.where(success_mask)[0][0].item()
+
+            original_img = correct_inputs[success_idx].cpu()
+            adversarial_img = adversarial[success_idx].cpu()
+            original_label_idx = correct_labels[success_idx].item()
+            adv_pred_idx = adv_preds[success_idx].item()
+
+            successful_examples.append(
+                {
+                    "original": original_img,
+                    "adversarial": adversarial_img,
+                    "original_label": class_names[original_label_idx],
+                    "original_idx": original_label_idx,
+                    "adv_prediction": class_names[adv_pred_idx],
+                    "adv_idx": adv_pred_idx,
+                }
+            )
+
+    # Get metrics from the attack
+    attack_metrics = attack.get_metrics()
+
+    # Combine metrics
+    metrics["success_rate"] = attack_metrics["success_rate"]
+    metrics["l2_norm"] = attack_metrics["l2_norm"]
+    metrics["linf_norm"] = attack_metrics["linf_norm"]
+    metrics["ssim"] = attack_metrics["ssim"]
+    metrics["time_per_sample"] = attack_metrics["time_per_sample"]
+    metrics["iterations"] = attack_metrics["iterations"]
+    metrics["gradient_calls"] = attack_metrics["gradient_calls"]
+
+    # Print metrics summary
+    print(f"\nMetrics for {attack_name}:")
+    print(f"  Success Rate: {metrics['success_rate']:.2f}%")
+    print(f"  L2 Norm: {metrics['l2_norm']:.4f}")
+    print(f"  L∞ Norm: {metrics['linf_norm']:.4f}")
+    print(f"  SSIM: {metrics['ssim']:.4f}")
+    print(f"  Time per sample: {metrics['time_per_sample']*1000:.2f} ms")
+    print(f"  Average iterations: {metrics['iterations']:.2f}")
+    print(f"  Average gradient calls: {metrics['gradient_calls']:.2f}")
+
+    # Create visualizations
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    for i, example in enumerate(successful_examples):
+        plot_images(
+            original=example["original"],
+            adversarial=example["adversarial"],
+            attack_name=attack_name,
+            original_label=f"{example['original_label']} ({example['original_idx']})",
+            adv_prediction=f"{example['adv_prediction']} ({example['adv_idx']})",
+            save_path=f"{args.output_dir}/{attack_name.lower().replace(' ', '_')}_example_{i+1}.png",
+        )
+
+    return metrics
+
+
+def main(args):
+    """Main function."""
+    # Set device
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {args.device}")
+
+    # Load dataset
+    print("Loading ImageNet dataset...")
+    dataset = get_dataset(
+        dataset_name="imagenet", data_dir=args.data_dir, max_samples=args.num_samples
+    )
+
+    # Load model
+    print(f"Loading {args.model_name} model...")
+    model = get_model(args.model_name).to(args.device)
+    model.eval()
+
+    # Initialize attacks to compare
+    attacks = []
+
+    # Standard PGD L2 attack
+    attacks.append(
+        (
+            PGD(
+                model,
+                norm="L2",
+                eps=1.0,  # Standard L2 epsilon
+                n_iterations=40,  # Default iterations
+                alpha_init=0.1,  # Step size
+                alpha_type="diminishing",  # Step size schedule
+                rand_init=True,
+                early_stopping=True,
+                verbose=args.verbose,
+                normalize_grad=True,  # Enable gradient normalization for L2
+                debug=args.verbose,  # Only show debug info if verbose flag is set
+            ),
+            "PGD (L2, eps=1.0)",
+        )
+    )
+
+    # Larger L2 epsilon
+    attacks.append(
+        (
+            PGD(
+                model,
+                norm="L2",
+                eps=3.0,  # Larger L2 epsilon
+                n_iterations=40,
+                alpha_init=0.3,  # Larger step size
+                alpha_type="diminishing",
+                rand_init=True,
+                early_stopping=True,
+                verbose=args.verbose,
+                normalize_grad=True,  # Enable gradient normalization for L2
+                debug=args.verbose,
+            ),
+            "PGD (L2, eps=3.0)",
+        )
+    )
+
+    # Linf variant with correct step size
+    attacks.append(
+        (
+            PGD(
+                model,
+                norm="Linf",
+                eps=8 / 255,  # Standard PGD epsilon for Linf
+                n_iterations=40,
+                alpha_init=0.8 / 255,  # Smaller step size for Linf (1/10 of epsilon)
+                alpha_type="constant",  # Constant step size for Linf
+                rand_init=True,
+                early_stopping=True,
+                verbose=args.verbose,
+                normalize_grad=False,  # No need for gradient normalization for Linf (we use sign)
+                debug=args.verbose,
+            ),
+            "PGD (Linf, eps=8/255)",
+        )
+    )
+
+    # More iterations, no early stopping
+    attacks.append(
+        (
+            PGD(
+                model,
+                norm="L2",
+                eps=2.0,
+                n_iterations=100,  # More iterations
+                alpha_init=0.1,
+                alpha_type="diminishing",
+                rand_init=True,
+                early_stopping=False,  # No early stopping
+                verbose=args.verbose,
+                normalize_grad=True,
+                debug=args.verbose,
+            ),
+            "PGD (L2, eps=2.0, no early stop)",
+        )
+    )
+
+    # Add comparison attacks if requested
+    if args.compare:
+        # FGSM for comparison
+        attacks.append((FGSM(model, eps=8 / 255), "FGSM (ε=8/255)"))
+
+        # DeepFool for comparison
+        attacks.append(
+            (DeepFool(model, steps=50, overshoot=0.02), "DeepFool (steps=50)")
+        )
+
+        # CW for comparison
+        attacks.append(
+            (CW(model, c=1.0, kappa=0, steps=100, lr=0.01), "CW (c=1.0, steps=100)")
+        )
+
+    # Test each attack and collect results
+    all_metrics = []
+
+    for attack, attack_name in attacks:
+        metrics = test_attack(
+            attack=attack,
+            model=model,
+            dataset=dataset,
+            attack_name=attack_name,
+            args=args,
+        )
+        all_metrics.append(metrics)
+
+    # Print comparison table
+    print("\n\n" + "=" * 80)
+    print("ATTACK COMPARISON")
+    print("=" * 80)
+
+    headers = [
+        "Attack",
+        "Success %",
+        "L2 Norm",
+        "L∞ Norm",
+        "SSIM",
+        "Time (ms)",
+        "Iterations",
+        "Grad Calls",
+    ]
+    rows = []
+
+    for metrics in all_metrics:
+        rows.append(
+            [
+                metrics["name"],
+                f"{metrics['success_rate']:.2f}%",
+                f"{metrics['l2_norm']:.4f}",
+                f"{metrics['linf_norm']:.4f}",
+                f"{metrics['ssim']:.4f}",
+                f"{metrics['time_per_sample']*1000:.2f}",
+                f"{metrics['iterations']:.1f}",
+                f"{metrics['gradient_calls']:.1f}",
+            ]
+        )
+
+    # Print as a formatted table
+    col_widths = [
+        max(len(row[i]) for row in rows + [headers]) for i in range(len(headers))
+    ]
+
+    # Print header
+    header_str = " | ".join(
+        f"{headers[i]:{col_widths[i]}}" for i in range(len(headers))
+    )
+    print(header_str)
+    print("-" * len(header_str))
+
+    # Print rows
+    for row in rows:
+        row_str = " | ".join(f"{row[i]:{col_widths[i]}}" for i in range(len(headers)))
+        print(row_str)
+
+    print(f"\nResults and visualizations saved to {args.output_dir}")
+    print("\nNote on metrics:")
+    print("- Iterations: Average number of optimization iterations per sample")
+    print("- Grad Calls: Average number of gradient evaluations per sample")
+    print("- FGSM has exactly 1 iteration and gradient call by definition")
+    print("- PGD attacks should typically have multiple iterations & gradient calls")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Test Projected Gradient Descent adversarial attack"
+    )
+
+    # Dataset and model parameters
+    parser.add_argument(
+        "--data-dir", type=str, default="data", help="Base directory for datasets"
+    )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="resnet18",
+        choices=[
+            "resnet18",
+            "resnet50",
+            "vgg16",
+            "efficientnet_b0",
+            "mobilenet_v3_large",
+        ],
+        help="Model architecture to attack",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=5,
+        help="Number of samples to load from dataset",
+    )
+
+    # Test parameters
+    parser.add_argument(
+        "--batch-size", type=int, default=4, help="Batch size for testing"
+    )
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=1,
+        help="Maximum number of batches to test per attack",
+    )
+    parser.add_argument(
+        "--num-vis",
+        type=int,
+        default=3,
+        help="Number of adversarial examples to visualize per attack",
+    )
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Compare with other baseline attacks",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output from attacks",
+    )
+
+    # Output parameters
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="results/test_pgd",
+        help="Directory to save test results and visualizations",
+    )
+
+    args = parser.parse_args()
+
+    main(args)

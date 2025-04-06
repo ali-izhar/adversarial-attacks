@@ -75,7 +75,16 @@ def project_linf_ball(delta: torch.Tensor, epsilon: float) -> torch.Tensor:
         Projected perturbation tensor
     """
     # Simple element-wise clamping to [-epsilon, epsilon]
-    return torch.clamp(delta, -epsilon, epsilon)
+    projected = torch.clamp(delta, -epsilon, epsilon)
+
+    # Verify that the projection worked correctly - helpful for debugging
+    max_abs_val = projected.abs().max().item()
+    if max_abs_val > epsilon + 1e-5:
+        print(
+            f"WARNING: Linf projection failed! Max abs value: {max_abs_val:.6f} > epsilon: {epsilon:.6f}"
+        )
+
+    return projected
 
 
 def project_perturbation(
@@ -107,6 +116,7 @@ def project_adversarial_example(
     norm: str,
     min_val: float = None,
     max_val: float = None,
+    debug: bool = False,
 ) -> torch.Tensor:
     """
     Project adversarial examples to satisfy both norm constraints and box constraints.
@@ -118,6 +128,7 @@ def project_adversarial_example(
         norm: Type of norm constraint ('L2' or 'Linf')
         min_val: Minimum allowed pixel value (default: None, will be calculated from ImageNet stats)
         max_val: Maximum allowed pixel value (default: None, will be calculated from ImageNet stats)
+        debug: Whether to print debug information about the projection
 
     Returns:
         Projected adversarial examples
@@ -136,11 +147,83 @@ def project_adversarial_example(
     # Calculate perturbation
     delta = x_adv - x_orig
 
+    # Check original perturbation size before projection
+    if debug:
+        if norm.lower() == "l2":
+            orig_norm = (
+                torch.norm(delta.reshape(delta.shape[0], -1), p=2, dim=1).mean().item()
+            )
+            print(
+                f"Before projection - L2 norm: {orig_norm:.6f}, epsilon: {epsilon:.6f}"
+            )
+        elif norm.lower() == "linf":
+            orig_norm = (
+                torch.norm(delta.reshape(delta.shape[0], -1), p=float("inf"), dim=1)
+                .mean()
+                .item()
+            )
+            print(
+                f"Before projection - Linf norm: {orig_norm:.6f}, epsilon: {epsilon:.6f}"
+            )
+
     # Project perturbation according to norm constraint
     delta = project_perturbation(delta, epsilon, norm)
+
+    # Check perturbation size after projection
+    if debug:
+        if norm.lower() == "l2":
+            projected_norm = (
+                torch.norm(delta.reshape(delta.shape[0], -1), p=2, dim=1).mean().item()
+            )
+            print(
+                f"After projection - L2 norm: {projected_norm:.6f}, epsilon: {epsilon:.6f}"
+            )
+        elif norm.lower() == "linf":
+            projected_norm = (
+                torch.norm(delta.reshape(delta.shape[0], -1), p=float("inf"), dim=1)
+                .mean()
+                .item()
+            )
+            print(
+                f"After projection - Linf norm: {projected_norm:.6f}, epsilon: {epsilon:.6f}"
+            )
+
+        # Check if any values exceed epsilon
+        if norm.lower() == "linf":
+            max_abs_val = delta.abs().max().item()
+            if max_abs_val > epsilon + 1e-5:
+                print(
+                    f"WARNING: Linf projection failed! Max abs value: {max_abs_val:.6f} > epsilon: {epsilon:.6f}"
+                )
 
     # Apply perturbation and ensure valid image range
     projected = x_orig + delta
 
     # Clamp to valid normalized range
-    return project_box(projected, min_val, max_val)
+    result = project_box(projected, min_val, max_val)
+
+    # Final validation check
+    if debug:
+        final_delta = result - x_orig
+        if norm.lower() == "l2":
+            final_norm = (
+                torch.norm(final_delta.reshape(final_delta.shape[0], -1), p=2, dim=1)
+                .mean()
+                .item()
+            )
+            print(
+                f"Final (after box clipping) - L2 norm: {final_norm:.6f}, epsilon: {epsilon:.6f}"
+            )
+        elif norm.lower() == "linf":
+            final_norm = (
+                torch.norm(
+                    final_delta.reshape(final_delta.shape[0], -1), p=float("inf"), dim=1
+                )
+                .mean()
+                .item()
+            )
+            print(
+                f"Final (after box clipping) - Linf norm: {final_norm:.6f}, epsilon: {epsilon:.6f}"
+            )
+
+    return result

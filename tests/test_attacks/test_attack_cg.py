@@ -331,15 +331,18 @@ def main(args):
                 norm="L2",
                 eps=1.0,  # Standard L2 epsilon
                 n_iter=40,  # Similar to PGD defaults
-                fletcher_reeves=True,
+                beta_method="HS",  # Use Hestenes-Stiefel formula (best for nonlinear optimization)
                 restart_interval=10,
-                tv_lambda=0.3,
-                color_lambda=0.5,
-                rand_init=True,
+                tv_lambda=0.2,
+                color_lambda=0.3,
+                perceptual_lambda=0.4,
+                rand_init=False,
+                fgsm_init=True,
+                adaptive_restart=True,
                 early_stopping=True,
                 verbose=args.verbose,
             ),
-            "CG (L2, eps=1.0)",
+            "CG (L2, eps=1.0, HS)",
         )
     )
 
@@ -351,11 +354,14 @@ def main(args):
                 norm="L2",
                 eps=3.0,  # Larger L2 epsilon
                 n_iter=40,
-                fletcher_reeves=False,  # Use Polak-Ribière formula
+                beta_method="PR",  # Use Polak-Ribière formula
                 restart_interval=10,
-                tv_lambda=0.3,
-                color_lambda=0.5,
-                rand_init=True,
+                tv_lambda=0.2,
+                color_lambda=0.3,
+                perceptual_lambda=0.4,
+                rand_init=False,
+                fgsm_init=True,
+                adaptive_restart=True,
                 early_stopping=True,
                 verbose=args.verbose,
             ),
@@ -371,11 +377,14 @@ def main(args):
                 norm="Linf",
                 eps=8 / 255,  # Standard PGD epsilon
                 n_iter=40,
-                fletcher_reeves=True,
+                beta_method="HS",  # Use Hestenes-Stiefel formula
                 restart_interval=10,
-                tv_lambda=0.3,
-                color_lambda=0.5,
-                rand_init=True,
+                tv_lambda=0.2,
+                color_lambda=0.3,
+                perceptual_lambda=0.4,
+                rand_init=False,
+                fgsm_init=True,
+                adaptive_restart=True,
                 early_stopping=True,
                 verbose=args.verbose,
             ),
@@ -391,15 +400,18 @@ def main(args):
                 norm="L2",
                 eps=2.0,
                 n_iter=100,  # More iterations
-                fletcher_reeves=True,
+                beta_method="FR",  # Use Fletcher-Reeves formula
                 restart_interval=10,
-                tv_lambda=0.3,
-                color_lambda=0.5,
-                rand_init=True,
+                tv_lambda=0.2,
+                color_lambda=0.3,
+                perceptual_lambda=0.4,
+                rand_init=False,
+                fgsm_init=True,
+                adaptive_restart=True,
                 early_stopping=False,  # No early stopping
                 verbose=args.verbose,
             ),
-            "CG (L2, eps=2.0, no early stop)",
+            "CG (L2, eps=2.0, FR, no early stop)",
         )
     )
 
@@ -512,7 +524,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-samples",
         type=int,
-        default=50,
+        default=5,
         help="Number of samples to load from dataset",
     )
 
@@ -523,7 +535,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-batches",
         type=int,
-        default=5,
+        default=1,
         help="Maximum number of batches to test per attack",
     )
     parser.add_argument(
