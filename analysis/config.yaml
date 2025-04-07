@@ -21,7 +21,7 @@ evaluation:
 
 # Attack method configuration
 attack:
-  method: "DeepFool"  # Options: FGSM, FFGSM, DeepFool, CW, MIFGSM, PGD
+  method: "DeepFool"  # Options: FGSM, FFGSM, DeepFool, CW, PGD
   norm_types:
     - "Linf" 
     - "L2"
@@ -102,24 +102,6 @@ attack:
         steps: 200                 # More iterations for targeted attacks
         learning_rate: 0.01        # Same learning rate
         abort_early: true          # Enable early stopping for efficiency
-
-    MIFGSM:
-      untargeted:
-        loss_fn: "cross_entropy"   # Standard loss function
-        steps: 10                  # Standard iterations from Dong et al. (2018)
-        alpha: 0.01                # Standard step size per iteration
-        decay_factor: 0.9          # Standard momentum value (renamed from momentum)
-        eps_values:
-          Linf: [8/255]            # Standard value for imperceptible attacks
-          L2: [0.5]                # Standard value for balanced attacks
-      targeted:
-        loss_fn: "cross_entropy"   # Standard loss function
-        steps: 20                  # More iterations for targeted attacks 
-        alpha: 0.01                # Same step size
-        decay_factor: 0.9          # Same momentum value
-        eps_values:
-          Linf: [16/255, 32/255]   # Larger epsilon for targeted attacks
-          L2: [2.0, 3.0]           # Larger epsilon for targeted attacks
 
 # Target method configuration for targeted attacks
 target_methods:

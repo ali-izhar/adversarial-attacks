@@ -2,7 +2,7 @@
 """
 Tests for all baseline attacks.
 
-This script tests all baseline attacks (FGSM, FFGSM, DeepFool, CW, MIFGSM)
+This script tests all baseline attacks (FGSM, FFGSM, DeepFool, CW, PGD)
 on a small sample of ImageNet data, using our model wrappers
 that handle normalized inputs correctly.
 
@@ -31,7 +31,6 @@ from src.attacks.baseline.attack_fgsm import FGSM
 from src.attacks.baseline.attack_ffgsm import FFGSM
 from src.attacks.baseline.attack_deepfool import DeepFool
 from src.attacks.baseline.attack_cw import CW
-from src.attacks.baseline.attack_mifgsm import MIFGSM
 from src.attacks.attack_pgd import PGD
 
 
@@ -386,20 +385,6 @@ def create_attack(model, attack_type, config, targeted=False):
         attack = CW(model, c=c, kappa=kappa, steps=steps, lr=lr)
         attack_name = f"CW (c={c}, kappa={kappa}, steps={steps})"
 
-    elif attack_type == "MIFGSM":
-        # Get MIFGSM parameters from config
-        params = attack_params["MIFGSM"][attack_mode]
-        eps_value = params["eps_values"]["Linf"][0]  # Default to first epsilon value
-        eps = parse_fraction(eps_value)
-        steps = params["steps"]
-        alpha = params["alpha"]
-        decay_factor = params["decay_factor"]
-
-        attack = MIFGSM(
-            model, eps=eps, steps=steps, alpha=alpha, decay_factor=decay_factor
-        )
-        attack_name = f"MIFGSM (steps={steps}, ε={eps:.4f})"
-
     elif attack_type == "PGD":
         # Get PGD parameters from config
         params = attack_params["PGD"][attack_mode]
@@ -497,7 +482,7 @@ def main(args):
     for attack_type in args.attacks:
         if attack_type.lower() == "all":
             # Load all configured attacks
-            for attack_name in ["FGSM", "FFGSM", "DeepFool", "CW", "MIFGSM", "PGD"]:
+            for attack_name in ["FGSM", "FFGSM", "DeepFool", "CW", "PGD"]:
                 try:
                     attack, attack_name = create_attack(
                         model, attack_name, config, args.targeted
@@ -514,7 +499,6 @@ def main(args):
                 "FFGSM": "FFGSM",
                 "DEEPFOOL": "DeepFool",
                 "CW": "CW",
-                "MIFGSM": "MIFGSM",
                 "PGD": "PGD",
             }
             try:
@@ -626,7 +610,7 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["all"],
-        choices=["all", "fgsm", "ffgsm", "deepfool", "cw", "mifgsm", "pgd"],
+        choices=["all", "fgsm", "ffgsm", "deepfool", "cw", "pgd"],
         help="Which attacks to test",
     )
 
