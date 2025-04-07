@@ -3,8 +3,8 @@
 # Dataset configuration
 dataset:
   name: "imagenet"
-  num_images: 2    # Number of images to evaluate per model
-  image_dir: "data/imagenet"
+  num_images: 5    # Number of images to evaluate per model
+  image_dir: "data"
 
 # Model configuration
 models:
@@ -21,50 +21,112 @@ evaluation:
 
 # Attack method configuration
 attack:
-  method: "DeepFool"  # Options: FGSM, FFGSM, DeepFool, CW, MIFGSM
-  targeted: false
+  method: "DeepFool"  # Options: FGSM, FFGSM, DeepFool, CW, MIFGSM, PGD
   norm_types:
-    - "Linf" # untargeted attack
-    - "L2" # targeted attack
+    - "Linf" 
+    - "L2"
   
   # Method-specific parameters
   params:
     FGSM:
-      loss_fn: "cross_entropy"  # Standard loss function for classification
-      eps_values:
-        Linf: [0.03]  # Standard value from Goodfellow et al. (2014)
-        L2: [0.5]     # Standard value for L2 attacks
+      untargeted:
+        loss_fn: "cross_entropy"
+        eps_values:
+          Linf: [4/255, 8/255]  # Standard values from Goodfellow et al. (2014)
+          L2: [0.5, 1.0]        # Standard values for L2 attacks
+      targeted:
+        loss_fn: "cross_entropy"
+        eps_values:
+          Linf: [16/255, 32/255]  # Larger values needed for targeted attacks
+          L2: [2.0, 3.0]         # Larger perturbations for targeted attacks
 
     FFGSM:
-      loss_fn: "cross_entropy"  # Standard loss function
-      alpha_linf: 0.4  # Standard value for L∞ norm from Wong et al. (2020)
-      alpha_l2: 0.25   # Standard value for L2 norm from Wong et al. (2020)
-      eps_values:
-        Linf: [0.03]  # Should achieve ~87.5% success with SSIM > 0.8
-        L2: [0.3]     # Should achieve good success with SSIM > 0.7
+      untargeted:
+        loss_fn: "cross_entropy"
+        alpha_linf: 0.4   # Standard value from Wong et al. (2020)
+        alpha_l2: 0.25    # Standard value for L2 norm
+        eps_values:
+          Linf: [8/255]   # Should achieve ~87.5% success with SSIM > 0.8
+          L2: [0.5]       # Should achieve good success with SSIM > 0.7
+      targeted:
+        loss_fn: "cross_entropy"
+        alpha_linf: 0.5   # Increased alpha for targeted attacks
+        alpha_l2: 0.35    # Increased alpha for targeted attacks
+        eps_values:
+          Linf: [16/255, 32/255]  # Larger epsilon for targeted attacks
+          L2: [2.0, 3.0]          # Larger epsilon for targeted attacks
+    
+    PGD:
+      untargeted:
+        loss_fn: "cross_entropy"
+        n_iterations: 40           # Standard value from Madry et al. (2017)
+        alpha_init_linf: 2/255     # Step size for Linf (1/10 of epsilon)
+        alpha_init_l2: 0.1         # Step size for L2
+        alpha_type: "diminishing"  # Step size scheduling
+        rand_init: true            # Random initialization
+        early_stopping: true       # Stop when attack succeeds
+        eps_values:
+          Linf: [8/255]            # Standard value from Madry et al. (2017)
+          L2: [1.0, 2.0]           # Common values for L2 PGD
+      targeted:
+        loss_fn: "cross_entropy"
+        n_iterations: 100          # More iterations for targeted attacks
+        alpha_init_linf: 2/255     # Step size for Linf (smaller relative to eps)
+        alpha_init_l2: 0.15        # Slightly larger step size for targeted
+        alpha_type: "constant"     # Constant step size works better for targeted
+        rand_init: true            # Random initialization
+        early_stopping: true       # Stop when attack succeeds
+        eps_values:
+          Linf: [16/255, 32/255]   # Larger values for targeted attacks
+          L2: [2.0, 3.0]           # Larger values for targeted attacks
     
     DeepFool:
-      num_classes: 1000  # ImageNet class count
-      overshoot_values: [0.02]  # Standard value from Moosavi-Dezfooli et al. (2016)
-      max_iter: 50  # Reduced from 100 as DeepFool typically converges quickly
-      early_stopping: true  # Enable early stopping to improve efficiency
+      # DeepFool is typically untargeted only
+      untargeted:
+        num_classes: 1000          # ImageNet class count
+        overshoot_values: [0.02]   # Standard value from Moosavi-Dezfooli et al. (2016)
+        steps: 50                  # Reduced from 100 as DeepFool converges quickly
+        early_stopping: true       # Enable early stopping to improve efficiency
+        top_k_classes: 10          # Only consider top-k classes for efficiency
     
     CW:
-      confidence_values: [0.0]  # Standard value from Carlini & Wagner (2017)
-      c_init: 0.001  # More conservative initialization for better optimization
-      max_iter: 1000  # Standard number of iterations for thorough optimization
-      binary_search_steps: 9  # Increased from 5 to 9 for more accurate c value
-      learning_rate: 0.01  # Standard learning rate from original paper
-      abort_early: true  # Enable early stopping for efficiency
+      untargeted:
+        confidence_values: [0.0]   # Standard value from Carlini & Wagner (2017)
+        c_init: 1.0                # Initial c value
+        steps: 100                 # Standard number of iterations for untargeted
+        learning_rate: 0.01        # Standard learning rate from original paper
+        abort_early: true          # Enable early stopping for efficiency
+      targeted:
+        confidence_values: [20.0]  # Higher confidence for targeted attacks
+        c_init: 10.0               # Higher c value for targeted attacks
+        steps: 200                 # More iterations for targeted attacks
+        learning_rate: 0.01        # Same learning rate
+        abort_early: true          # Enable early stopping for efficiency
 
     MIFGSM:
-      loss_fn: "cross_entropy"  # Standard loss function
-      steps: 10  # Standard number of iterations from Dong et al. (2018)
-      alpha: 0.01  # Standard step size per iteration
-      momentum: 0.9  # Standard momentum value from original paper
-      eps_values:
-        Linf: [0.03]  # Standard value for imperceptible attacks
-        L2: [0.3]     # Standard value for balanced attacks
+      untargeted:
+        loss_fn: "cross_entropy"   # Standard loss function
+        steps: 10                  # Standard iterations from Dong et al. (2018)
+        alpha: 0.01                # Standard step size per iteration
+        decay_factor: 0.9          # Standard momentum value (renamed from momentum)
+        eps_values:
+          Linf: [8/255]            # Standard value for imperceptible attacks
+          L2: [0.5]                # Standard value for balanced attacks
+      targeted:
+        loss_fn: "cross_entropy"   # Standard loss function
+        steps: 20                  # More iterations for targeted attacks 
+        alpha: 0.01                # Same step size
+        decay_factor: 0.9          # Same momentum value
+        eps_values:
+          Linf: [16/255, 32/255]   # Larger epsilon for targeted attacks
+          L2: [2.0, 3.0]           # Larger epsilon for targeted attacks
+
+# Target method configuration for targeted attacks
+target_methods:
+  random:
+    description: "Select random target classes"
+  least-likely:
+    description: "Select least-likely predicted classes (hardest targets)"
 
 # Tables configuration for reporting results
 tables:
