@@ -110,6 +110,14 @@ class Attack(object):
         # Metrics tracking for paper evaluation
         self.reset_metrics()
 
+        # Tracking metrics
+        self.total_samples = 0
+        self.attack_success_count = 0
+        self.total_time = 0.0
+        self.total_iterations = 0
+        self.total_gradient_calls = 0
+        self.prev_gradient_calls = 0  # Track gradient calls between function calls
+
     def reset_metrics(self):
         """Reset all tracked metrics for a new evaluation."""
         self.total_iterations = 0

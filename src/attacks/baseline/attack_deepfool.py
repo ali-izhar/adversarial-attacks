@@ -33,7 +33,9 @@ class DeepFool(Attack):
         bounded to valid normalized image values.
     """
 
-    def __init__(self, model, steps=50, overshoot=0.02, early_stopping=True):
+    def __init__(
+        self, model, steps=30, overshoot=0.02, early_stopping=True, top_k_classes=10
+    ):
         """Initialize DeepFool attack.
 
         Args:
@@ -41,6 +43,7 @@ class DeepFool(Attack):
             steps: Maximum number of iterations for finding adversarial examples
             overshoot: Parameter to enhance the noise (default: 0.02)
             early_stopping: Whether to stop early when all samples are fooled (default: True)
+            top_k_classes: Number of top classes to consider when finding closest boundary (default: 10)
         """
         super().__init__("DeepFool", model)
         self.steps = steps  # Maximum number of iterations
@@ -48,6 +51,7 @@ class DeepFool(Attack):
         self.early_stopping = (
             early_stopping  # Whether to stop early when all samples are fooled
         )
+        self.top_k_classes = top_k_classes  # Only consider top-k classes for efficiency
         # DeepFool only supports untargeted attacks
         self.supported_mode = ["default"]
 
@@ -68,165 +72,60 @@ class DeepFool(Attack):
 
         # Clone and detach input images to avoid modifying the original data
         images = images.clone().detach().to(self.device)
-        original_images = images.clone()
         labels = labels.clone().detach().to(self.device)
 
         batch_size = len(images)
 
         # Calculate normalized min/max bounds for valid pixel values
-        # Create normalized min/max bounds directly - ensuring correct dtype
         min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
         max_bound = ((1 - self.mean) / self.std).to(
             device=images.device, dtype=images.dtype
         )
-
         min_bound = min_bound.view(1, 3, 1, 1)
         max_bound = max_bound.view(1, 3, 1, 1)
 
-        # Get initial predictions and prepare tensors
-        with torch.no_grad():
-            logits = self.get_logits(images)
-            _, initial_preds = torch.max(logits, dim=1)
-
-        # Keep track of fooled samples
-        fooled = initial_preds != labels
-        target_labels = initial_preds.clone()
-
-        # Initialize perturbations with zeros
-        r_tot = torch.zeros_like(images)
-        curr_steps = 0
-
-        # Store per-sample iterations for metrics
+        # Process each sample individually to avoid inplace operation issues
+        adv_images = []
         sample_iterations = torch.zeros(batch_size, device=self.device)
-        active_samples = torch.logical_not(fooled)
+        target_preds = torch.zeros_like(labels)
 
-        # Get the number of classes
-        num_classes = logits.shape[1]
+        # Track the total number of gradient calls before this function
+        prev_grad_calls = self.total_gradient_calls
 
-        # Main iteration loop
-        while active_samples.any() and curr_steps < self.steps:
-            # Keep only active samples (not yet fooled)
-            curr_images = torch.clamp(images + r_tot, min=min_bound, max=max_bound)
-            curr_images.requires_grad_(True)
+        # Process each image individually
+        for i in range(batch_size):
+            x = images[i : i + 1].clone()
+            y = labels[i : i + 1]
 
-            # Get current logits
-            fs = self.get_logits(curr_images)
-
-            # Get predictions
-            _, curr_preds = torch.max(fs, dim=1)
-
-            # Update fooled status
-            newly_fooled = (curr_preds != labels) & active_samples
-            if newly_fooled.any():
-                target_labels[newly_fooled] = curr_preds[newly_fooled]
-                active_samples = torch.logical_not(newly_fooled) & active_samples
-
-                # Exit early if all samples are fooled and early_stopping is enabled
-                if self.early_stopping and not active_samples.any():
-                    break
-
-            # For active samples, compute gradients for all classes in parallel
-            pert = torch.ones_like(curr_images) * float("inf")
-
-            # Process only active samples
-            active_idx = torch.where(active_samples)[0]
-            if len(active_idx) == 0:
-                break
-
-            # For each active sample, find closest boundary
-            for i in active_idx:
-                # Current sample and true label
-                x_i = curr_images[i : i + 1].detach().requires_grad_(True)
-                true_label = labels[i].item()
-
-                # Get current prediction and logits
-                fs_i = self.get_logits(x_i)[0]
-                f_0 = fs_i[true_label]
-
-                # Find gradient for true class
-                if x_i.grad is not None:
-                    x_i.grad.zero_()
-                f_0.backward(retain_graph=True)
-                self.total_gradient_calls += 1
-                grad_0 = x_i.grad.clone()
-
-                # Find the closest decision boundary
-                min_dist = float("inf")
-                closest_k = -1
-                w_k_best = None
-                f_k_best = None
-
-                # Compute gradients for other classes
-                for k in range(num_classes):
-                    if k == true_label:
-                        continue
-
-                    # Reset gradients
-                    if x_i.grad is not None:
-                        x_i.grad.zero_()
-
-                    # Compute gradient for class k
-                    fs_i[k].backward(retain_graph=(k < num_classes - 1))
-                    self.total_gradient_calls += 1
-
-                    # Compute decision boundary parameters
-                    w_k = x_i.grad.clone() - grad_0
-                    f_k = fs_i[k] - f_0
-
-                    # Skip if gradient is too small
-                    w_k_norm = torch.norm(w_k.flatten())
-                    if w_k_norm < 1e-8:
-                        continue
-
-                    # Compute distance to boundary
-                    dist_k = torch.abs(f_k) / w_k_norm
-
-                    # Update if this boundary is closer
-                    if dist_k < min_dist:
-                        min_dist = dist_k
-                        closest_k = k
-                        w_k_best = w_k
-                        f_k_best = f_k
-
-                # Compute perturbation
-                if closest_k >= 0:
-                    w_k_norm = torch.norm(w_k_best.flatten())
-                    r_i = torch.abs(f_k_best) / (w_k_norm**2 + 1e-10) * w_k_best
-                    pert[i : i + 1] = r_i
-
-                # Update sample iterations count
-                sample_iterations[i] += 1
-
-            # Apply perturbation with overshoot
-            r_tot = r_tot + (1 + self.overshoot) * pert
-
-            # Ensure the perturbed images are within valid normalized range
-            perturbed_images = torch.clamp(
-                original_images + r_tot, min=min_bound, max=max_bound
+            # Use the individual implementation for each sample
+            fooled, iters, adv_x, target_class = self._attack_single_sample(
+                x, y, self.steps, min_bound, max_bound
             )
-            r_tot = perturbed_images - original_images
 
-            # Update images for next iteration (no need to clone since we don't modify)
-            images = original_images
+            # Update metrics
+            sample_iterations[i] = iters
+            target_preds[i] = target_class
+            adv_images.append(adv_x)
 
-            # Count iterations for all active samples
-            self.total_iterations += active_samples.sum().item()
-            curr_steps += 1
-
-        # Final perturbed images
-        adv_images = torch.clamp(
-            original_images + r_tot, min=min_bound, max=max_bound
-        ).detach()
+        # Concatenate results
+        adv_batch = torch.cat(adv_images, dim=0)
 
         # Calculate perturbation metrics
-        perturbation_metrics = self.compute_perturbation_metrics(
-            original_images, adv_images
-        )
+        perturbation_metrics = self.compute_perturbation_metrics(images, adv_batch)
 
-        # Print metrics for reporting
-        avg_iters = sample_iterations.sum().item() / batch_size
+        # Calculate number of fooled samples
+        with torch.no_grad():
+            preds = self.get_logits(adv_batch).argmax(dim=1)
+            fooled_count = (preds != labels).sum().item()
+
+        # Record metrics
+        avg_iters = sample_iterations.float().mean().item()
+        grad_calls = self.total_gradient_calls - prev_grad_calls
+        avg_grad_calls = grad_calls / batch_size
+
+        # Print stats
         print(
-            f"DeepFool stats: avg iterations={avg_iters:.2f}, fooled {batch_size - active_samples.sum().item()}/{batch_size} samples"
+            f"DeepFool stats: avg iterations={avg_iters:.2f}, fooled {fooled_count}/{batch_size} samples, avg gradient calls={avg_grad_calls:.2f}"
         )
         print(
             f"DeepFool metrics - L2: {perturbation_metrics['l2_norm']:.4f}, L∞: {perturbation_metrics['linf_norm']:.4f}, SSIM: {perturbation_metrics['ssim']:.4f}"
@@ -236,100 +135,134 @@ class DeepFool(Attack):
         end_time = time.time()
         self.total_time += end_time - start_time
 
-        return adv_images, target_labels
+        return adv_batch, target_preds
 
-    def _forward_indiv(self, image, label):
-        """Process a single image in DeepFool algorithm.
+    def _attack_single_sample(self, x, y, steps, min_bound, max_bound):
+        """Attack a single sample with DeepFool algorithm.
 
         Args:
-            image: Input image to process (normalized)
-            label: True label of the image
+            x: Single input image (1,C,H,W)
+            y: True label
+            steps: Maximum iterations
+            min_bound: Minimum valid pixel values
+            max_bound: Maximum valid pixel values
 
         Returns:
-            early_stop: Whether to stop processing this image
-            pre: Predicted label
-            perturbation: Perturbation to add to the image
+            (success, iterations, adv_image, target_class)
         """
-        # Get a copy of the image for gradient computation
-        image_copy = image.clone().detach().requires_grad_(True)
+        # Get true label as scalar
+        true_label = y.item()
 
-        # Calculate normalized min/max bounds for valid pixel values
-        # Create normalized min/max bounds directly - ensuring correct dtype
-        min_bound = (-self.mean / self.std).to(device=image.device, dtype=image.dtype)
-        max_bound = ((1 - self.mean) / self.std).to(
-            device=image.device, dtype=image.dtype
+        # Initialize
+        adv_x = x.clone()
+        iterations = 0
+        current_pred = None
+        target_class = -1
+        fooled = False
+
+        # Track perturbation
+        total_perturbation = torch.zeros_like(x)
+
+        # Main iteration loop
+        for i in range(steps):
+            # If already fooled, exit
+            if fooled:
+                break
+
+            # Create input that requires gradient
+            adv_x_i = adv_x.clone().detach().requires_grad_(True)
+
+            # Forward pass
+            logits = self.get_logits(adv_x_i)
+
+            # Check current prediction
+            current_pred = logits[0].argmax().item()
+
+            # If already misclassified, we're done
+            if current_pred != true_label:
+                fooled = True
+                target_class = current_pred
+                break
+
+            # Get top-k classes (exclude true class)
+            values, indices = torch.topk(logits[0], k=self.top_k_classes + 1)
+
+            # Filter out true class
+            other_classes = []
+            for idx in indices:
+                if idx.item() != true_label and len(other_classes) < self.top_k_classes:
+                    other_classes.append(idx.item())
+
+            # Ensure we have at least one class
+            if not other_classes:
+                # Use the second highest class if true_label is the highest
+                if indices[0].item() == true_label:
+                    other_classes = [indices[1].item()]
+                else:
+                    other_classes = [indices[0].item()]
+
+            # Get gradient of true class
+            true_logit = logits[0, true_label]
+            adv_x_i.grad = None
+            true_logit.backward(retain_graph=True)
+            self.total_gradient_calls += 1
+            grad_true = adv_x_i.grad.clone()
+
+            # Find closest boundary
+            min_distance = float("inf")
+            closest_grad = None
+            closest_diff = None
+            closest_class = -1
+
+            # Check each class
+            for k in other_classes:
+                adv_x_i.grad = None
+                logits[0, k].backward(retain_graph=(k != other_classes[-1]))
+                self.total_gradient_calls += 1
+
+                # Compute w_k (difference in gradients)
+                grad_k = adv_x_i.grad.clone()
+                grad_diff = grad_k - grad_true
+
+                # Compute f_k (difference in logits)
+                f_diff = logits[0, k].item() - true_logit.item()
+
+                # Compute distance to boundary
+                grad_norm = torch.norm(grad_diff.flatten())
+                if grad_norm < 1e-6:
+                    continue
+
+                dist = abs(f_diff) / grad_norm
+
+                # Update if this is the closest boundary
+                if dist < min_distance:
+                    min_distance = dist
+                    closest_grad = grad_diff
+                    closest_diff = f_diff
+                    closest_class = k
+
+            # If no valid boundary found, break
+            if closest_grad is None:
+                break
+
+            # Compute perturbation
+            pert_norm = torch.norm(closest_grad.flatten())
+            perturbation = abs(closest_diff) / (pert_norm**2 + 1e-8) * closest_grad
+
+            # Add perturbation
+            adv_x = torch.clamp(adv_x + perturbation, min=min_bound, max=max_bound)
+            total_perturbation = adv_x - x
+
+            # Update iteration count
+            iterations += 1
+
+        # Apply overshoot to final perturbation
+        adv_x = torch.clamp(
+            x + (1 + self.overshoot) * total_perturbation, min=min_bound, max=max_bound
         )
 
-        min_bound = min_bound.view(1, 3, 1, 1)
-        max_bound = max_bound.view(1, 3, 1, 1)
-
-        # Get model predictions
-        fs = self.get_logits(image_copy)[0]
-        _, pre = torch.max(fs, dim=0)
-
-        # If already misclassified, return early with no perturbation
-        if pre != label:
-            return (True, pre, torch.zeros_like(image))
-
-        # Get the score for the true class
-        f_0 = fs[label]
-
-        # Get scores for all other classes
-        wrong_classes = [i for i in range(len(fs)) if i != label]
-
-        # If no wrong classes (unlikely in practice), return early
-        if len(wrong_classes) == 0:
-            return (True, pre, torch.zeros_like(image))
-
-        f_k = fs[wrong_classes]
-
-        # Calculate gradients for each wrong class
-        w_k = []
-        for k in wrong_classes:
-            if image_copy.grad is not None:
-                image_copy.grad.zero_()
-            fs[k].backward(retain_graph=True)
-            # Each backward pass counts as a gradient call
-            self.total_gradient_calls += 1
-            w_k.append(image_copy.grad.clone().detach())
-
-        # Calculate gradients for true class
-        if image_copy.grad is not None:
-            image_copy.grad.zero_()
-        f_0.backward(retain_graph=False)
-        # This backward pass is another gradient call
-        self.total_gradient_calls += 1
-        w_0 = image_copy.grad.clone().detach()
-
-        # Calculate the difference in scores and gradients
-        f_prime = f_k - f_0
-        w_prime = torch.stack(w_k) - w_0
-
-        # Calculate the distance to decision boundary for each class
-        # Add small epsilon to avoid division by zero
-        norm_values = torch.norm(nn.Flatten()(w_prime), p=2, dim=1)
-        value = torch.abs(f_prime) / (norm_values + 1e-10)
-
-        # Find the closest decision boundary
-        _, hat_L = torch.min(value, 0)
-
-        # Calculate the perturbation vector
-        norm_squared = torch.norm(w_prime[hat_L], p=2) ** 2
-        # Add small epsilon to avoid division by zero
-        delta = torch.abs(f_prime[hat_L]) * w_prime[hat_L] / (norm_squared + 1e-10)
-
-        # Determine the target label
-        target_label = wrong_classes[hat_L]
-
-        # Return the perturbation with overshoot
-        perturbation = (1 + self.overshoot) * delta
-
-        # Make sure the perturbation respects image bounds when applied
-        perturbed_image = image + perturbation
-        perturbed_image = torch.clamp(perturbed_image, min=min_bound, max=max_bound)
-        perturbation = perturbed_image - image
-
-        return (False, target_label, perturbation)
+        # Return results
+        return fooled, iterations, adv_x, target_class
 
     def _construct_jacobian(self, y, x):
         """Construct the Jacobian matrix of model outputs with respect to inputs.
