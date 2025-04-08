@@ -428,7 +428,7 @@ def main(args):
     config_path = (
         args.config_file
         if args.config_file
-        else os.path.join(project_root, "analysis", "config.yaml")
+        else os.path.join(project_root, "config", "config.yaml")
     )
     print(f"Loading configuration from {config_path}")
     config = load_config(config_path)
@@ -601,7 +601,7 @@ if __name__ == "__main__":
         "--config-file",
         type=str,
         default=None,
-        help="Path to configuration file (defaults to analysis/config.yaml)",
+        help="Path to configuration file (defaults to config/config.yaml)",
     )
 
     # Attack selection
