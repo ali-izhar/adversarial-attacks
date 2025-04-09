@@ -357,8 +357,31 @@ def create_attack(model, attack_type, config, targeted=False, pgd_variant=None):
         eps_value = params["eps_values"]["Linf"][0]  # Default to first epsilon value
         eps = parse_fraction(eps_value)
 
-        attack = LBFGS(model, eps=eps)
-        attack_name = f"LBFGS (ε={eps:.4f})"
+        # Get enhanced LBFGS parameters with defaults if not present
+        n_iterations = params.get("n_iterations", 50)
+        history_size = params.get("history_size", 10)
+        initial_const = params.get("initial_const", 1e-2)
+        binary_search_steps = params.get("binary_search_steps", 5)
+        const_factor = params.get("const_factor", 10.0)
+        repeat_search = params.get("repeat_search", True)
+        rand_init = params.get("rand_init", True)
+        init_std = params.get("init_std", 0.01)
+
+        attack = LBFGS(
+            model,
+            norm=norm_type,
+            eps=eps,
+            n_iterations=n_iterations,
+            history_size=history_size,
+            initial_const=initial_const,
+            binary_search_steps=binary_search_steps,
+            const_factor=const_factor,
+            repeat_search=repeat_search,
+            rand_init=rand_init,
+            init_std=init_std,
+        )
+
+        attack_name = f"LBFGS (ε={eps:.4f}, bs_steps={binary_search_steps})"
 
     elif attack_type == "PGD":
         # Get the base PGD parameters from config
