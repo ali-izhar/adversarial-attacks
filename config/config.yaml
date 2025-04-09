@@ -3,7 +3,7 @@
 # Dataset configuration
 dataset:
   name: "imagenet"
-  num_images: 5    # Number of images to evaluate per model
+  num_images: 10    # Number of images to evaluate per model
   image_dir: "data"
 
 # Model configuration
@@ -56,30 +56,6 @@ attack:
           Linf: [16/255, 32/255]  # Larger epsilon for targeted attacks
           L2: [2.0, 3.0]          # Larger epsilon for targeted attacks
     
-    PGD:
-      untargeted:
-        loss_fn: "cross_entropy"
-        n_iterations: 40           # Standard value from Madry et al. (2017)
-        alpha_init_linf: 2/255     # Step size for Linf (1/10 of epsilon)
-        alpha_init_l2: 0.1         # Step size for L2
-        alpha_type: "diminishing"  # Step size scheduling
-        rand_init: true            # Random initialization
-        early_stopping: true       # Stop when attack succeeds
-        eps_values:
-          Linf: [8/255]            # Standard value from Madry et al. (2017)
-          L2: [1.0, 2.0]           # Common values for L2 PGD
-      targeted:
-        loss_fn: "cross_entropy"
-        n_iterations: 100          # More iterations for targeted attacks
-        alpha_init_linf: 2/255     # Step size for Linf (smaller relative to eps)
-        alpha_init_l2: 0.15        # Slightly larger step size for targeted
-        alpha_type: "constant"     # Constant step size works better for targeted
-        rand_init: true            # Random initialization
-        early_stopping: true       # Stop when attack succeeds
-        eps_values:
-          Linf: [16/255, 32/255]   # Larger values for targeted attacks
-          L2: [2.0, 3.0]           # Larger values for targeted attacks
-    
     DeepFool:
       # DeepFool is typically untargeted only
       untargeted:
@@ -102,6 +78,118 @@ attack:
         steps: 200                 # More iterations for targeted attacks
         learning_rate: 0.01        # Same learning rate
         abort_early: true          # Enable early stopping for efficiency
+    
+    CG:
+      untargeted:
+        loss_fn: "cross_entropy"
+        n_iterations: 50           # Standard iterations for untargeted (Feng et al., 2020)
+        beta_type: "polak_ribiere" # Most effective conjugacy formula from studies
+        line_search_fn: "armijo"   # Efficient line search method
+        max_line_search: 10        # Balance between precision and speed
+        initial_step: 1.0          # Conservative initial step size
+        restart_freq: 10           # Restart every 10 iterations to avoid conjugacy loss
+        rand_init: true            # Random initialization within epsilon ball
+        early_stopping: true       # Stop when attack succeeds
+        eps_values:
+          Linf: [8/255, 16/255]   # Common values from adversarial literature
+          L2: [1.0, 2.0]          # Standard L2 bounds
+      targeted:
+        loss_fn: "cross_entropy"
+        n_iterations: 100          # More iterations needed for targeted attacks
+        beta_type: "fletcher_reeves" # More stable for targeted attacks
+        line_search_fn: "strong_wolfe" # More precise line search for targeted
+        max_line_search: 20        # More line search iterations for precision
+        initial_step: 0.5          # Smaller initial step for better convergence
+        restart_freq: 15           # Less frequent restarts for targeted
+        rand_init: true            # Random initialization
+        early_stopping: true       # Stop when attack succeeds
+        eps_values:
+          Linf: [16/255, 32/255]  # Larger perturbations for targeted
+          L2: [2.0, 4.0]          # Larger L2 bounds for targeted
+
+    LBFGS:
+      untargeted:
+        loss_fn: "cross_entropy"
+        n_iterations: 50           # Standard from Zhu et al. (2019)
+        history_size: 10           # Common value for L-BFGS memory
+        line_search_fn: "armijo"   # Efficient line search
+        max_line_search: 15        # Balance between precision and speed
+        initial_step: 3.0          # Aggressive initial step size
+        rand_init: true           # Random initialization
+        init_std: 0.05            # Standard deviation for initialization
+        grad_scale: 1.0           # No gradient scaling
+        early_stopping: true      # Stop when attack succeeds
+        eps_values:
+          Linf: [8/255, 16/255]   # Standard bounds from literature
+          L2: [1.0, 2.0]          # Common L2 bounds
+      targeted:
+        loss_fn: "cross_entropy"
+        n_iterations: 100          # More iterations for targeted attacks
+        history_size: 15           # Larger memory for better Hessian approximation
+        line_search_fn: "strong_wolfe" # More precise line search
+        max_line_search: 20        # More line search iterations
+        initial_step: 2.0          # More conservative step size
+        rand_init: true           # Random initialization
+        init_std: 0.01            # Smaller initialization
+        grad_scale: 1.5           # Slightly aggressive updates
+        early_stopping: true      # Stop when attack succeeds
+        eps_values:
+          Linf: [16/255, 32/255]  # Larger bounds for targeted
+          L2: [2.0, 4.0]          # Larger L2 bounds
+
+    PGD:
+      # PGD variants for testing different configurations
+      variants:
+        basic:
+          name: "PGD (Basic)"
+          params:
+            norm: "Linf"
+            n_iterations: 40
+            step_size: 2/255
+            loss_fn: "cross_entropy"
+            rand_init: true
+            early_stopping: true
+        
+        momentum:
+          name: "PGD (Margin)"
+          params:
+            norm: "Linf"
+            n_iterations: 40
+            step_size: 2/255
+            loss_fn: "margin"
+            rand_init: true
+            early_stopping: true
+        
+        l2:
+          name: "PGD (L2)"
+          params:
+            norm: "L2"
+            n_iterations: 40
+            step_size: 0.1
+            loss_fn: "cross_entropy"
+            rand_init: true
+            early_stopping: true
+      
+      untargeted:
+        loss_fn: "margin"         # Better loss function than cross_entropy
+        n_iterations: 40           # From Madry et al. (2017)
+        step_size_linf: 2/255      # Step size (standard practice)
+        step_size_l2: 0.1          # Step size for L2 attacks
+        rand_init: true            # Random initialization (important for PGD)
+        early_stopping: true       # Stop when attack succeeds
+        eps_values:
+          Linf: [8/255]           # Standard from Madry et al. (2017)
+          L2: [1.0, 2.0]          # Common L2 bounds
+      targeted:
+        loss_fn: "carlini_wagner"  # Better for targeted attacks
+        n_iterations: 100          # More iterations for targeted
+        step_size_linf: 2/255      # Same step size ratio
+        step_size_l2: 0.15         # Slightly larger for targeted
+        rand_init: true            # Random initialization
+        early_stopping: true       # Stop when attack succeeds
+        eps_values:
+          Linf: [16/255, 32/255]  # Larger eps for targeted
+          L2: [2.0, 3.0]          # Larger L2 bounds
 
 # Target method configuration for targeted attacks
 target_methods:

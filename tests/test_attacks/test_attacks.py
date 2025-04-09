@@ -1,12 +1,12 @@
-#!/usr/bin/env python
 """
-Test script for the Projected Gradient Descent (PGD) adversarial attack.
+Test optimization attacks.
 
-This script tests the PGD attack on a sample of ImageNet data
-and compares it with other baseline attacks.
+This script tests all optimization attacks (PGD, CG, LBFGS)
+on a small sample of ImageNet data, using our model wrappers
+that handle normalized inputs correctly.
 
 Usage:
-    python -m tests.test_attacks.test_attack_pgd
+    python -m tests.test_attacks.test_attacks
 """
 
 import os
@@ -15,6 +15,7 @@ import time
 import torch
 import argparse
 import matplotlib.pyplot as plt
+import yaml
 from tqdm import tqdm
 
 # Add the project root to the path
@@ -25,10 +26,15 @@ sys.path.insert(0, project_root)
 
 from src.datasets.imagenet import get_dataset, get_dataloader
 from src.models.wrappers import get_model
-from src.attacks.baseline.attack_fgsm import FGSM
-from src.attacks.baseline.attack_deepfool import DeepFool
-from src.attacks.baseline.attack_cw import CW
-from src.attacks.attack_pgd import PGD
+from src.attacks import CG, PGD, LBFGS
+
+# The PGD variants are now defined in config.yaml
+
+
+def load_config(config_path):
+    """Load configuration from YAML file."""
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
 
 
 def plot_images(
@@ -171,6 +177,18 @@ def test_attack(attack, model, dataset, attack_name, args):
     # Reset attack metrics before starting
     attack.reset_metrics()
 
+    # Set targeted mode if requested
+    if args.targeted:
+        if args.target_method == "random":
+            attack.set_mode_targeted_random()
+            attack_name = f"{attack_name} (Targeted-Random)"
+        elif args.target_method == "least-likely":
+            attack.set_mode_targeted_least_likely()
+            attack_name = f"{attack_name} (Targeted-Least-Likely)"
+        print(f"Running in targeted mode: {args.target_method}")
+    else:
+        attack.set_mode_default()
+
     # Track successful adversarial examples for visualization
     successful_examples = []
 
@@ -211,21 +229,8 @@ def test_attack(attack, model, dataset, attack_name, args):
 
         # Attack only the correctly classified samples
         attack_start = time.time()
-
-        # For debugging
-        if args.verbose:
-            print(
-                f"  Initial metrics: iterations={attack.total_iterations}, gradient_calls={attack.total_gradient_calls}"
-            )
-
         adversarial = attack(correct_inputs, correct_labels)
         attack_time = time.time() - attack_start
-
-        # For debugging
-        if args.verbose:
-            print(
-                f"  After attack: iterations={attack.total_iterations}, gradient_calls={attack.total_gradient_calls}"
-            )
 
         # Explicitly evaluate attack success - this updates the attack's internal metrics
         batch_success_rate, success_mask, (orig_preds, adv_preds) = (
@@ -234,7 +239,7 @@ def test_attack(attack, model, dataset, attack_name, args):
 
         # Explicitly compute perturbation metrics - this updates the attack's internal metrics
         perturbation_metrics = attack.compute_perturbation_metrics(
-            correct_inputs, adversarial, success_mask
+            correct_inputs, adversarial
         )
 
         # Display batch results
@@ -275,7 +280,9 @@ def test_attack(attack, model, dataset, attack_name, args):
     metrics["ssim"] = attack_metrics["ssim"]
     metrics["time_per_sample"] = attack_metrics["time_per_sample"]
     metrics["iterations"] = attack_metrics["iterations"]
-    metrics["gradient_calls"] = attack_metrics["gradient_calls"]
+    metrics["gradient_calls"] = attack_metrics.get(
+        "gradient_calls", 0
+    )  # May not exist in simplified version
 
     # Print metrics summary
     print(f"\nMetrics for {attack_name}:")
@@ -285,7 +292,8 @@ def test_attack(attack, model, dataset, attack_name, args):
     print(f"  SSIM: {metrics['ssim']:.4f}")
     print(f"  Time per sample: {metrics['time_per_sample']*1000:.2f} ms")
     print(f"  Average iterations: {metrics['iterations']:.2f}")
-    print(f"  Average gradient calls: {metrics['gradient_calls']:.2f}")
+    if "gradient_calls" in attack_metrics:
+        print(f"  Average gradient calls: {metrics['gradient_calls']:.2f}")
 
     # Create visualizations
     os.makedirs(args.output_dir, exist_ok=True)
@@ -303,16 +311,188 @@ def test_attack(attack, model, dataset, attack_name, args):
     return metrics
 
 
+def parse_fraction(value):
+    """Parse string fractions like '4/255' or convert floats."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and "/" in value:
+        num, denom = value.split("/")
+        return float(num) / float(denom)
+    return float(value)
+
+
+def create_attack(model, attack_type, config, targeted=False, pgd_variant=None):
+    """
+    Create an attack instance based on the attack type and configuration.
+
+    Args:
+        model: The model to attack
+        attack_type: Type of attack (e.g., "CG", "LBFGS", "PGD")
+        config: Configuration dictionary
+        targeted: Whether the attack is targeted
+        pgd_variant: Specific PGD variant to use (basic, margin, l2)
+
+    Returns:
+        tuple: (attack_instance, attack_name)
+    """
+    # Get attack parameters from config
+    attack_params = config["attack"]["params"]
+    attack_mode = "targeted" if targeted else "untargeted"
+
+    # Default norm type (first in the list)
+    norm_type = config["attack"]["norm_types"][0]
+
+    if attack_type == "CG":
+        # Get CG parameters from config
+        params = attack_params["CG"][attack_mode]
+        eps_value = params["eps_values"]["Linf"][0]  # Default to first epsilon value
+        eps = parse_fraction(eps_value)
+
+        attack = CG(model, eps=eps)
+        attack_name = f"CG (ε={eps:.4f})"
+
+    elif attack_type == "LBFGS":
+        # Get LBFGS parameters from config
+        params = attack_params["LBFGS"][attack_mode]
+        eps_value = params["eps_values"]["Linf"][0]  # Default to first epsilon value
+        eps = parse_fraction(eps_value)
+
+        attack = LBFGS(model, eps=eps)
+        attack_name = f"LBFGS (ε={eps:.4f})"
+
+    elif attack_type == "PGD":
+        # Get the base PGD parameters from config
+        params = attack_params["PGD"][attack_mode]
+        norm = "Linf"  # Default norm
+        eps_value = params["eps_values"][norm][0]  # Default to first epsilon value
+        eps = parse_fraction(eps_value)
+
+        # If a specific PGD variant is specified, use that configuration
+        if pgd_variant:
+            # Get variant configuration from config file
+            if pgd_variant in config["attack"]["params"]["PGD"]["variants"]:
+                variant_config = config["attack"]["params"]["PGD"]["variants"][
+                    pgd_variant
+                ]
+                variant_params = variant_config["params"].copy()
+
+                # Set epsilon based on config file
+                variant_params["eps"] = eps
+
+                # Parse any fraction values
+                for param, value in variant_params.items():
+                    if isinstance(value, str) and "/" in value:
+                        variant_params[param] = parse_fraction(value)
+
+                # Create attack with the specific variant parameters
+                attack = PGD(model, **variant_params)
+                attack_name = f"{variant_config['name']} (ε={eps:.4f})"
+
+                # Add information about special features to the name
+                if variant_params.get("loss_fn") != "cross_entropy":
+                    attack_name += f", {variant_params.get('loss_fn')} loss"
+            else:
+                print(
+                    f"Warning: PGD variant '{pgd_variant}' not found in config, using default"
+                )
+                # Fall back to standard PGD parameters
+                n_iterations = params["n_iterations"]
+                step_size_key = f"step_size_{norm.lower()}"
+                step_size = parse_fraction(params[step_size_key])
+                rand_init = params["rand_init"]
+                early_stopping = params["early_stopping"]
+                loss_fn = params.get("loss_fn", "cross_entropy")
+
+                attack = PGD(
+                    model,
+                    norm=norm,
+                    eps=eps,
+                    n_iterations=n_iterations,
+                    step_size=step_size,
+                    loss_fn=loss_fn,
+                    rand_init=rand_init,
+                    early_stopping=early_stopping,
+                )
+                attack_name = (
+                    f"PGD ({norm}, ε={eps:.4f}, steps={n_iterations}, {loss_fn})"
+                )
+        else:
+            # Use standard PGD parameters from config
+            n_iterations = params["n_iterations"]
+            step_size_key = f"step_size_{norm.lower()}"
+            step_size = parse_fraction(params[step_size_key])
+            rand_init = params["rand_init"]
+            early_stopping = params["early_stopping"]
+            loss_fn = params.get("loss_fn", "cross_entropy")
+
+            attack = PGD(
+                model,
+                norm=norm,
+                eps=eps,
+                n_iterations=n_iterations,
+                step_size=step_size,
+                loss_fn=loss_fn,
+                rand_init=rand_init,
+                early_stopping=early_stopping,
+            )
+            attack_name = f"PGD ({norm}, ε={eps:.4f}, steps={n_iterations}, {loss_fn})"
+
+    else:
+        raise ValueError(f"Unknown attack type: {attack_type}")
+
+    return attack, attack_name
+
+
 def main(args):
     """Main function."""
     # Set device
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {args.device}")
 
+    # Load configuration file
+    config_path = (
+        args.config_file
+        if args.config_file
+        else os.path.join(project_root, "config", "config.yaml")
+    )
+    print(f"Loading configuration from {config_path}")
+    config = load_config(config_path)
+
+    # Validate targeted attack parameters
+    if args.targeted and not args.target_method:
+        print("Error: --target-method must be specified when --targeted is set")
+        print("Choose from: random, least-likely")
+        return
+
+    # Adjust output directory if needed for targeted attacks
+    if args.targeted:
+        args.output_dir = os.path.join(
+            args.output_dir, f"targeted_{args.target_method}"
+        )
+
     # Load dataset
     print("Loading ImageNet dataset...")
+    num_samples = args.num_samples or config["dataset"]["num_images"]
+    data_dir = args.data_dir or config["dataset"]["image_dir"]
+
+    # Make sure we're using a valid path for the dataset
+    if not os.path.exists(data_dir) and "imagenet" not in data_dir:
+        # Try with imagenet subdirectory
+        alt_path = os.path.join(data_dir, "imagenet")
+        if os.path.exists(alt_path):
+            data_dir = alt_path
+        else:
+            # Try with project root
+            project_data_dir = os.path.join(project_root, "data", "imagenet")
+            if os.path.exists(project_data_dir):
+                data_dir = project_data_dir
+            else:
+                # Just use as is and let the dataset loader handle it
+                pass
+
+    print(f"Using dataset path: {data_dir}")
     dataset = get_dataset(
-        dataset_name="imagenet", data_dir=args.data_dir, max_samples=args.num_samples
+        dataset_name="imagenet", data_dir=data_dir, max_samples=num_samples
     )
 
     # Load model
@@ -320,103 +500,63 @@ def main(args):
     model = get_model(args.model_name).to(args.device)
     model.eval()
 
-    # Initialize attacks to compare
+    # Initialize attacks based on config
     attacks = []
 
-    # Standard PGD L2 attack
-    attacks.append(
-        (
-            PGD(
-                model,
-                norm="L2",
-                eps=1.0,  # Standard L2 epsilon
-                n_iterations=40,  # Default iterations
-                alpha_init=0.1,  # Step size
-                alpha_type="diminishing",  # Step size schedule
-                rand_init=True,
-                early_stopping=True,
-                verbose=args.verbose,
-                normalize_grad=True,  # Enable gradient normalization for L2
-                debug=args.verbose,  # Only show debug info if verbose flag is set
-            ),
-            "PGD (L2, eps=1.0)",
-        )
-    )
-
-    # Larger L2 epsilon
-    attacks.append(
-        (
-            PGD(
-                model,
-                norm="L2",
-                eps=3.0,  # Larger L2 epsilon
-                n_iterations=40,
-                alpha_init=0.3,  # Larger step size
-                alpha_type="diminishing",
-                rand_init=True,
-                early_stopping=True,
-                verbose=args.verbose,
-                normalize_grad=True,  # Enable gradient normalization for L2
-                debug=args.verbose,
-            ),
-            "PGD (L2, eps=3.0)",
-        )
-    )
-
-    # Linf variant with correct step size
-    attacks.append(
-        (
-            PGD(
-                model,
-                norm="Linf",
-                eps=8 / 255,  # Standard PGD epsilon for Linf
-                n_iterations=40,
-                alpha_init=0.8 / 255,  # Smaller step size for Linf (1/10 of epsilon)
-                alpha_type="constant",  # Constant step size for Linf
-                rand_init=True,
-                early_stopping=True,
-                verbose=args.verbose,
-                normalize_grad=False,  # No need for gradient normalization for Linf (we use sign)
-                debug=args.verbose,
-            ),
-            "PGD (Linf, eps=8/255)",
-        )
-    )
-
-    # More iterations, no early stopping
-    attacks.append(
-        (
-            PGD(
-                model,
-                norm="L2",
-                eps=2.0,
-                n_iterations=100,  # More iterations
-                alpha_init=0.1,
-                alpha_type="diminishing",
-                rand_init=True,
-                early_stopping=False,  # No early stopping
-                verbose=args.verbose,
-                normalize_grad=True,
-                debug=args.verbose,
-            ),
-            "PGD (L2, eps=2.0, no early stop)",
-        )
-    )
-
-    # Add comparison attacks if requested
-    if args.compare:
-        # FGSM for comparison
-        attacks.append((FGSM(model, eps=8 / 255), "FGSM (ε=8/255)"))
-
-        # DeepFool for comparison
-        attacks.append(
-            (DeepFool(model, steps=50, overshoot=0.02), "DeepFool (steps=50)")
-        )
-
-        # CW for comparison
-        attacks.append(
-            (CW(model, c=1.0, kappa=0, steps=100, lr=0.01), "CW (c=1.0, steps=100)")
-        )
+    # Map attack request to creation function
+    for attack_type in args.attacks:
+        if attack_type.lower() == "all":
+            # Load all configured attacks
+            for attack_name in ["CG", "LBFGS", "PGD"]:
+                try:
+                    attack, attack_name = create_attack(
+                        model, attack_name, config, args.targeted
+                    )
+                    attacks.append((attack, attack_name))
+                except Exception as e:
+                    print(f"Error creating attack {attack_name}: {e}")
+        elif attack_type.lower() == "pgd":
+            # If pgd_variant is specified, create that specific variant
+            if args.pgd_variant:
+                try:
+                    attack, attack_name = create_attack(
+                        model,
+                        "PGD",
+                        config,
+                        args.targeted,
+                        pgd_variant=args.pgd_variant,
+                    )
+                    attacks.append((attack, attack_name))
+                except Exception as e:
+                    print(f"Error creating PGD variant {args.pgd_variant}: {e}")
+            else:
+                # Create default PGD
+                try:
+                    attack, attack_name = create_attack(
+                        model, "PGD", config, args.targeted
+                    )
+                    attacks.append((attack, attack_name))
+                except Exception as e:
+                    print(f"Error creating PGD attack: {e}")
+        else:
+            # Load specific attack type (normalize to uppercase for consistent comparison)
+            attack_type_upper = attack_type.upper()
+            # Map to correct case based on known attack types
+            attack_type_map = {
+                "CG": "CG",
+                "LBFGS": "LBFGS",
+                "PGD": "PGD",
+            }
+            try:
+                if attack_type_upper in attack_type_map:
+                    attack, attack_name = create_attack(
+                        model, attack_type_map[attack_type_upper], config, args.targeted
+                    )
+                    attacks.append((attack, attack_name))
+                else:
+                    print(f"Unknown attack type: {attack_type}")
+            except Exception as e:
+                print(f"Error creating attack {attack_type}: {e}")
 
     # Test each attack and collect results
     all_metrics = []
@@ -436,16 +576,7 @@ def main(args):
     print("ATTACK COMPARISON")
     print("=" * 80)
 
-    headers = [
-        "Attack",
-        "Success %",
-        "L2 Norm",
-        "L∞ Norm",
-        "SSIM",
-        "Time (ms)",
-        "Iterations",
-        "Grad Calls",
-    ]
+    headers = ["Attack", "Success %", "L2 Norm", "L∞ Norm", "SSIM", "Time (ms)"]
     rows = []
 
     for metrics in all_metrics:
@@ -457,8 +588,6 @@ def main(args):
                 f"{metrics['linf_norm']:.4f}",
                 f"{metrics['ssim']:.4f}",
                 f"{metrics['time_per_sample']*1000:.2f}",
-                f"{metrics['iterations']:.1f}",
-                f"{metrics['gradient_calls']:.1f}",
             ]
         )
 
@@ -479,22 +608,19 @@ def main(args):
         row_str = " | ".join(f"{row[i]:{col_widths[i]}}" for i in range(len(headers)))
         print(row_str)
 
+    attack_mode = "targeted" if args.targeted else "untargeted"
     print(f"\nResults and visualizations saved to {args.output_dir}")
-    print("\nNote on metrics:")
-    print("- Iterations: Average number of optimization iterations per sample")
-    print("- Grad Calls: Average number of gradient evaluations per sample")
-    print("- FGSM has exactly 1 iteration and gradient call by definition")
-    print("- PGD attacks should typically have multiple iterations & gradient calls")
+    print(f"Attack mode: {attack_mode.upper()}")
+    if args.targeted:
+        print(f"Target method: {args.target_method}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Test Projected Gradient Descent adversarial attack"
-    )
+    parser = argparse.ArgumentParser(description="Test baseline adversarial attacks")
 
     # Dataset and model parameters
     parser.add_argument(
-        "--data-dir", type=str, default="data", help="Base directory for datasets"
+        "--data-dir", type=str, default=None, help="Base directory for datasets"
     )
     parser.add_argument(
         "--model-name",
@@ -512,8 +638,35 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-samples",
         type=int,
-        default=5,
-        help="Number of samples to load from dataset",
+        default=None,
+        help="Number of samples to load from dataset (defaults to config value)",
+    )
+
+    # Config file
+    parser.add_argument(
+        "--config-file",
+        type=str,
+        default=None,
+        help="Path to configuration file (defaults to config/config.yaml)",
+    )
+
+    # Attack selection
+    parser.add_argument(
+        "--attacks",
+        type=str,
+        nargs="+",
+        default=["all"],
+        choices=["all", "cg", "lbfgs", "pgd"],
+        help="Which attacks to test",
+    )
+
+    # PGD variant selection
+    parser.add_argument(
+        "--pgd-variant",
+        type=str,
+        choices=["basic", "momentum", "l2"],
+        default="momentum",
+        help="Specific PGD variant to test (for --attacks pgd)",
     )
 
     # Test parameters
@@ -532,23 +685,26 @@ if __name__ == "__main__":
         default=3,
         help="Number of adversarial examples to visualize per attack",
     )
-    parser.add_argument(
-        "--compare",
-        action="store_true",
-        help="Compare with other baseline attacks",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose output from attacks",
-    )
 
     # Output parameters
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="results/test_pgd",
+        default="results/test_attacks",
         help="Directory to save test results and visualizations",
+    )
+
+    # Targeted attack parameters
+    parser.add_argument(
+        "--targeted",
+        action="store_true",
+        help="Run targeted attacks",
+    )
+    parser.add_argument(
+        "--target-method",
+        type=str,
+        choices=["random", "least-likely"],
+        help="Target method for targeted attacks",
     )
 
     args = parser.parse_args()

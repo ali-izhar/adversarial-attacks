@@ -16,7 +16,7 @@ from .baseline.attack import Attack
 from .optimize.cg import ConjugateGradientOptimizer
 
 
-class ConjugateGradient(Attack):
+class CG(Attack):
     r"""
     Enhanced Conjugate Gradient Attack with perceptual constraints.
 
@@ -60,7 +60,7 @@ class ConjugateGradient(Attack):
         verbose: bool = False,
     ):
         # Initialize the Attack base class
-        super().__init__("ConjugateGradient", model)
+        super().__init__("CG", model)
 
         # Record attack parameters
         self.norm = norm
