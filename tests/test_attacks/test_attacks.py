@@ -160,8 +160,10 @@ def test_attack(attack, model, dataset, attack_name, args):
 
     # Calculate optimal batch size based on number of samples
     num_samples = len(dataset)
-    batch_size = min(args.batch_size, num_samples) if args.batch_size > 0 else num_samples
-    
+    batch_size = (
+        min(args.batch_size, num_samples) if args.batch_size > 0 else num_samples
+    )
+
     # Create a dataloader with the calculated batch size
     dataloader = get_dataloader(dataset, batch_size=batch_size, shuffle=False)
     class_names = dataset.class_names
@@ -170,7 +172,7 @@ def test_attack(attack, model, dataset, attack_name, args):
     metrics = {
         "name": attack_name,
         "attack_success_rate": 0.0,  # How often attack succeeded in fooling the model
-        "model_accuracy": 0.0,       # Model's accuracy on adversarial examples
+        "model_accuracy": 0.0,  # Model's accuracy on adversarial examples
         "l2_norm": 0.0,
         "linf_norm": 0.0,
         "ssim": 0.0,
@@ -200,8 +202,10 @@ def test_attack(attack, model, dataset, attack_name, args):
     # Run attack on all batches
     total_samples = 0
     total_batches = len(dataloader)
-    
-    print(f"Processing {num_samples} samples in {total_batches} batches (batch size: {batch_size})")
+
+    print(
+        f"Processing {num_samples} samples in {total_batches} batches (batch size: {batch_size})"
+    )
 
     for batch_idx, (inputs, labels) in enumerate(
         tqdm(dataloader, desc=f"{attack_name}", total=total_batches)
@@ -288,13 +292,17 @@ def test_attack(attack, model, dataset, attack_name, args):
 
     # Combine metrics
     metrics["attack_success_rate"] = attack_metrics["success_rate"]
-    metrics["model_accuracy"] = 100 - attack_metrics["success_rate"]  # Since attack success = 100 - model accuracy
+    metrics["model_accuracy"] = (
+        100 - attack_metrics["success_rate"]
+    )  # Since attack success = 100 - model accuracy
     metrics["l2_norm"] = attack_metrics["l2_norm"]
     metrics["linf_norm"] = attack_metrics["linf_norm"]
     metrics["ssim"] = attack_metrics["ssim"]
     metrics["time_per_sample"] = attack_metrics["time_per_sample"]
     metrics["iterations"] = attack_metrics["iterations"]
-    metrics["gradient_calls"] = attack_metrics.get("gradient_calls", 0)  # May not exist in simplified version
+    metrics["gradient_calls"] = attack_metrics.get(
+        "gradient_calls", 0
+    )  # May not exist in simplified version
 
     # Print metrics summary
     print(f"\nMetrics for {attack_name}:")
@@ -612,7 +620,15 @@ def main(args):
     print("ATTACK COMPARISON")
     print("=" * 80)
 
-    headers = ["Attack", "Attack Success %", "Model Accuracy %", "L2 Norm", "L∞ Norm", "SSIM", "Time (ms)"]
+    headers = [
+        "Attack",
+        "Attack Success %",
+        "Model Accuracy %",
+        "L2 Norm",
+        "L∞ Norm",
+        "SSIM",
+        "Time (ms)",
+    ]
     rows = []
 
     for metrics in all_metrics:
