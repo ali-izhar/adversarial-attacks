@@ -161,8 +161,14 @@ def test_attack(attack, model, dataset, attack_name, args):
     print(f"Testing {attack_name} attack")
     print(f"{'='*50}")
 
-    # Create a dataloader with the test batch size
-    dataloader = get_dataloader(dataset, batch_size=args.batch_size, shuffle=False)
+    # Calculate optimal batch size based on number of samples
+    num_samples = len(dataset)
+    batch_size = (
+        min(args.batch_size, num_samples) if args.batch_size > 0 else num_samples
+    )
+
+    # Create a dataloader with the calculated batch size
+    dataloader = get_dataloader(dataset, batch_size=batch_size, shuffle=False)
     class_names = dataset.class_names
 
     # Store metrics
@@ -195,15 +201,17 @@ def test_attack(attack, model, dataset, attack_name, args):
     # Track successful adversarial examples for visualization
     successful_examples = []
 
-    # Run attack on a limited number of batches
+    # Run attack on all batches
     total_samples = 0
+    total_batches = len(dataloader)
+
+    print(
+        f"Processing {num_samples} samples in {total_batches} batches (batch size: {batch_size})"
+    )
 
     for batch_idx, (inputs, labels) in enumerate(
-        tqdm(dataloader, desc=f"{attack_name}")
+        tqdm(dataloader, desc=f"{attack_name}", total=total_batches)
     ):
-        if batch_idx >= args.max_batches:
-            break
-
         # Ensure inputs and labels are the right type and on the right device
         inputs = inputs.to(args.device).float()  # Explicitly convert to float32
         labels = labels.to(args.device)
@@ -219,7 +227,7 @@ def test_attack(attack, model, dataset, attack_name, args):
             correct_mask = original_preds == labels
             if not correct_mask.any():
                 print(
-                    f"  All samples in this batch are already misclassified, skipping"
+                    f"  All samples in batch {batch_idx+1}/{total_batches} are already misclassified, skipping"
                 )
                 continue
 
@@ -247,7 +255,7 @@ def test_attack(attack, model, dataset, attack_name, args):
 
         # Display batch results
         print(
-            f"  Batch {batch_idx+1}: Success Rate = {batch_success_rate:.2f}%, "
+            f"  Batch {batch_idx+1}/{total_batches}: Success Rate = {batch_success_rate:.2f}%, "
             f"L2: {perturbation_metrics['l2_norm']:.4f}, "
             f"L∞: {perturbation_metrics['linf_norm']:.4f}, "
             f"SSIM: {perturbation_metrics['ssim']:.4f}"
