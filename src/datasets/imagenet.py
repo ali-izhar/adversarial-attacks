@@ -71,12 +71,7 @@ class ImageNetDataset(Dataset):
             )
 
     def load_class_names(self):
-        """
-        Load class names from imagenet_classes.txt and handle duplicates.
-
-        ImageNet-1k has some duplicate class names (like 'crane' and 'maillot'),
-        where multiple synset IDs map to the same class name.
-        """
+        """Load class names from imagenet_classes.txt."""
         class_file = os.path.join(self.data_dir, "imagenet_classes.txt")
 
         if not os.path.exists(class_file):
@@ -88,41 +83,21 @@ class ImageNetDataset(Dataset):
         if not self.class_names:
             raise ValueError(f"No class names found in {class_file}")
 
-        # Find duplicate class names and their indices
-        name_to_indices: Dict[str, List[int]] = {}
-        for idx, name in enumerate(self.class_names):
-            if name not in name_to_indices:
-                name_to_indices[name] = []
-            name_to_indices[name].append(idx)
-
-        # Report duplicates
-        self.duplicate_classes = {
-            name: indices
-            for name, indices in name_to_indices.items()
-            if len(indices) > 1
-        }
-        if self.duplicate_classes:
-            print("Warning: Found duplicate class names:")
-            for name, indices in self.duplicate_classes.items():
-                print(f"  '{name}' appears at indices: {indices}")
-
-        # Create mapping for class name to indices (handling duplicates)
-        self.class_to_indices = name_to_indices
-
-        # Standard mapping for synset ID to class index
-        # This is particularly important for duplicated class names
-        self.synset_to_idx = {}
-
-        # Known mappings for some common synset IDs
-        # Add specific mappings for duplicated classes
+        # Known synset mappings for special cases
         self.synset_to_idx = {
-            # Specifically handle the "crane" duplicates
-            "n01531178": 134,  # Crane (bird)
-            "n03126707": 517,  # Crane (construction)
-            # Specifically handle the "maillot" duplicates
-            "n03710637": 638,  # Maillot (swimsuit)
-            "n03710721": 639,  # Maillot (tank suit)
+            # Animals and birds
+            "n01531178": 11,  # goldfinch
+            "n02113186": 264,  # Cardigan Welsh Corgi
+            # Objects and clothing
+            "n02963159": 474,  # cardigan (sweater)
+            "n03126707": 517,  # crane (construction)
+            "n03710637": 638,  # maillot (swimsuit)
+            "n03710721": 639,  # maillot (tank suit)
         }
+
+    def normalize_class_name(self, name: str) -> str:
+        """Normalize class name by removing spaces, hyphens, and special characters."""
+        return name.lower().replace(" ", "_").replace("-", "_").replace("'", "").strip()
 
     def get_image_paths(
         self, max_samples: Optional[int] = None
@@ -130,75 +105,51 @@ class ImageNetDataset(Dataset):
         """
         Get list of (image_path, label) tuples from the sample_images directory.
 
-        Handles the case where different synset IDs map to the same class name,
-        by using synset ID to determine the correct class index.
+        Args:
+            max_samples: Optional limit on number of samples to return.
+
+        Returns:
+            List of tuples containing (image_path, class_index).
         """
         img_dir = os.path.join(self.data_dir, "sample_images")
-
         if not os.path.exists(img_dir):
             raise FileNotFoundError(f"Image directory not found at {img_dir}")
+
+        # Create mapping of normalized class names to indices
+        class_to_idx = {
+            self.normalize_class_name(name): idx
+            for idx, name in enumerate(self.class_names)
+        }
 
         image_paths = []
         valid_extensions = (".jpg", ".jpeg", ".png", ".JPEG", ".JPG", ".PNG")
 
         for filename in sorted(os.listdir(img_dir)):
-            if not any(
-                filename.lower().endswith(ext.lower()) for ext in valid_extensions
-            ):
+            if not any(filename.lower().endswith(ext) for ext in valid_extensions):
                 continue
 
             filepath = os.path.join(img_dir, filename)
-            label = None
 
-            # First, try to extract synset ID from filename (format: nXXXXXXXX_classname.JPEG)
-            if "_" in filename:
-                synset_id = filename.split("_")[0]
+            # Extract synset ID and class name
+            if "_" not in filename:
+                continue
 
-                # If synset ID is in our known mapping, use it directly
-                if synset_id in self.synset_to_idx:
-                    label = self.synset_to_idx[synset_id]
-                    image_paths.append((filepath, label))
-                    continue
+            synset_id = filename.split("_")[0]
+            class_name = filename.split("_", 1)[1].split(".")[0]
 
-                # Extract the class name part to match with our class list
-                class_name_part = filename.split("_", 1)[1]
-                if "." in class_name_part:
-                    class_name_part = class_name_part.split(".")[0]
+            # First try synset mapping for special cases
+            if synset_id in self.synset_to_idx:
+                label = self.synset_to_idx[synset_id]
+                image_paths.append((filepath, label))
+                continue
 
-                # Match class name, properly handling duplicates
-                matched_name = None
-                for name in self.class_to_indices:
-                    if name.lower() == class_name_part.lower():
-                        matched_name = name
-                        break
+            # Try exact match with normalized class name
+            normalized_class = self.normalize_class_name(class_name)
+            if normalized_class in class_to_idx:
+                label = class_to_idx[normalized_class]
+                image_paths.append((filepath, label))
 
-                if matched_name:
-                    indices = self.class_to_indices[matched_name]
-
-                    # If duplicate class names exist, handle specially
-                    if len(indices) > 1:
-                        # For special cases, try to disambiguate using synset ID
-                        if synset_id and matched_name in self.duplicate_classes:
-                            if matched_name == "crane":
-                                # Bird crane has synset starting with "n015..."
-                                if synset_id.startswith("n015"):
-                                    label = 134  # Bird crane
-                                else:
-                                    label = 517  # Construction crane
-                            elif matched_name == "maillot":
-                                # Different types of maillot
-                                if synset_id == "n03710637":
-                                    label = 638
-                                else:
-                                    label = 639
-                    else:
-                        # Non-duplicate case, just use the single index
-                        label = indices[0]
-
-                    if label is not None:
-                        image_paths.append((filepath, label))
-
-        print(f"Found {len(image_paths)} valid images")
+        print(f"\nFound {len(image_paths)} valid images")
 
         # Limit to max_samples if specified
         if max_samples is not None and max_samples < len(image_paths):
