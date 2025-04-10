@@ -174,7 +174,8 @@ def test_attack(attack, model, dataset, attack_name, args):
     # Store metrics
     metrics = {
         "name": attack_name,
-        "success_rate": 0.0,
+        "attack_success_rate": 0.0,  # How often attack succeeded in fooling the model
+        "model_accuracy": 0.0,  # Model's accuracy on adversarial examples
         "l2_norm": 0.0,
         "linf_norm": 0.0,
         "ssim": 0.0,
@@ -243,6 +244,12 @@ def test_attack(attack, model, dataset, attack_name, args):
         adversarial = attack(correct_inputs, correct_labels)
         attack_time = time.time() - attack_start
 
+        # Get model predictions on adversarial examples
+        with torch.no_grad():
+            adv_outputs = model(adversarial)
+            _, adv_preds = torch.max(adv_outputs, 1)
+            model_accuracy = (adv_preds == correct_labels).float().mean().item() * 100
+
         # Explicitly evaluate attack success - this updates the attack's internal metrics
         batch_success_rate, success_mask, (orig_preds, adv_preds) = (
             attack.evaluate_attack_success(correct_inputs, adversarial, correct_labels)
@@ -255,7 +262,9 @@ def test_attack(attack, model, dataset, attack_name, args):
 
         # Display batch results
         print(
-            f"  Batch {batch_idx+1}/{total_batches}: Success Rate = {batch_success_rate:.2f}%, "
+            f"  Batch {batch_idx+1}/{total_batches}: "
+            f"Attack Success = {batch_success_rate:.2f}%, "
+            f"Model Accuracy = {model_accuracy:.2f}%, "
             f"L2: {perturbation_metrics['l2_norm']:.4f}, "
             f"L∞: {perturbation_metrics['linf_norm']:.4f}, "
             f"SSIM: {perturbation_metrics['ssim']:.4f}"
@@ -285,7 +294,10 @@ def test_attack(attack, model, dataset, attack_name, args):
     attack_metrics = attack.get_metrics()
 
     # Combine metrics
-    metrics["success_rate"] = attack_metrics["success_rate"]
+    metrics["attack_success_rate"] = attack_metrics["success_rate"]
+    metrics["model_accuracy"] = (
+        100 - attack_metrics["success_rate"]
+    )  # Since attack success = 100 - model accuracy
     metrics["l2_norm"] = attack_metrics["l2_norm"]
     metrics["linf_norm"] = attack_metrics["linf_norm"]
     metrics["ssim"] = attack_metrics["ssim"]
@@ -295,7 +307,8 @@ def test_attack(attack, model, dataset, attack_name, args):
 
     # Print metrics summary
     print(f"\nMetrics for {attack_name}:")
-    print(f"  Success Rate: {metrics['success_rate']:.2f}%")
+    print(f"  Attack Success Rate: {metrics['attack_success_rate']:.2f}%")
+    print(f"  Model Accuracy on Adversarial Examples: {metrics['model_accuracy']:.2f}%")
     print(f"  L2 Norm: {metrics['l2_norm']:.4f}")
     print(f"  L∞ Norm: {metrics['linf_norm']:.4f}")
     print(f"  SSIM: {metrics['ssim']:.4f}")
@@ -538,14 +551,23 @@ def main(args):
     print("ATTACK COMPARISON")
     print("=" * 80)
 
-    headers = ["Attack", "Success %", "L2 Norm", "L∞ Norm", "SSIM", "Time (ms)"]
+    headers = [
+        "Attack",
+        "Attack Success %",
+        "Model Accuracy %",
+        "L2 Norm",
+        "L∞ Norm",
+        "SSIM",
+        "Time (ms)",
+    ]
     rows = []
 
     for metrics in all_metrics:
         rows.append(
             [
                 metrics["name"],
-                f"{metrics['success_rate']:.2f}%",
+                f"{metrics['attack_success_rate']:.2f}%",
+                f"{metrics['model_accuracy']:.2f}%",
                 f"{metrics['l2_norm']:.4f}",
                 f"{metrics['linf_norm']:.4f}",
                 f"{metrics['ssim']:.4f}",
