@@ -442,9 +442,9 @@ class Attack(object):
         self.normalization_used["std"] = std
         self._set_normalization_applied(True)
 
-    def normalize(self, inputs):
+    def apply_normalization(self, inputs):
         """
-        Apply normalization to inputs using stored mean and std.
+        Apply custom normalization to inputs using stored mean and std.
 
         Note: For our current framework, this should rarely be needed since
         inputs from the dataset are already normalized.
@@ -564,13 +564,13 @@ class Attack(object):
         """Change model mode based on training settings."""
         if self._model_training:
             self.model.train()
-            for _, m in self.model.named_modules():
+            for name, m in self.model.named_modules():
                 if not self._batchnorm_training:
                     if "BatchNorm" in m.__class__.__name__:
-                        m = m.eval()
+                        m.eval()
                 if not self._dropout_training:
                     if "Dropout" in m.__class__.__name__:
-                        m = m.eval()
+                        m.eval()
         else:
             self.model.eval()
 
@@ -608,7 +608,7 @@ class Attack(object):
 
         # Calculate perturbation metrics
         perturbation_metrics = self.compute_perturbation_metrics(
-            inputs.to(self.device), adv_inputs
+            inputs.to(self.device), adv_inputs, success_mask
         )
 
         # Update timing information
@@ -964,7 +964,7 @@ class Attack(object):
 
             adv_inputs = self.forward(inputs, labels, *args, **kwargs)
 
-            adv_inputs = self.normalize(adv_inputs)
+            adv_inputs = self.apply_normalization(adv_inputs)
             self._set_normalization_applied(True)
         else:
             adv_inputs = self.forward(inputs, labels, *args, **kwargs)
@@ -1024,3 +1024,13 @@ class Attack(object):
             attacks[name + "." + str(num)] = value
             for subname, subvalue in value.__dict__.get("_attacks").items():
                 attacks[name + "." + subname] = subvalue
+
+    def track_gradient_calls(self, count=1):
+        """Track additional gradient calls that may occur in complex attacks.
+
+        Args:
+            count: Number of additional gradient evaluations to track.
+                  Default is 1. For efficiency, this can be multiplied by
+                  batch size if needed.
+        """
+        self.total_gradient_calls += count

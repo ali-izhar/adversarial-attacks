@@ -214,7 +214,7 @@ def test_attack(attack, model, dataset, attack_name, args):
         tqdm(dataloader, desc=f"{attack_name}", total=total_batches)
     ):
         # Ensure inputs and labels are the right type and on the right device
-        inputs = inputs.to(args.device).float()  # Explicitly convert to float32
+        inputs = inputs.to(args.device, dtype=torch.float32)  # Explicitly set dtype
         labels = labels.to(args.device)
 
         total_samples += inputs.size(0)
@@ -257,7 +257,7 @@ def test_attack(attack, model, dataset, attack_name, args):
 
         # Explicitly compute perturbation metrics - this updates the attack's internal metrics
         perturbation_metrics = attack.compute_perturbation_metrics(
-            correct_inputs, adversarial
+            correct_inputs, adversarial, success_mask
         )
 
         # Display batch results
@@ -356,87 +356,194 @@ def create_attack(model, attack_type, config, targeted=False):
         tuple: (attack_instance, attack_name)
     """
     # Get attack parameters from config
-    attack_params = config["attack"]["params"]
-    attack_mode = "targeted" if targeted else "untargeted"
+    try:
+        attack_params = config.get("attack", {}).get("params", {})
+        if not attack_params:
+            raise ValueError("Missing 'attack.params' section in config")
 
-    # Default norm type (first in the list)
-    norm_type = config["attack"]["norm_types"][0]
+        # Default norm type (first in the list)
+        norm_types = config.get("attack", {}).get("norm_types", ["Linf"])
+        norm_type = norm_types[0]
 
-    if attack_type == "FGSM":
-        # Get FGSM parameters from config
-        params = attack_params["FGSM"][attack_mode]
-        eps_value = params["eps_values"]["Linf"][0]  # Default to first epsilon value
-        eps = parse_fraction(eps_value)
+        if attack_type == "FGSM":
+            # Get FGSM parameters from config
+            if "FGSM" not in attack_params:
+                raise ValueError("Missing FGSM configuration in attack params")
 
-        attack = FGSM(model, eps=eps)
-        attack_name = f"FGSM (ε={eps:.4f})"
+            attack_mode = "targeted" if targeted else "untargeted"
+            if attack_mode not in attack_params["FGSM"]:
+                raise ValueError(f"Missing {attack_mode} mode for FGSM in config")
 
-    elif attack_type == "FFGSM":
-        # Get FFGSM parameters from config
-        params = attack_params["FFGSM"][attack_mode]
-        eps_value = params["eps_values"]["Linf"][0]  # Default to first epsilon value
-        eps = parse_fraction(eps_value)
-        alpha = (
-            parse_fraction(params["alpha_linf"]) * eps
-        )  # Alpha is typically relative to epsilon
+            params = attack_params["FGSM"][attack_mode]
 
-        attack = FFGSM(model, eps=eps, alpha=alpha)
-        attack_name = f"FFGSM (ε={eps:.4f}, α={alpha:.4f})"
+            if (
+                "eps_values" not in params
+                or "Linf" not in params["eps_values"]
+                or not params["eps_values"]["Linf"]
+            ):
+                raise ValueError("Missing epsilon values for FGSM")
 
-    elif attack_type == "DeepFool":
-        # DeepFool is typically untargeted only
-        params = attack_params["DeepFool"]["untargeted"]
-        steps = params["steps"]
-        overshoot = params["overshoot_values"][0]
-        top_k_classes = params.get("top_k_classes", 10)
+            eps_value = params["eps_values"]["Linf"][
+                0
+            ]  # Default to first epsilon value
+            eps = parse_fraction(eps_value)
 
-        attack = DeepFool(
-            model, steps=steps, overshoot=overshoot, top_k_classes=top_k_classes
-        )
-        attack_name = f"DeepFool (steps={steps})"
+            attack = FGSM(model, eps=eps)
+            attack_name = f"FGSM (ε={eps:.4f})"
 
-    elif attack_type == "CW":
-        # Get CW parameters from config
-        params = attack_params["CW"][attack_mode]
-        c = params["c_init"]
-        kappa = params["confidence_values"][0]
-        steps = params["steps"]
-        lr = params["learning_rate"]
+        elif attack_type == "FFGSM":
+            # Get FFGSM parameters from config
+            if "FFGSM" not in attack_params:
+                raise ValueError("Missing FFGSM configuration in attack params")
 
-        attack = CW(model, c=c, kappa=kappa, steps=steps, lr=lr)
-        attack_name = f"CW (c={c}, kappa={kappa}, steps={steps})"
+            attack_mode = "targeted" if targeted else "untargeted"
+            if attack_mode not in attack_params["FFGSM"]:
+                raise ValueError(f"Missing {attack_mode} mode for FFGSM in config")
 
-    elif attack_type == "PGD":
-        # Get PGD parameters from config
-        params = attack_params["PGD"][attack_mode]
-        norm = "Linf"  # Default norm
-        eps_value = params["eps_values"][norm][0]  # Default to first epsilon value
-        eps = parse_fraction(eps_value)
-        n_iterations = params["n_iterations"]
-        alpha_init_value = (
-            params["alpha_init_linf"] if norm == "Linf" else params["alpha_init_l2"]
-        )
-        alpha_init = parse_fraction(alpha_init_value)
-        alpha_type = params["alpha_type"]
-        rand_init = params["rand_init"]
-        early_stopping = params["early_stopping"]
+            params = attack_params["FFGSM"][attack_mode]
 
-        attack = PGD(
-            model,
-            norm=norm,
-            eps=eps,
-            n_iterations=n_iterations,
-            alpha_init=alpha_init,
-            alpha_type=alpha_type,
-            rand_init=rand_init,
-            early_stopping=early_stopping,
-        )
-        attack_name = f"PGD ({norm}, ε={eps:.4f}, steps={n_iterations})"
+            if (
+                "eps_values" not in params
+                or "Linf" not in params["eps_values"]
+                or not params["eps_values"]["Linf"]
+            ):
+                raise ValueError("Missing epsilon values for FFGSM")
 
-    else:
-        raise ValueError(f"Unknown attack type: {attack_type}")
+            eps_value = params["eps_values"]["Linf"][
+                0
+            ]  # Default to first epsilon value
+            eps = parse_fraction(eps_value)
 
-    return attack, attack_name
+            if "alpha_linf" not in params:
+                raise ValueError("Missing alpha_linf parameter for FFGSM")
+
+            alpha = (
+                parse_fraction(params["alpha_linf"]) * eps
+            )  # Alpha is typically relative to epsilon
+
+            attack = FFGSM(model, eps=eps, alpha=alpha)
+            attack_name = f"FFGSM (ε={eps:.4f}, α={alpha:.4f})"
+
+        elif attack_type == "DeepFool":
+            # DeepFool is typically untargeted only
+            if "DeepFool" not in attack_params:
+                raise ValueError("Missing DeepFool configuration in attack params")
+
+            if "untargeted" not in attack_params["DeepFool"]:
+                raise ValueError("Missing untargeted mode for DeepFool in config")
+
+            params = attack_params["DeepFool"]["untargeted"]
+
+            if "steps" not in params:
+                raise ValueError("Missing steps parameter for DeepFool")
+            steps = params["steps"]
+
+            if "overshoot_values" not in params or not params["overshoot_values"]:
+                raise ValueError("Missing overshoot values for DeepFool")
+            overshoot = params["overshoot_values"][0]
+
+            top_k_classes = params.get("top_k_classes", 10)
+
+            attack = DeepFool(
+                model, steps=steps, overshoot=overshoot, top_k_classes=top_k_classes
+            )
+            attack_name = f"DeepFool (steps={steps})"
+
+        elif attack_type == "CW":
+            # Get CW parameters from config
+            if "CW" not in attack_params:
+                raise ValueError("Missing CW configuration in attack params")
+
+            attack_mode = "targeted" if targeted else "untargeted"
+            if attack_mode not in attack_params["CW"]:
+                raise ValueError(f"Missing {attack_mode} mode for CW in config")
+
+            params = attack_params["CW"][attack_mode]
+
+            required_params = ["c_init", "confidence_values", "steps", "learning_rate"]
+            for param in required_params:
+                if param not in params or (
+                    param == "confidence_values" and not params[param]
+                ):
+                    raise ValueError(f"Missing {param} parameter for CW")
+
+            c = params["c_init"]
+            kappa = params["confidence_values"][0]
+            steps = params["steps"]
+            lr = params["learning_rate"]
+
+            attack = CW(model, c=c, kappa=kappa, steps=steps, lr=lr)
+            attack_name = f"CW (c={c}, kappa={kappa}, steps={steps})"
+
+        elif attack_type == "PGD":
+            # Get PGD parameters from config
+            if "PGD" not in attack_params:
+                raise ValueError("Missing PGD configuration in attack params")
+
+            attack_mode = "targeted" if targeted else "untargeted"
+            if attack_mode not in attack_params["PGD"]:
+                raise ValueError(f"Missing {attack_mode} mode for PGD in config")
+
+            params = attack_params["PGD"][attack_mode]
+
+            norm = "Linf"  # Default norm
+
+            if (
+                "eps_values" not in params
+                or norm not in params["eps_values"]
+                or not params["eps_values"][norm]
+            ):
+                raise ValueError(f"Missing epsilon values for PGD with {norm} norm")
+
+            eps_value = params["eps_values"][norm][0]  # Default to first epsilon value
+            eps = parse_fraction(eps_value)
+
+            required_params = [
+                "n_iterations",
+                "alpha_type",
+                "rand_init",
+                "early_stopping",
+            ]
+            for param in required_params:
+                if param not in params:
+                    raise ValueError(f"Missing {param} parameter for PGD")
+
+            n_iterations = params["n_iterations"]
+
+            # Check for alpha init parameters based on norm
+            alpha_init_key = "alpha_init_linf" if norm == "Linf" else "alpha_init_l2"
+            if alpha_init_key not in params:
+                raise ValueError(f"Missing {alpha_init_key} parameter for PGD")
+
+            alpha_init_value = params[alpha_init_key]
+            alpha_init = parse_fraction(alpha_init_value)
+            alpha_type = params["alpha_type"]
+            rand_init = params["rand_init"]
+            early_stopping = params["early_stopping"]
+
+            attack = PGD(
+                model,
+                norm=norm,
+                eps=eps,
+                n_iterations=n_iterations,
+                alpha_init=alpha_init,
+                alpha_type=alpha_type,
+                rand_init=rand_init,
+                early_stopping=early_stopping,
+            )
+            attack_name = f"PGD ({norm}, ε={eps:.4f}, steps={n_iterations})"
+
+        else:
+            raise ValueError(f"Unknown attack type: {attack_type}")
+
+        return attack, attack_name
+
+    except (KeyError, IndexError, ValueError) as e:
+        # More specific error handling with context
+        raise ValueError(f"Error creating {attack_type} attack: {str(e)}")
+    except Exception as e:
+        # Catch other unexpected errors
+        raise RuntimeError(f"Unexpected error creating {attack_type} attack: {str(e)}")
 
 
 def main(args):
@@ -452,7 +559,13 @@ def main(args):
         else os.path.join(project_root, "config", "config.yaml")
     )
     print(f"Loading configuration from {config_path}")
-    config = load_config(config_path)
+
+    try:
+        config = load_config(config_path)
+    except Exception as e:
+        print(f"Error loading config from {config_path}: {str(e)}")
+        print("Please ensure the config file exists and is valid YAML.")
+        return
 
     # Validate targeted attack parameters
     if args.targeted and not args.target_method:
@@ -468,8 +581,10 @@ def main(args):
 
     # Load dataset
     print("Loading ImageNet dataset...")
-    num_samples = args.num_samples or config["dataset"]["num_images"]
-    data_dir = args.data_dir or config["dataset"]["image_dir"]
+    num_samples = args.num_samples or config.get("dataset", {}).get("num_images", 50)
+    data_dir = args.data_dir or config.get("dataset", {}).get(
+        "image_dir", "data/imagenet"
+    )
 
     # Make sure we're using a valid path for the dataset
     if not os.path.exists(data_dir) and "imagenet" not in data_dir:
@@ -487,14 +602,24 @@ def main(args):
                 pass
 
     print(f"Using dataset path: {data_dir}")
-    dataset = get_dataset(
-        dataset_name="imagenet", data_dir=data_dir, max_samples=num_samples
-    )
+    try:
+        dataset = get_dataset(
+            dataset_name="imagenet", data_dir=data_dir, max_samples=num_samples
+        )
+    except Exception as e:
+        print(f"Error loading dataset from {data_dir}: {str(e)}")
+        print("Please ensure the dataset exists and is properly structured.")
+        return
 
     # Load model
     print(f"Loading {args.model_name} model...")
-    model = get_model(args.model_name).to(args.device)
-    model.eval()
+    try:
+        model = get_model(args.model_name).to(args.device)
+        model.eval()
+    except Exception as e:
+        print(f"Error loading model {args.model_name}: {str(e)}")
+        print("Please ensure the model is available and properly implemented.")
+        return
 
     # Initialize attacks based on config
     attacks = []
@@ -509,8 +634,12 @@ def main(args):
                         model, attack_name, config, args.targeted
                     )
                     attacks.append((attack, attack_name))
-                except Exception as e:
+                except ValueError as e:
                     print(f"Error creating attack {attack_name}: {e}")
+                except RuntimeError as e:
+                    print(f"Runtime error with {attack_name}: {e}")
+                except Exception as e:
+                    print(f"Unexpected error with {attack_name}: {e}")
         else:
             # Load specific attack type (normalize to uppercase for consistent comparison)
             attack_type_upper = attack_type.upper()
@@ -530,21 +659,39 @@ def main(args):
                     attacks.append((attack, attack_name))
                 else:
                     print(f"Unknown attack type: {attack_type}")
-            except Exception as e:
+                    print(f"Valid attack types: {', '.join(attack_type_map.keys())}")
+            except ValueError as e:
                 print(f"Error creating attack {attack_type}: {e}")
+            except RuntimeError as e:
+                print(f"Runtime error with {attack_type}: {e}")
+            except Exception as e:
+                print(f"Unexpected error with {attack_type}: {e}")
+
+    # Check if we have any attacks to test
+    if not attacks:
+        print("No valid attacks to test. Exiting.")
+        return
 
     # Test each attack and collect results
     all_metrics = []
 
     for attack, attack_name in attacks:
-        metrics = test_attack(
-            attack=attack,
-            model=model,
-            dataset=dataset,
-            attack_name=attack_name,
-            args=args,
-        )
-        all_metrics.append(metrics)
+        try:
+            metrics = test_attack(
+                attack=attack,
+                model=model,
+                dataset=dataset,
+                attack_name=attack_name,
+                args=args,
+            )
+            all_metrics.append(metrics)
+        except Exception as e:
+            print(f"Error testing {attack_name}: {e}")
+            print("Continuing with next attack...")
+
+    if not all_metrics:
+        print("All attack tests failed. Exiting.")
+        return
 
     # Print comparison table
     print("\n\n" + "=" * 80)
@@ -604,10 +751,11 @@ if __name__ == "__main__":
 
     # Dataset and model parameters
     parser.add_argument(
-        "--data-dir", type=str, default=None, help="Base directory for datasets"
+        "--data-dir", "-d", type=str, default=None, help="Base directory for datasets"
     )
     parser.add_argument(
         "--model-name",
+        "-m",
         type=str,
         default="resnet18",
         choices=[
@@ -621,6 +769,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--num-samples",
+        "-n",
         type=int,
         default=None,
         help="Number of samples to load from dataset (defaults to config value)",
@@ -629,6 +778,7 @@ if __name__ == "__main__":
     # Config file
     parser.add_argument(
         "--config-file",
+        "-c",
         type=str,
         default=None,
         help="Path to configuration file (defaults to config/config.yaml)",
@@ -637,6 +787,7 @@ if __name__ == "__main__":
     # Attack selection
     parser.add_argument(
         "--attacks",
+        "-a",
         type=str,
         nargs="+",
         default=["all"],
@@ -646,16 +797,18 @@ if __name__ == "__main__":
 
     # Test parameters
     parser.add_argument(
-        "--batch-size", type=int, default=4, help="Batch size for testing"
+        "--batch-size", "-b", type=int, default=4, help="Batch size for testing"
     )
     parser.add_argument(
         "--max-batches",
+        "-mb",
         type=int,
         default=1,
         help="Maximum number of batches to test per attack",
     )
     parser.add_argument(
         "--num-vis",
+        "-v",
         type=int,
         default=3,
         help="Number of adversarial examples to visualize per attack",
@@ -664,6 +817,7 @@ if __name__ == "__main__":
     # Output parameters
     parser.add_argument(
         "--output-dir",
+        "-o",
         type=str,
         default="results/test_baseline",
         help="Directory to save test results and visualizations",
@@ -672,11 +826,13 @@ if __name__ == "__main__":
     # Targeted attack parameters
     parser.add_argument(
         "--targeted",
+        "-t",
         action="store_true",
         help="Run targeted attacks",
     )
     parser.add_argument(
         "--target-method",
+        "-tm",
         type=str,
         choices=["random", "least-likely"],
         help="Target method for targeted attacks",

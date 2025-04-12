@@ -56,10 +56,11 @@ class FFGSM(Attack):
         # Scale epsilon and alpha to normalized space by dividing by ImageNet std
         # This makes the perturbation magnitude consistent across channels
         mean_std = self.std.clone().detach().mean().item()
-        self.eps = eps / mean_std
-        self.alpha = alpha / mean_std
+        self.eps = eps / mean_std  # Scaling to normalized space
+        self.alpha = alpha / mean_std  # Alpha is the step size for the gradient update
 
         # Validate that alpha is less than or equal to epsilon
+        # This ensures the gradient step doesn't exceed the total perturbation budget
         if self.alpha > self.eps:
             raise ValueError(
                 f"alpha ({self.alpha}) must be less than or equal to eps ({self.eps})"
@@ -84,10 +85,11 @@ class FFGSM(Attack):
             target_labels = self.get_target_label(images, labels)
 
         # Use cross-entropy loss for classification tasks
+        # This implements L(f(x+δ), y) from the paper's formulation
         loss = nn.CrossEntropyLoss()
 
         # Calculate normalized min/max bounds for valid pixel values
-        # Create normalized min/max bounds directly - ensuring correct dtype
+        # These bounds ensure adversarial examples are valid images after denormalization
         min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
         max_bound = ((1 - self.mean) / self.std).to(
             device=images.device, dtype=images.dtype
@@ -96,45 +98,51 @@ class FFGSM(Attack):
         min_bound = min_bound.view(1, 3, 1, 1)
         max_bound = max_bound.view(1, 3, 1, 1)
 
-        # Initialize adversarial images with random noise within epsilon bound in normalized space
-        # This is the key difference from standard FGSM - starting from a random point
+        # FFGSM Step 1: Initialize with random noise within epsilon bound
+        # This corresponds to x' = x + α·sign(N(0,1)) from the paper
+        # But using uniform noise instead of normally distributed noise with sign
         adv_images = images + torch.randn_like(images).uniform_(-self.eps, self.eps)
 
         # Ensure the initial perturbation is within valid normalized image range
+        # This implements the projection step to keep x' within the valid image domain
         adv_images = torch.clamp(adv_images, min=min_bound, max=max_bound).detach()
 
         # Enable gradient computation for the perturbed images
         adv_images.requires_grad = True
 
         # Get model predictions for the randomly perturbed images
+        # This calls f(x') in the paper's notation and increments gradient call counter
         outputs = self.get_logits(adv_images)
 
-        # FFGSM is a single-step method, so increment iteration count by batch size
+        # FFGSM is a single-step method (after random initialization)
         self.total_iterations += images.size(0)
 
         # Calculate loss based on attack mode
         if self.targeted:
             # For targeted attacks, minimize loss with respect to target labels
-            cost = -loss(outputs, target_labels)
+            cost = -loss(outputs, target_labels)  # Negative sign to minimize
         else:
             # For untargeted attacks, maximize loss with respect to true labels
+            # This implements max_δ L(f(x+δ), y) from the paper
             cost = loss(outputs, labels)
 
         # Compute gradients of loss with respect to perturbed images
+        # This calculates ∇_x L(f(x'), y) from the paper
         grad = torch.autograd.grad(
             cost, adv_images, retain_graph=False, create_graph=False
         )[0]
 
-        # FFGSM update: take a step in the direction of signed gradients
-        # This is similar to FGSM but with a different step size (alpha)
+        # FFGSM Step 2: Gradient step from the perturbed starting point
+        # This corresponds to x_adv = x' + (ε-α)·sign(∇_x L(f(x'), y))
+        # But using alpha directly instead of (ε-α) as in some implementations
         adv_images = adv_images + self.alpha * grad.sign()
 
-        # Project the perturbation back to epsilon-ball around original images in normalized space
-        # This ensures the total perturbation doesn't exceed epsilon
+        # Project the perturbation back to epsilon-ball around original images
+        # This ensures ||δ||_∞ ≤ ε as required by the constraint
         delta = torch.clamp(adv_images - images, min=-self.eps, max=self.eps)
 
         # Final adversarial images are original images plus bounded perturbation
-        # Ensure result is within valid normalized image range
+        # This implements the final projection step to ensure valid images
         adv_images = torch.clamp(images + delta, min=min_bound, max=max_bound).detach()
 
         # Measure and record time taken

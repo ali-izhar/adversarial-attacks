@@ -51,7 +51,9 @@ class FGSM(Attack):
         # Scale epsilon to normalized space by dividing by ImageNet std
         # This makes the perturbation magnitude consistent across channels
         mean_std = self.std.clone().detach().mean().item()
-        self.eps = eps / mean_std
+        self.eps = (
+            eps / mean_std
+        )  # Scaling to normalized space for consistent perturbation
 
         # FGSM supports both untargeted and targeted attacks
         self.supported_mode = ["default", "targeted"]
@@ -72,37 +74,44 @@ class FGSM(Attack):
             target_labels = self.get_target_label(images, labels)
 
         # Use cross-entropy loss for classification tasks
+        # This implements L(f(x+δ), y) from the paper's formulation
         loss = nn.CrossEntropyLoss()
 
         # Enable gradient computation for input images
         images.requires_grad = True
 
-        # Get model predictions
-        outputs = self.get_logits(images)
+        # Get model predictions - this increments gradient call counter in the base class
+        outputs = self.get_logits(images)  # f(x) in the paper
 
-        # FGSM is a single-step method, so we count this as one iteration per sample
+        # FGSM is a single-step method (one gradient computation per sample)
+        # We count this as one iteration per sample in our metrics
         self.total_iterations += images.size(0)
 
         # Calculate loss based on attack mode
         if self.targeted:
             # For targeted attacks, minimize loss with respect to target labels
-            cost = -loss(outputs, target_labels)
+            # This is an extension of the original FGSM but follows the same principle
+            cost = -loss(
+                outputs, target_labels
+            )  # Negative sign to minimize instead of maximize
         else:
             # For untargeted attacks, maximize loss with respect to true labels
+            # This implements max_δ L(f(x+δ), y) from the paper
             cost = loss(outputs, labels)
 
         # Compute gradients of loss with respect to input images
+        # This calculates ∇_x L(f(x), y) from the paper
         grad = torch.autograd.grad(
             cost, images, retain_graph=False, create_graph=False
         )[0]
 
         # FGSM update: add signed gradients scaled by epsilon
-        # The sign of the gradient indicates the direction of steepest ascent
+        # This implements x_adv = x + ε * sign(∇_x L(f(x), y)) from the paper
         adv_images = images + self.eps * grad.sign()
 
         # Calculate normalized min/max bounds to keep adversarial example
         # within valid pixel ranges after denormalization
-        # Create normalized min/max bounds directly - ensuring correct dtype
+        # This ensures that the adversarial examples are valid images
         min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
         max_bound = ((1 - self.mean) / self.std).to(
             device=images.device, dtype=images.dtype
@@ -112,6 +121,8 @@ class FGSM(Attack):
         max_bound = max_bound.view(1, 3, 1, 1)
 
         # Clamp to valid normalized range
+        # This enforces the constraint ||δ||_∞ ≤ ε indirectly by ensuring
+        # the adversarial examples remain valid images
         adv_images = torch.clamp(adv_images, min=min_bound, max=max_bound).detach()
 
         # Track how long the attack took
