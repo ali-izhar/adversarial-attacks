@@ -68,6 +68,15 @@ def compute_ssim(original, perturbed):
     return ssim_value
 
 
+def get_class_name_and_confidence(model, image, class_idx):
+    """Get class name and confidence score for a given prediction"""
+    with torch.no_grad():
+        logits = model(image)
+        probs = torch.softmax(logits, dim=1)
+        confidence = probs[0, class_idx].item() * 100
+    return confidence
+
+
 def main():
     # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -112,9 +121,20 @@ def main():
 
     # Get predictions and compute SSIM
     with torch.no_grad():
-        orig_pred = model(image).argmax(dim=1).item()
-        untarg_pred = model(adv_untargeted).argmax(dim=1).item()
-        targ_pred = model(adv_targeted).argmax(dim=1).item()
+        orig_logits = model(image)
+        orig_probs = torch.softmax(orig_logits, dim=1)
+        orig_pred = orig_logits.argmax(dim=1).item()
+        orig_conf = orig_probs[0, orig_pred].item() * 100
+
+        untarg_logits = model(adv_untargeted)
+        untarg_probs = torch.softmax(untarg_logits, dim=1)
+        untarg_pred = untarg_logits.argmax(dim=1).item()
+        untarg_conf = untarg_probs[0, untarg_pred].item() * 100
+
+        targ_logits = model(adv_targeted)
+        targ_probs = torch.softmax(targ_logits, dim=1)
+        targ_pred = targ_logits.argmax(dim=1).item()
+        targ_conf = targ_probs[0, targ_pred].item() * 100
 
         # Compute SSIM for both attacks
         untarg_ssim = compute_ssim(image[0], adv_untargeted[0])
@@ -142,7 +162,9 @@ def main():
     ax0 = fig.add_subplot(gs[0])
     orig_img = denormalize(image[0]).cpu().permute(1, 2, 0).numpy()
     ax0.imshow(orig_img)
-    ax0.set_title("Original\n" + r"Predicted: \texttt{saluki}", pad=20)
+    ax0.set_title(
+        f"Original\nPredicted: \\texttt{{saluki}}\n({orig_conf:.1f}\\%)", pad=20
+    )
     ax0.axis("off")
 
     # First separator (empty subplot)
@@ -154,7 +176,7 @@ def main():
     untargeted_group.axis("off")
 
     # Create nested grid for untargeted attack
-    gs_untarg = plt.GridSpec(1, 2)
+    gs_untarg = plt.GridSpec(2, 2, height_ratios=[1, 0.2])
     gs_untarg.update(
         left=untargeted_group.get_position().x0,
         right=untargeted_group.get_position().x1,
@@ -163,20 +185,30 @@ def main():
     )
 
     # Untargeted perturbation and result
-    ax_pert_untarg = fig.add_subplot(gs_untarg[0])
+    ax_pert_untarg = fig.add_subplot(gs_untarg[0, 0])
     pert_untarg = visualize_perturbation(adv_untargeted[0] - image[0])
     ax_pert_untarg.imshow(pert_untarg)
     ax_pert_untarg.set_title("Untargeted\nPerturbation", pad=20)
     ax_pert_untarg.axis("off")
 
-    ax_res_untarg = fig.add_subplot(gs_untarg[1])
+    ax_res_untarg = fig.add_subplot(gs_untarg[0, 1])
     untarg_img = denormalize(adv_untargeted[0]).cpu().permute(1, 2, 0).numpy()
     ax_res_untarg.imshow(untarg_img)
     ax_res_untarg.set_title(
-        f"Result ({untarg_ssim*100:.1f}\% similar)\n" + r"Predicted: \texttt{beagle}",
-        pad=20,
+        f"Predicted: \\texttt{{beagle}}\n({untarg_conf:.1f}\\%)", pad=20
     )
     ax_res_untarg.axis("off")
+
+    # Add SSIM text below the result image
+    ax_ssim_untarg = fig.add_subplot(gs_untarg[1, 1])
+    ax_ssim_untarg.text(
+        0.5,
+        0.5,
+        f"SSIM: {untarg_ssim*100:.1f}\\%",
+        horizontalalignment="center",
+        verticalalignment="center",
+    )
+    ax_ssim_untarg.axis("off")
 
     # Second separator (empty subplot)
     sep2 = fig.add_subplot(gs[3])
@@ -187,7 +219,7 @@ def main():
     targeted_group.axis("off")
 
     # Create nested grid for targeted attack
-    gs_targ = plt.GridSpec(1, 2)
+    gs_targ = plt.GridSpec(2, 2, height_ratios=[1, 0.2])
     gs_targ.update(
         left=targeted_group.get_position().x0,
         right=targeted_group.get_position().x1,
@@ -196,20 +228,30 @@ def main():
     )
 
     # Targeted perturbation and result
-    ax_pert_targ = fig.add_subplot(gs_targ[0])
+    ax_pert_targ = fig.add_subplot(gs_targ[0, 0])
     pert_targ = visualize_perturbation(adv_targeted[0] - image[0])
     ax_pert_targ.imshow(pert_targ)
     ax_pert_targ.set_title("Targeted\nPerturbation", pad=20)
     ax_pert_targ.axis("off")
 
-    ax_res_targ = fig.add_subplot(gs_targ[1])
+    ax_res_targ = fig.add_subplot(gs_targ[0, 1])
     targ_img = denormalize(adv_targeted[0]).cpu().permute(1, 2, 0).numpy()
     ax_res_targ.imshow(targ_img)
     ax_res_targ.set_title(
-        f"Result ({targ_ssim*100:.1f}\% similar)\n" + r"Predicted: \texttt{gorilla}",
-        pad=20,
+        f"Predicted: \\texttt{{gorilla}}\n({targ_conf:.1f}\\%)", pad=20
     )
     ax_res_targ.axis("off")
+
+    # Add SSIM text below the result image
+    ax_ssim_targ = fig.add_subplot(gs_targ[1, 1])
+    ax_ssim_targ.text(
+        0.5,
+        0.5,
+        f"SSIM: {targ_ssim*100:.1f}\\%",
+        horizontalalignment="center",
+        verticalalignment="center",
+    )
+    ax_ssim_targ.axis("off")
 
     # Add vertical lines for separation
     fig.patches.extend(
