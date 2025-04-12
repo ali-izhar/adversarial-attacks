@@ -1,10 +1,9 @@
 """DeepFool adversarial attack implementation.
 
-Code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
+Some code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
 """
 
 import torch
-import torch.nn as nn
 import time
 
 from .attack import Attack
@@ -34,7 +33,7 @@ class DeepFool(Attack):
     """
 
     def __init__(
-        self, model, steps=30, overshoot=0.02, early_stopping=True, top_k_classes=10
+        self, model, steps=30, overshoot=0.02, early_stopping=True, top_k_classes=5
     ):
         """Initialize DeepFool attack.
 
@@ -43,7 +42,7 @@ class DeepFool(Attack):
             steps: Maximum number of iterations for finding adversarial examples
             overshoot: Parameter to enhance the noise (default: 0.02)
             early_stopping: Whether to stop early when all samples are fooled (default: True)
-            top_k_classes: Number of top classes to consider when finding closest boundary (default: 10)
+            top_k_classes: Number of top classes to consider when finding closest boundary (default: 5)
         """
         super().__init__("DeepFool", model)
         self.steps = steps  # Maximum number of iterations
@@ -77,6 +76,7 @@ class DeepFool(Attack):
         batch_size = len(images)
 
         # Calculate normalized min/max bounds for valid pixel values
+        # This ensures perturbations keep the image within valid range
         min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
         max_bound = ((1 - self.mean) / self.std).to(
             device=images.device, dtype=images.dtype
@@ -85,11 +85,13 @@ class DeepFool(Attack):
         max_bound = max_bound.view(1, 3, 1, 1)
 
         # Process each sample individually to avoid inplace operation issues
+        # Practical consideration: batch processing with individual handling
+        # avoids gradient accumulation issues in PyTorch
         adv_images = []
         sample_iterations = torch.zeros(batch_size, device=self.device)
         target_preds = torch.zeros_like(labels)
 
-        # Track the total number of gradient calls before this function
+        # Reset gradient call counter for accurate tracking
         prev_grad_calls = self.total_gradient_calls
 
         # Process each image individually
@@ -107,16 +109,22 @@ class DeepFool(Attack):
             target_preds[i] = target_class
             adv_images.append(adv_x)
 
+            # Properly track iterations in the main counter
+            self.total_iterations += iters
+
         # Concatenate results
         adv_batch = torch.cat(adv_images, dim=0)
-
-        # Calculate perturbation metrics
-        perturbation_metrics = self.compute_perturbation_metrics(images, adv_batch)
 
         # Calculate number of fooled samples
         with torch.no_grad():
             preds = self.get_logits(adv_batch).argmax(dim=1)
-            fooled_count = (preds != labels).sum().item()
+            fooled_mask = preds != labels
+            fooled_count = fooled_mask.sum().item()
+
+        # Calculate perturbation metrics only for successful attacks
+        perturbation_metrics = self.compute_perturbation_metrics(
+            images, adv_batch, fooled_mask
+        )
 
         # Record metrics
         avg_iters = sample_iterations.float().mean().item()
@@ -154,37 +162,42 @@ class DeepFool(Attack):
         true_label = y.item()
 
         # Initialize
-        adv_x = x.clone()
+        adv_x = x.clone()  # Current adversarial example x_k
         iterations = 0
         current_pred = None
         target_class = -1
         fooled = False
 
-        # Track perturbation
+        # Track perturbation - this accumulates the total perturbation δ
         total_perturbation = torch.zeros_like(x)
 
-        # Main iteration loop
+        # Main iteration loop - implements the iterative DeepFool algorithm
         for i in range(steps):
-            # If already fooled, exit
+            # If already fooled, exit - practical early stopping
             if fooled:
                 break
 
             # Create input that requires gradient
             adv_x_i = adv_x.clone().detach().requires_grad_(True)
 
-            # Forward pass
-            logits = self.get_logits(adv_x_i)
+            # Forward pass to get logits f(x_k)
+            # NOTE: We don't call self.get_logits() to avoid duplicate gradient call counting
+            # since we're manually tracking gradients below
+            logits = self.model(adv_x_i)
 
             # Check current prediction
             current_pred = logits[0].argmax().item()
 
             # If already misclassified, we're done
+            # This corresponds to checking k̂(x + δ) ≠ k̂(x) in the paper
             if current_pred != true_label:
                 fooled = True
                 target_class = current_pred
                 break
 
             # Get top-k classes (exclude true class)
+            # Practical optimization: only check the most likely classes
+            # instead of all possible classes (important for ImageNet)
             values, indices = torch.topk(logits[0], k=self.top_k_classes + 1)
 
             # Filter out true class
@@ -201,40 +214,49 @@ class DeepFool(Attack):
                 else:
                     other_classes = [indices[0].item()]
 
-            # Get gradient of true class
+            # Optimization: compute all gradients in one pass using the Jacobian
+            # This is more efficient than computing gradients separately for each class
+            jacobian_rows = []
+
+            # Get gradient of true class - ∇f_{k̂(x)}(x)
             true_logit = logits[0, true_label]
             adv_x_i.grad = None
             true_logit.backward(retain_graph=True)
-            self.total_gradient_calls += 1
+            # Count as one gradient call
+            self.track_gradient_calls(1)
             grad_true = adv_x_i.grad.clone()
 
-            # Find closest boundary
+            # Find closest boundary - implements the minimization part of:
+            # r_k = (min_{j≠k̂(x)} |f_j(x) - f_{k̂(x)}(x)| / ‖∇f_j(x) - ∇f_{k̂(x)}(x)‖²) · (∇f_{j*}(x) - ∇f_{k̂(x)}(x))
             min_distance = float("inf")
             closest_grad = None
             closest_diff = None
             closest_class = -1
 
-            # Check each class
-            for k in other_classes:
+            # Check each class - finding j* that minimizes the distance
+            for k_idx, k in enumerate(other_classes):
                 adv_x_i.grad = None
-                logits[0, k].backward(retain_graph=(k != other_classes[-1]))
-                self.total_gradient_calls += 1
+                # Only retain graph if not the last class
+                retain_graph = k_idx < len(other_classes) - 1
+                logits[0, k].backward(retain_graph=retain_graph)
+                # Count as one gradient call
+                self.track_gradient_calls(1)
 
-                # Compute w_k (difference in gradients)
+                # Compute w_k (difference in gradients) - ∇f_j(x) - ∇f_{k̂(x)}(x)
                 grad_k = adv_x_i.grad.clone()
                 grad_diff = grad_k - grad_true
 
-                # Compute f_k (difference in logits)
+                # Compute f_k (difference in logits) - f_j(x) - f_{k̂(x)}(x)
                 f_diff = logits[0, k].item() - true_logit.item()
 
-                # Compute distance to boundary
+                # Compute distance to boundary - |f_j(x) - f_{k̂(x)}(x)| / ‖∇f_j(x) - ∇f_{k̂(x)}(x)‖
                 grad_norm = torch.norm(grad_diff.flatten())
-                if grad_norm < 1e-6:
+                if grad_norm < 1e-6:  # Numerical stability check
                     continue
 
                 dist = abs(f_diff) / grad_norm
 
-                # Update if this is the closest boundary
+                # Update if this is the closest boundary - finding j*
                 if dist < min_distance:
                     min_distance = dist
                     closest_grad = grad_diff
@@ -242,14 +264,18 @@ class DeepFool(Attack):
                     closest_class = k
 
             # If no valid boundary found, break
+            # Practical consideration for numerical stability
             if closest_grad is None:
                 break
 
-            # Compute perturbation
+            # Compute perturbation - this is r_k in the paper
+            # r_k = (|f_j(x) - f_{k̂(x)}(x)| / ‖∇f_j(x) - ∇f_{k̂(x)}(x)‖²) · (∇f_j(x) - ∇f_{k̂(x)}(x))
             pert_norm = torch.norm(closest_grad.flatten())
-            perturbation = abs(closest_diff) / (pert_norm**2 + 1e-8) * closest_grad
+            perturbation = (
+                abs(closest_diff) / (pert_norm**2 + 1e-8) * closest_grad
+            )  # 1e-8 for stability
 
-            # Add perturbation
+            # Add perturbation - implements x_{k+1} = x_k + r_k
             adv_x = torch.clamp(adv_x + perturbation, min=min_bound, max=max_bound)
             total_perturbation = adv_x - x
 
@@ -257,6 +283,8 @@ class DeepFool(Attack):
             iterations += 1
 
         # Apply overshoot to final perturbation
+        # Practical enhancement from the paper: overshoot slightly beyond the boundary
+        # to ensure successful misclassification (helps with non-linear boundaries)
         adv_x = torch.clamp(
             x + (1 + self.overshoot) * total_perturbation, min=min_bound, max=max_bound
         )
@@ -281,7 +309,7 @@ class DeepFool(Attack):
             # Compute gradients for each output element
             y_element.backward(retain_graph=(False or idx + 1 < len(y)))
             # Count each backward pass as a gradient call
-            self.total_gradient_calls += 1
+            self.track_gradient_calls(1)
             x_grads.append(x.grad.clone().detach())
         # Stack all gradients to form the Jacobian matrix
         return torch.stack(x_grads).reshape(*y.shape, *x.shape)

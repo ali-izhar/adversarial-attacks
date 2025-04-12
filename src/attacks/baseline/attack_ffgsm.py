@@ -1,6 +1,6 @@
 """Fast Fast Gradient Sign Method (FFGSM) adversarial attack implementation.
 
-Code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
+Some code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
 """
 
 import torch

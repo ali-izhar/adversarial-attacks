@@ -1,6 +1,6 @@
 """Base class for all baseline attacks.
 
-Code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
+Some code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
 
 NORMALIZATION WARNING:
 When using these attacks with our framework:
