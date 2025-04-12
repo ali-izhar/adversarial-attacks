@@ -28,8 +28,6 @@ from src.datasets.imagenet import get_dataset, get_dataloader
 from src.models.wrappers import get_model
 from src.attacks import CG, PGD, LBFGS
 
-# The PGD variants are now defined in config.yaml
-
 
 def load_config(config_path):
     """Load configuration from YAML file."""
@@ -673,10 +671,11 @@ if __name__ == "__main__":
 
     # Dataset and model parameters
     parser.add_argument(
-        "--data-dir", type=str, default=None, help="Base directory for datasets"
+        "--data-dir", "-d", type=str, default=None, help="Base directory for datasets"
     )
     parser.add_argument(
         "--model-name",
+        "-m",
         type=str,
         default="resnet18",
         choices=[
@@ -690,6 +689,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--num-samples",
+        "-n",
         type=int,
         default=None,
         help="Number of samples to load from dataset (defaults to config value)",
@@ -698,6 +698,7 @@ if __name__ == "__main__":
     # Config file
     parser.add_argument(
         "--config-file",
+        "-c",
         type=str,
         default=None,
         help="Path to configuration file (defaults to config/config.yaml)",
@@ -706,6 +707,7 @@ if __name__ == "__main__":
     # Attack selection
     parser.add_argument(
         "--attacks",
+        "-a",
         type=str,
         nargs="+",
         default=["all"],
@@ -716,6 +718,7 @@ if __name__ == "__main__":
     # PGD variant selection
     parser.add_argument(
         "--pgd-variant",
+        "-pv",
         type=str,
         choices=["basic", "momentum", "l2"],
         default="momentum",
@@ -724,16 +727,18 @@ if __name__ == "__main__":
 
     # Test parameters
     parser.add_argument(
-        "--batch-size", type=int, default=4, help="Batch size for testing"
+        "--batch-size", "-b", type=int, default=4, help="Batch size for testing"
     )
     parser.add_argument(
         "--max-batches",
+        "-mb",
         type=int,
         default=1,
         help="Maximum number of batches to test per attack",
     )
     parser.add_argument(
         "--num-vis",
+        "-v",
         type=int,
         default=3,
         help="Number of adversarial examples to visualize per attack",
@@ -742,6 +747,7 @@ if __name__ == "__main__":
     # Output parameters
     parser.add_argument(
         "--output-dir",
+        "-o",
         type=str,
         default="results/test_attacks",
         help="Directory to save test results and visualizations",
@@ -750,11 +756,13 @@ if __name__ == "__main__":
     # Targeted attack parameters
     parser.add_argument(
         "--targeted",
+        "-t",
         action="store_true",
         help="Run targeted attacks",
     )
     parser.add_argument(
         "--target-method",
+        "-tm",
         type=str,
         choices=["random", "least-likely"],
         help="Target method for targeted attacks",

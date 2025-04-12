@@ -36,14 +36,14 @@ class PGDOptimizer:
 
     def __init__(
         self,
-        norm: str = "L2",
-        eps: float = 0.5,
-        n_iterations: int = 100,
-        step_size: float = 0.1,
-        rand_init: bool = True,
-        early_stopping: bool = True,
+        norm: str = "L2",  # Norm constraint type as in paper (L2 or Linf)
+        eps: float = 0.5,  # Perturbation budget ε as defined in the paper
+        n_iterations: int = 100,  # Maximum iterations T in the PGD algorithm
+        step_size: float = 0.1,  # Step size α for gradient updates
+        rand_init: bool = True,  # Whether to use random initialization (δ₀ ~ U(-0.01,0.01)ⁿ)
+        early_stopping: bool = True,  # Implements early stopping from paper's algorithm
         verbose: bool = False,
-        maximize: bool = True,
+        maximize: bool = True,  # Whether to maximize loss (untargeted) or minimize (targeted)
     ):
         """
         Initialize the PGD optimizer with minimal parameters.
@@ -108,13 +108,14 @@ class PGDOptimizer:
         if x_original is None:
             x_original = x_init
 
-        # Initialize perturbation
+        # Initialize perturbation - this corresponds to the initialization step in the algorithm
+        # "Initialize δ₀ ~ U(-0.01,0.01)ⁿ" (random initialization within small range)
         if self.rand_init:
             if self.norm == "linf":
-                # Uniform initialization in epsilon ball
+                # Uniform initialization in epsilon ball for Linf
                 eta = torch.zeros_like(x_init).uniform_(-self.eps, self.eps)
             else:  # L2 norm
-                # Random direction with magnitude eps
+                # Random direction with magnitude eps for L2
                 eta = torch.randn_like(x_init)
                 eta_flat = eta.view(eta.shape[0], -1)
                 eta_norm = torch.norm(eta_flat, p=2, dim=1).view(-1, 1, 1, 1)
@@ -122,7 +123,8 @@ class PGDOptimizer:
         else:
             eta = torch.zeros_like(x_init)
 
-        # Apply initial perturbation and clip to valid range
+        # Apply initial perturbation and clip to valid image range
+        # This ensures x + δ ∈ [0,1]ⁿ as required by the paper
         x_adv = torch.clamp(x_original + eta, 0.0, 1.0)
 
         # Initialize metrics
@@ -137,11 +139,13 @@ class PGDOptimizer:
             success = torch.zeros(batch_size, dtype=torch.bool, device=device)
             initial_success = success.clone()
 
-        # Main optimization loop
+        # Main optimization loop - the "for t = 0 to T-1" loop in the algorithm
         for i in range(self.n_iterations):
             iterations += 1
 
             # Early stopping if all examples are successful
+            # This implements the paper's early stopping condition:
+            # "If arg max_j f_j(x_{t+1}) ≠ y_{true} and ||δ_{t+1} - δ_t||_p < 0.01 ||δ_t||_p"
             if self.early_stopping and success_fn is not None and success.all():
                 if self.verbose:
                     print(f"Early stopping at iteration {i}: all examples successful")
@@ -157,7 +161,7 @@ class PGDOptimizer:
                     batch_size, dtype=torch.bool, device=device
                 )
 
-            # Compute gradient
+            # Compute gradient - corresponds to "g_t ← ∇_δ L(f(x + δ_t), y)" in the algorithm
             grad = gradient_fn(x_adv)
 
             # Update only working examples if early stopping is enabled
@@ -165,28 +169,35 @@ class PGDOptimizer:
                 grad = grad * working_examples.view(-1, 1, 1, 1).float()
 
             # Normalize gradient for Linf or L2 attacks
+            # This implements the normalization step in the algorithm:
+            # "d_t ← sign(g_t) for ℓ_∞ or d_t ← g_t/||g_t||_2 for ℓ_2"
             if self.norm == "linf":
-                # Sign gradient for Linf norm
+                # Sign gradient for Linf norm - implements Eq. (3) for Linf update
                 grad_step = torch.sign(grad)
             else:  # L2 norm
-                # Normalize gradient by L2 norm
+                # Normalize gradient by L2 norm - implements Eq. (5) for L2 update
                 grad_flat = grad.view(grad.shape[0], -1)
                 grad_norm = torch.norm(grad_flat, p=2, dim=1).view(-1, 1, 1, 1)
                 grad_step = grad / (grad_norm + 1e-12)
 
             # Update in the appropriate direction
+            # This implements the gradient step in the algorithm:
+            # "δ_{t+1} ← δ_t + α · d_t" for untargeted attacks (maximize=True)
+            # "δ_{t+1} ← δ_t - α · d_t" for targeted attacks (maximize=False)
             if self.maximize:
                 x_adv = x_adv + self.step_size * grad_step
             else:
                 x_adv = x_adv - self.step_size * grad_step
 
             # Project perturbation onto epsilon ball
+            # This implements the projection step in the algorithm:
+            # "δ_{t+1} ← Π_{||·||_p ≤ ε}(δ_t + α · d_t)"
             delta = x_adv - x_original
             if self.norm == "linf":
-                # Element-wise clipping for Linf
+                # Element-wise clipping for Linf - implements Eq. (4) Π_{||·||_∞ ≤ ε}
                 delta = torch.clamp(delta, -self.eps, self.eps)
             else:  # L2 norm
-                # Project onto L2 ball
+                # Project onto L2 ball - implements Eq. (6) Π_{||·||_2 ≤ ε}
                 delta_flat = delta.view(delta.shape[0], -1)
                 delta_norm = torch.norm(delta_flat, p=2, dim=1).view(-1, 1, 1, 1)
                 factor = torch.min(
@@ -195,9 +206,11 @@ class PGDOptimizer:
                 delta = delta * factor
 
             # Apply projected perturbation and clip to valid range
+            # This implements the final step in the algorithm:
+            # "x_{t+1} ← Π_{[0,1]^n}(x + δ_{t+1})" (clipping to valid image range)
             x_adv = torch.clamp(x_original + delta, 0.0, 1.0)
 
-            # Check for success
+            # Check for success - part of the early stopping condition
             if success_fn is not None:
                 new_success = success_fn(x_adv)
                 if self.early_stopping:

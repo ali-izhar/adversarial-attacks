@@ -1,26 +1,4 @@
-"""Simplified Projected Gradient Descent (PGD) adversarial attack implementation.
-
-This file implements a concise version of the PGD attack based on the approach from
-Madry et al. 2017, which is a powerful first-order iterative method for generating
-adversarial examples.
-
-Key features:
-- Simple implementation of the core PGD algorithm
-- Support for both targeted and untargeted attacks
-- L2 and Linf perturbation norms
-- Optional random initialization
-- Early stopping capability
-
-Expected inputs:
-- A neural network model to attack
-- Input samples (images) to perturb
-- Target labels (true labels for untargeted attacks, target labels for targeted attacks)
-- Configuration parameters for the attack
-
-Expected outputs:
-- Adversarial examples that aim to fool the model
-- Simple metrics about the attack performance
-"""
+"""Projected Gradient Descent (PGD) adversarial attack implementation."""
 
 import time
 import torch
@@ -42,13 +20,13 @@ class PGD(Attack):
     def __init__(
         self,
         model,
-        norm: str = "L2",
-        eps: float = 0.5,
-        n_iterations: int = 100,
-        step_size: float = 0.1,
-        loss_fn: str = "cross_entropy",
-        rand_init: bool = True,
-        early_stopping: bool = True,
+        norm: str = "L2",  # As described in the paper, PGD supports both L2 and Linf norms
+        eps: float = 0.5,  # The perturbation budget (epsilon) as described in the paper
+        n_iterations: int = 100,  # Maximum iterations T in the algorithm
+        step_size: float = 0.1,  # Step size alpha in the gradient update equations
+        loss_fn: str = "cross_entropy",  # Loss function to maximize/minimize
+        rand_init: bool = True,  # Random initialization as described in the algorithm
+        early_stopping: bool = True,  # Implements the early stopping condition from the algorithm
         verbose: bool = False,
     ):
         """
@@ -74,21 +52,23 @@ class PGD(Attack):
         self.n_iterations = n_iterations
         self.step_size = step_size
         self.loss_fn_type = loss_fn
-        self.rand_init = rand_init
-        self.early_stopping = early_stopping
+        self.rand_init = (
+            rand_init  # Corresponds to δ₀ ~ U(-0.01,0.01)ⁿ in the algorithm
+        )
+        self.early_stopping = early_stopping  # Implements the early stopping condition
         self.verbose = verbose
 
         # Set up supported modes
         self.supported_mode = ["default", "targeted"]
 
-        # Create the optimizer for PGD
+        # Create the optimizer for PGD - this will handle the core optimization algorithm
         self.optimizer = PGDOptimizer(
-            norm=norm,
-            eps=eps,
-            n_iterations=n_iterations,
-            step_size=step_size,
-            rand_init=rand_init,
-            early_stopping=early_stopping,
+            norm=norm,  # Corresponds to L2 or Linf norm as shown in paper
+            eps=eps,  # Corresponds to ε in the perturbation constraint ||δ||_p ≤ ε
+            n_iterations=n_iterations,  # Corresponds to T in the algorithm
+            step_size=step_size,  # Corresponds to α in the update equations
+            rand_init=rand_init,  # Implements random initialization of δ₀
+            early_stopping=early_stopping,  # Implements early stopping condition
             verbose=verbose,
             maximize=True,  # Default for untargeted attacks, will be set in forward()
         )
@@ -118,19 +98,24 @@ class PGD(Attack):
             target_labels = labels
 
         # Set optimize direction based on attack mode
+        # For untargeted attacks (maximize=True), we want to maximize the loss to move away from true class
+        # For targeted attacks (maximize=False), we want to minimize the loss to move toward target class
         self.optimizer.maximize = not self.targeted
 
         # Select appropriate loss function based on configuration
         if self.loss_fn_type == "cross_entropy":
+            # Cross-entropy loss function as described in the paper section on optimization formulation
             ce_loss = nn.CrossEntropyLoss(reduction="none")
 
             def loss_fn(outputs, targets, targeted=False):
                 if targeted:
-                    return -ce_loss(outputs, targets)
+                    return -ce_loss(outputs, targets)  # Minimize for targeted attacks
                 else:
-                    return ce_loss(outputs, targets)
+                    return ce_loss(outputs, targets)  # Maximize for untargeted attacks
 
         elif self.loss_fn_type == "margin":
+            # Margin loss focuses on the difference between the logit of the correct class
+            # and the logit of the most likely incorrect class, as discussed in the paper
 
             def loss_fn(outputs, targets, targeted=False):
                 if targeted:
@@ -151,7 +136,11 @@ class PGD(Attack):
                     return -margin  # For untargeted, this will be maximized
 
         elif self.loss_fn_type == "carlini_wagner":
-            confidence = 0.0
+            # Carlini-Wagner loss function with confidence parameter κ, similar to the targeted loss
+            # formulation in the paper's optimization section
+            confidence = (
+                0.0  # Corresponds to κ in the paper's targeted attack formulation
+            )
 
             def loss_fn(outputs, targets, targeted=False):
                 if targeted:
@@ -175,17 +164,19 @@ class PGD(Attack):
                     )
                     return cw_loss
 
-        # Define the gradient function for the optimizer
+        # Define the gradient function for the optimizer - computes ∇_δ L(f(x + δ_t), y)
+        # This corresponds to the gradient computation step in the algorithm
         def gradient_fn(x):
             x.requires_grad_(True)
             outputs = self.get_logits(x)
             curr_labels = target_labels[: x.size(0)]
             loss_values = loss_fn(outputs, curr_labels, self.targeted)
             mean_loss = loss_values.mean()
-            grad = torch.autograd.grad(mean_loss, x)[0]
+            grad = torch.autograd.grad(mean_loss, x)[0]  # Compute gradient w.r.t. input
             return grad
 
-        # Define success function for early stopping
+        # Define success function for early stopping - checks if attack has succeeded
+        # This implements the early stopping condition from the algorithm
         def success_fn(x):
             with torch.no_grad():
                 outputs = self.get_logits(x)
@@ -203,6 +194,15 @@ class PGD(Attack):
                     return outputs.argmax(dim=1) != curr_labels
 
         # Run the optimizer to generate adversarial examples
+        # This is where the actual PGD iteration happens (inside the PGDOptimizer)
+        # The optimizer will handle:
+        # 1. Initialization (random or zero)
+        # 2. Computing gradients at each step
+        # 3. Normalizing gradients (sign for L∞, unit vector for L2)
+        # 4. Taking gradient steps (α ⋅ normalized_gradient)
+        # 5. Projecting to the ε-constraint ball (L2 or L∞)
+        # 6. Clipping to valid image range [0,1]
+        # 7. Checking early stopping condition
         adv_images, metrics = self.optimizer.optimize(
             x_init=images,
             gradient_fn=gradient_fn,
@@ -217,7 +217,8 @@ class PGD(Attack):
         self.end_time = time.time()
         self.total_time += self.end_time - start_time
 
-        # Ensure outputs are properly clamped
+        # Ensure outputs are properly clamped to [0,1] - this matches the constraint in the paper
+        # that requires x + δ ∈ [0,1]^n (valid image range)
         adv_images = torch.clamp(adv_images, 0, 1).detach()
 
         # Evaluate success and compute perturbation metrics
@@ -225,7 +226,7 @@ class PGD(Attack):
             images, adv_images, labels
         )
 
-        # Compute perturbation metrics
+        # Compute perturbation metrics - L2 and L∞ as described in the paper
         perturbation_metrics = self.compute_perturbation_metrics(
             images, adv_images, success_mask
         )
