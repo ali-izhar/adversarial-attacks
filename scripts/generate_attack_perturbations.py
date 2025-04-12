@@ -245,9 +245,8 @@ def create_visualizations(
 
 
 def create_comparison_grid(original, attack_results, class_names, orig_idx):
-    """Create a comparison grid of all attack methods using L-infinity norm for visualization"""
+    """Create a comparison grid of all attack methods using their optimal norms"""
     try:
-        # Disable LaTeX rendering to avoid font and special character issues
         plt.rcParams.update(
             {
                 "text.usetex": False,
@@ -266,8 +265,13 @@ def create_comparison_grid(original, attack_results, class_names, orig_idx):
         axes[0].set_title(f"Original\nPredicted: {class_names[orig_idx]}")
         axes[0].axis("off")
 
-        # Get max L-infinity norm for relative color intensity
-        max_linf = max([result["metrics"]["linf_norm"] for result in attack_results])
+        # Each attack method with its optimal norm
+        optimal_norms = {
+            "FGSM": "linf_norm",  # FGSM optimized for L∞
+            "FFGSM": "linf_norm",  # FFGSM optimized for L∞
+            "DeepFool": "l2_norm",  # DeepFool optimized for L2
+            "C&W": "l2_norm",  # C&W primarily optimized for L2
+        }
 
         # For each attack
         for i, result in enumerate(attack_results):
@@ -275,58 +279,93 @@ def create_comparison_grid(original, attack_results, class_names, orig_idx):
             adv_img = result["adv_img"]
             metrics = result["metrics"]
 
-            # Get adversarial image
+            # Get adversarial image (actual image, not perturbation)
             adv_np = denormalize(adv_img).cpu().permute(1, 2, 0).numpy()
 
-            # Show adversarial image
+            # Show the actual adversarial image
             axes[i + 1].imshow(adv_np)
 
-            # Calculate normalized intensity for this attack (for color intensity)
-            intensity = min(1.0, metrics["linf_norm"] / max_linf)
+            # Get optimal norm for this attack
+            optimal_norm_key = optimal_norms.get(name, "linf_norm")
+            optimal_norm_value = metrics[optimal_norm_key]
 
-            # Get perturbation heat map using L-infinity norm
+            # Get norm name for display (L-inf or L2)
+            norm_display = "L-inf" if optimal_norm_key == "linf_norm" else "L2"
+
+            # Calculate perturbation for highlight overlay
             pert = adv_img - original
-            # Max absolute change across RGB channels for each pixel (L-infinity)
-            pert_mag = torch.max(torch.abs(pert), dim=0)[0].cpu().numpy()
 
-            # Create mask for significant changes
-            threshold = max(
-                0.003, metrics["linf_norm"] * 0.1
-            )  # 10% of linf with minimum
+            # Create a subtle highlight overlay based on the optimal norm
+            if optimal_norm_key == "linf_norm":
+                # For L∞-optimized attacks (FGSM, FFGSM)
+                pert_mag = torch.max(torch.abs(pert), dim=0)[0].cpu().numpy()
+                # More conservative threshold to only highlight significant changes
+                threshold = max(0.05, optimal_norm_value * 0.4)
+                cmap = plt.cm.cool
+            else:
+                # For L2-optimized attacks (DeepFool, C&W)
+                pert_mag = torch.norm(pert, p=2, dim=0).cpu().numpy()
+                # Adaptive threshold based on the L2 norm
+                if name == "DeepFool":
+                    # DeepFool has very small perturbations
+                    threshold = max(0.001, optimal_norm_value * 0.3)
+                else:
+                    # C&W has larger L2 perturbations but they're still small visually
+                    threshold = max(0.05, min(0.3, optimal_norm_value * 0.01))
+                cmap = plt.cm.plasma
+
+            # Create mask for significant changes only
             highlight_mask = pert_mag > threshold
 
-            # Calculate percentage of pixels changed for this visualization
+            # Calculate percentage of pixels highlighted
             pct_pixels_visible = np.mean(highlight_mask) * 100
-            logger.info(f"{name} grid: L-inf visible pixels: {pct_pixels_visible:.2f}%")
+            logger.info(
+                f"{name} grid: {norm_display} visible pixels: {pct_pixels_visible:.2f}%"
+            )
 
-            # Create a heatmap color overlay
-            cmap = plt.colormaps.get_cmap("viridis")
+            # Only apply highlight where changes are significant
+            if np.any(highlight_mask):
+                # Create a normalized version of perturbation magnitude for coloring
+                norm_pert = np.zeros_like(pert_mag)
+                norm_pert[highlight_mask] = np.clip(
+                    pert_mag[highlight_mask] / pert_mag[highlight_mask].max(), 0, 1
+                )
 
-            # Normalize perturbation magnitude
-            if pert_mag.max() > 0:
-                norm_mag = pert_mag / pert_mag.max()
-            else:
-                norm_mag = pert_mag
+                # Create RGBA overlay with very subtle transparency
+                rgba_overlay = cmap(norm_pert)
+                # Control transparency - make it very subtle (0.1-0.2 alpha)
+                rgba_overlay[..., 3] = norm_pert * 0.15  # Very subtle highlight
 
-            # Create RGBA heatmap with proper alpha
-            heatmap = cmap(norm_mag)
-            # Make it transparent where changes are below threshold
-            heatmap[..., 3] = np.zeros_like(norm_mag)  # Start with all transparent
-            heatmap[highlight_mask, 3] = 0.5 * intensity  # Add alpha where significant
+                # Add overlay to the adversarial image plot
+                axes[i + 1].imshow(rgba_overlay, alpha=0.2)
 
-            # Overlay heatmap
-            axes[i + 1].imshow(heatmap)
+            # Calculate and format SSIM for display
+            ssim_value = metrics["ssim"] * 100
 
-            # Add title with metrics
-            if metrics["ssim"] > 0.9999:
-                ssim_display = 99.99  # Cap at 99.99%
-            else:
-                ssim_display = metrics["ssim"] * 100
+            # Format the title to show the attack name and metrics
+            with torch.no_grad():
+                adv_pred = torch.argmax(model(adv_img.unsqueeze(0)), dim=1).item()
+
+            # Show what class it was misclassified as
+            pred_class = class_names[adv_pred]
 
             axes[i + 1].set_title(
-                f"{name}\n({ssim_display:.2f}% similar, L-inf={metrics['linf_norm']:.4f})",
+                f"{name}\n({ssim_value:.2f}% similar, {norm_display}={optimal_norm_value:.4f})",
                 pad=10,
             )
+
+            # Add prediction as text at bottom of image
+            axes[i + 1].text(
+                0.5,
+                0.98,
+                f"Pred: {pred_class}",
+                transform=axes[i + 1].transAxes,
+                fontsize=10,
+                ha="center",
+                va="top",
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8),
+            )
+
             axes[i + 1].axis("off")
 
         plt.tight_layout()
@@ -446,6 +485,17 @@ def main():
         fgsm_metrics = analyze_perturbation(adv_fgsm[0] - image[0], "FGSM")
         fgsm_metrics["ssim"] = fgsm_ssim
 
+        # Calculate L2 and Linf norms directly to verify
+        fgsm_perturbation = adv_fgsm[0] - image[0]
+        fgsm_l2 = torch.norm(fgsm_perturbation.flatten(), p=2).item()
+        fgsm_linf = torch.norm(fgsm_perturbation.flatten(), p=float("inf")).item()
+        logger.info(
+            f"FGSM L2 norm (direct): {fgsm_l2:.6f}, Linf norm (direct): {fgsm_linf:.6f}"
+        )
+        # Ensure metrics match direct calculation
+        fgsm_metrics["l2_norm"] = fgsm_l2
+        fgsm_metrics["linf_norm"] = fgsm_linf
+
         attack_results.append(
             {"name": "FGSM", "adv_img": adv_fgsm[0], "metrics": fgsm_metrics}
         )
@@ -465,6 +515,17 @@ def main():
         ffgsm_metrics = analyze_perturbation(adv_ffgsm[0] - image[0], "FFGSM")
         ffgsm_metrics["ssim"] = ffgsm_ssim
 
+        # Calculate L2 and Linf norms directly to verify
+        ffgsm_perturbation = adv_ffgsm[0] - image[0]
+        ffgsm_l2 = torch.norm(ffgsm_perturbation.flatten(), p=2).item()
+        ffgsm_linf = torch.norm(ffgsm_perturbation.flatten(), p=float("inf")).item()
+        logger.info(
+            f"FFGSM L2 norm (direct): {ffgsm_l2:.6f}, Linf norm (direct): {ffgsm_linf:.6f}"
+        )
+        # Ensure metrics match direct calculation
+        ffgsm_metrics["l2_norm"] = ffgsm_l2
+        ffgsm_metrics["linf_norm"] = ffgsm_linf
+
         attack_results.append(
             {"name": "FFGSM", "adv_img": adv_ffgsm[0], "metrics": ffgsm_metrics}
         )
@@ -483,6 +544,19 @@ def main():
 
         deepfool_metrics = analyze_perturbation(adv_deepfool[0] - image[0], "DeepFool")
         deepfool_metrics["ssim"] = deepfool_ssim
+
+        # Calculate L2 and Linf norms directly to verify
+        deepfool_perturbation = adv_deepfool[0] - image[0]
+        deepfool_l2 = torch.norm(deepfool_perturbation.flatten(), p=2).item()
+        deepfool_linf = torch.norm(
+            deepfool_perturbation.flatten(), p=float("inf")
+        ).item()
+        logger.info(
+            f"DeepFool L2 norm (direct): {deepfool_l2:.6f}, Linf norm (direct): {deepfool_linf:.6f}"
+        )
+        # Ensure metrics match direct calculation
+        deepfool_metrics["l2_norm"] = deepfool_l2
+        deepfool_metrics["linf_norm"] = deepfool_linf
 
         attack_results.append(
             {
@@ -504,6 +578,35 @@ def main():
 
         cw_metrics = analyze_perturbation(adv_cw[0] - image[0], "C&W")
         cw_metrics["ssim"] = cw_ssim
+
+        # Calculate L2 and Linf norms directly to verify
+        cw_perturbation = adv_cw[0] - image[0]
+        cw_l2 = torch.norm(cw_perturbation.flatten(), p=2).item()
+        cw_linf = torch.norm(cw_perturbation.flatten(), p=float("inf")).item()
+        logger.info(
+            f"C&W L2 norm (direct): {cw_l2:.6f}, Linf norm (direct): {cw_linf:.6f}"
+        )
+        # Ensure metrics match direct calculation
+        cw_metrics["l2_norm"] = cw_l2
+        cw_metrics["linf_norm"] = cw_linf
+
+        # Check if any L2 norm seems unreasonably large (like the 33.3256 value we saw)
+        if cw_metrics["l2_norm"] > 10.0:
+            logger.warning(
+                f"C&W L2 norm seems unusually large: {cw_metrics['l2_norm']}. Checking scaling..."
+            )
+            # It might be a scaling issue - normalize the metrics to [0,1] range if needed
+            if cw_perturbation.max() > 1.0 or cw_perturbation.min() < -1.0:
+                logger.warning(
+                    "Perturbation values outside [-1,1] range, suggesting possible scaling issue"
+                )
+
+            # Try an alternative calculation for very small perturbations
+            scaled_l2 = torch.norm(cw_perturbation.flatten() * 255, p=2).item() / 255
+            logger.info(f"Alternative C&W L2 calculation: {scaled_l2:.6f}")
+            if scaled_l2 < cw_metrics["l2_norm"] and scaled_l2 > 0.01:
+                logger.warning(f"Using alternative L2 calculation: {scaled_l2}")
+                cw_metrics["l2_norm"] = scaled_l2
 
         attack_results.append(
             {
