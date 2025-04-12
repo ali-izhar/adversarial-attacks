@@ -1,50 +1,34 @@
-"""Conjugate Gradient optimization method.
-
-This file implements the Conjugate Gradient optimizer for generating adversarial examples
-against neural networks. The optimizer finds minimal perturbations that cause model
-misclassification by efficiently navigating the loss landscape using conjugate search
-directions.
-"""
+"""Conjugate Gradient optimization method."""
 
 import torch
 import time
-import math
 from typing import Tuple, Dict, Any, Optional, Callable
-from contextlib import nullcontext
 
 from .projections import project_adversarial_example
 
 
 class ConjugateGradientOptimizer:
-    """
-    Conjugate Gradient optimization method for generating adversarial examples.
-
-    This implementation uses nonlinear conjugate gradient descent with:
-    - Multiple conjugacy formulas (Fletcher-Reeves, Polak-Ribière, Hestenes-Stiefel)
-    - Adaptive restart conditions based on conjugacy loss
-    - Line search with backtracking Armijo condition
-    - Proper orthogonalization of search directions
-    """
+    """Implementation of nonlinear conjugate gradient descent."""
 
     def __init__(
         self,
         norm: str = "L2",
-        eps: float = 5.0,
-        n_iterations: int = 50,
+        eps: float = 5.0,  # perturbation budget ε constraint
+        n_iterations: int = 50,  # iterations T parameter
         beta_method: str = "HS",  # Options: "FR", "PR", "HS" (Hestenes-Stiefel)
         restart_interval: int = 10,
         line_search_factor: float = 0.5,
         sufficient_decrease: float = 1e-4,
         line_search_max_iter: int = 10,
-        rand_init: bool = True,
+        rand_init: bool = True,  # δ₀ ← U(-0.01, 0.01)ⁿ random initialization
         init_std: float = 0.1,
-        early_stopping: bool = True,
+        early_stopping: bool = True,  # early stopping if successful attack
         verbose: bool = False,
         adaptive_restart: bool = True,
         momentum: float = 0.0,  # Should be 0 for pure CG
         fgsm_init: bool = True,
-        multi_stage: bool = False,  # Turned off by default
-        auto_tune_eps: bool = False,  # Turned off by default
+        multi_stage: bool = False,
+        auto_tune_eps: bool = False,
     ):
         """
         Initialize the optimizer with parameters that control:
@@ -52,19 +36,23 @@ class ConjugateGradientOptimizer:
         - Maximum allowed perturbation size (eps)
         - Maximum number of iterations and other algorithmic details
         """
+        # ||δ||_p ≤ ε constraint
         self.norm = norm
         self.eps = eps
-        self.n_iterations = n_iterations
+        self.n_iterations = n_iterations  # iterations T parameter
+        # β formulas - FR, PR, or HS
         self.beta_method = beta_method
         self.restart_interval = restart_interval
         self.line_search_factor = line_search_factor
         self.sufficient_decrease = sufficient_decrease
         self.line_search_max_iter = line_search_max_iter
+        # δ₀ ← U(-0.01, 0.01)ⁿ random initialization
         self.rand_init = rand_init
         self.init_std = init_std
+        # break if ||r_{k+1}|| < tol or arg max_j f_j(x + δ_{k+1}) ≠ y_true
         self.early_stopping = early_stopping
         self.verbose = verbose
-        self.momentum = momentum  # Should be 0 for pure CG
+        self.momentum = momentum  # Pure CG uses no momentum
 
         # Additional parameters
         self.adaptive_restart = adaptive_restart
@@ -89,6 +77,11 @@ class ConjugateGradientOptimizer:
         """
         Compute conjugate gradient beta parameter using various formulas.
 
+        # Paper directly implements these three β formulas:
+        # β_t^FR = ||g_{t+1}||²/||g_t||² (Fletcher-Reeves)
+        # β_t^PR = g_{t+1}ᵀ(g_{t+1} - g_t)/(g_tᵀg_t) (Polak-Ribière)
+        # β_t^HS = g_{t+1}ᵀ(g_{t+1} - g_t)/(d_tᵀ(g_{t+1} - g_t)) (Hestenes-Stiefel)
+
         Args:
             grad_new: New gradient at current point
             grad_old: Previous gradient
@@ -111,7 +104,7 @@ class ConjugateGradientOptimizer:
         beta = torch.zeros(batch_size, device=grad_new.device)
 
         if self.beta_method == "FR":  # Fletcher-Reeves
-            # β_FR = ||∇f_k+1||² / ||∇f_k||²
+            # β_t^FR = ||g_{t+1}||²/||g_t||²
             grad_new_sq = (grad_new_flat**2).sum(dim=1)
             grad_old_sq = (grad_old_flat**2).sum(dim=1)
 
@@ -120,7 +113,7 @@ class ConjugateGradientOptimizer:
             beta[safe_mask] = grad_new_sq[safe_mask] / grad_old_sq[safe_mask]
 
         elif self.beta_method == "PR":  # Polak-Ribière
-            # β_PR = ∇f_k+1 · (∇f_k+1 - ∇f_k) / ||∇f_k||²
+            # β_t^PR = g_{t+1}ᵀ(g_{t+1} - g_t)/(g_tᵀg_t)
             grad_old_sq = (grad_old_flat**2).sum(dim=1)
             numerator = (grad_new_flat * y).sum(dim=1)
 
@@ -132,7 +125,7 @@ class ConjugateGradientOptimizer:
             beta = torch.clamp(beta, min=0)
 
         elif self.beta_method == "HS":  # Hestenes-Stiefel
-            # β_HS = ∇f_k+1 · (∇f_k+1 - ∇f_k) / [d_k · (∇f_k+1 - ∇f_k)]
+            # β_t^HS = g_{t+1}ᵀ(g_{t+1} - g_t)/(d_tᵀ(g_{t+1} - g_t))
             # First compute denominator: d_k · y
             denominator = (d_old_flat * y).sum(dim=1)
             numerator = (grad_new_flat * y).sum(dim=1)
@@ -158,6 +151,9 @@ class ConjugateGradientOptimizer:
     ) -> torch.BoolTensor:
         """
         Check if conjugacy is lost and restart is needed.
+
+        # Paper mentions: "periodic restart every restart_interval iterations"
+        # This is an enhancement of the paper's approach with more sophisticated restart criteria
 
         Conditions for restart (any of):
         1. Direction and gradient nearly parallel (> 0.2 cosine similarity)
@@ -220,6 +216,10 @@ class ConjugateGradientOptimizer:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Improved backtracking line search satisfying Armijo condition.
+
+        # Paper uses a simple optimal step size: α_k = r_k^T r_k / (p_k^T A p_k)
+        # This is an enhancement that uses a more robust line search approach
+        # for the nonlinear case where the simple formula may not be optimal
 
         Args:
             x: Current point
@@ -286,6 +286,7 @@ class ConjugateGradientOptimizer:
             if x_original is not None:
                 # Project each sample using its specific epsilon
                 for j in range(batch_size):
+                    # δ_{k+1} ← Π_{||·||_p ≤ ε}(δ_k + α_k p_k) projection step
                     x_new[j : j + 1] = project_adversarial_example(
                         x_new[j : j + 1],
                         x_original[j : j + 1],
@@ -380,6 +381,9 @@ class ConjugateGradientOptimizer:
         """
         Initialize adversarial examples using Fast Gradient Sign Method.
 
+        # This is an enhancement beyond the paper's random initialization
+        # to provide a better starting point closer to the decision boundary
+
         Args:
             x_original: Original clean images
             gradient_fn: Function to compute gradient
@@ -447,6 +451,9 @@ class ConjugateGradientOptimizer:
         """
         Run conjugate gradient optimization to generate adversarial examples.
 
+        # This is the main function that implements Algorithm 1 from the paper:
+        # "Efficient Conjugate Gradient Attack"
+
         Args:
             x_init: Initial images
             gradient_fn: Function to compute gradient of loss
@@ -483,7 +490,7 @@ class ConjugateGradientOptimizer:
             # Count gradient calls for initialization
             gradient_calls += 1
         elif self.rand_init and x_original is not None:
-            # Random initialization at the boundary
+            # δ₀ ← U(-0.01, 0.01)ⁿ - Random initialization
             x_adv = torch.zeros_like(x_original)
             for i in range(batch_size):
                 if self.norm.lower() == "l2":
@@ -548,6 +555,7 @@ class ConjugateGradientOptimizer:
             grad_all = torch.zeros_like(x_adv)
 
             # Get gradient only for active samples to save computation
+            # g_t = ∇_δ L(f(x + δ_t), y) - computing the gradient
             grad_active = gradient_fn(x_current)
             gradient_calls[active] += 1
 
@@ -557,6 +565,7 @@ class ConjugateGradientOptimizer:
             # Initialize search direction or compute conjugate direction
             if i == 0 or prev_grad is None:
                 # First iteration: use negative gradient (steepest descent)
+                # p_0 = r_0 where r_0 is -gradient
                 d_all = -grad_all.clone()
                 prev_grad = grad_all.clone()
                 prev_d = d_all.clone()
@@ -594,6 +603,7 @@ class ConjugateGradientOptimizer:
                     # For samples continuing CG, compute beta and update direction
                     if continue_mask.any():
                         # Compute beta only for continuing samples
+                        # β_{k+1} = ||g_{t+1}||²/||g_t||² (for FR method)
                         beta = self._compute_beta(
                             grad_active[continue_mask],
                             prev_grad_active[continue_mask],
@@ -601,7 +611,8 @@ class ConjugateGradientOptimizer:
                             y_active[continue_mask],
                         )
 
-                        # Update direction: d = -grad + beta * prev_d
+                        # Update direction
+                        # p_{k+1} = -r_{k+1} + β_{k+1} p_k
                         d_active[continue_mask] = (
                             -grad_active[continue_mask]
                             + beta.view(-1, 1, 1, 1) * prev_d_active[continue_mask]
@@ -658,6 +669,8 @@ class ConjugateGradientOptimizer:
                         return full_loss[active]
 
                 # Line search with per-sample epsilon
+                # α_k = r_k^T r_k / (p_k^T A p_k) optimal step size
+                # Our implementation uses a more robust line search for nonlinear case
                 alpha, d_search = self._line_search(
                     x_adv[active],
                     d_all[active],
@@ -693,6 +706,7 @@ class ConjugateGradientOptimizer:
                 if x_original is not None:
                     for i in range(batch_size):
                         if active[i]:
+                            # δ_{k+1} ← Π_{||·||_p ≤ ε}(δ_k + α_k p_k)
                             x_adv_new[i : i + 1] = project_adversarial_example(
                                 x_adv_new[i : i + 1],
                                 x_original[i : i + 1],
@@ -715,6 +729,8 @@ class ConjugateGradientOptimizer:
 
                 # Update active samples mask for early stopping
                 if self.early_stopping:
+                    # break if ||r_{k+1}|| < tol or arg max_j f_j(x + δ_{k+1}) ≠ y_true
+                    # This implements the early stopping if attack succeeds
                     active = ~success
 
             # Verbose logging

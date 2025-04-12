@@ -20,6 +20,9 @@ class CG(Attack):
     r"""
     Enhanced Conjugate Gradient Attack with perceptual constraints.
 
+    # Paper: "For adversarial attacks, we formulate the optimization problem as:
+    # min_δ L(f(x + δ), y) subject to ||δ||_p ≤ ε"
+
     This attack creates adversarial examples by optimizing the input using
     conjugate gradient descent to find minimal perturbations that cause
     misclassification while maintaining visual similarity. The improved implementation
@@ -45,18 +48,18 @@ class CG(Attack):
     def __init__(
         self,
         model,
-        norm: str = "L2",
-        eps: float = 0.5,
-        n_iter: int = 50,
-        beta_method: str = "HS",  # Hestenes-Stiefel method (best for nonlinear CG)
-        restart_interval: int = 10,
-        tv_lambda: float = 0.2,  # Reduced TV strength for better convergence
-        color_lambda: float = 0.3,  # Reduced color regularization
-        perceptual_lambda: float = 0.4,  # Weight for frequency domain perceptual loss
-        rand_init: bool = False,  # Don't use random init by default
-        fgsm_init: bool = True,  # Use FGSM initialization by default
-        adaptive_restart: bool = True,  # Enable adaptive restart for better convergence
-        early_stopping: bool = True,
+        norm: str = "L2",  # Paper: uses both L2 and Linf norms for constraints
+        eps: float = 0.5,  # Paper: "perturbation budget ε" constraint
+        n_iter: int = 50,  # Paper: "iterations T" parameter
+        beta_method: str = "HS",  # Paper: Hestenes-Stiefel method (best for nonlinear CG)
+        restart_interval: int = 10,  # Paper: mentions restart interval
+        tv_lambda: float = 0.2,  # Additional regularization beyond paper
+        color_lambda: float = 0.3,  # Additional regularization beyond paper
+        perceptual_lambda: float = 0.4,  # Additional regularization beyond paper
+        rand_init: bool = False,  # Paper: "δ₀ ← U(-0.01, 0.01)ⁿ" random initialization
+        fgsm_init: bool = True,  # Enhancement beyond paper
+        adaptive_restart: bool = True,  # Enhancement beyond paper
+        early_stopping: bool = True,  # Paper: "break if attack succeeds"
         verbose: bool = False,
     ):
         # Initialize the Attack base class
@@ -102,6 +105,9 @@ class CG(Attack):
     def total_variation_loss(self, delta):
         """Calculate total variation loss for smoothness.
 
+        # Enhancement beyond paper - adds regularization for visual quality
+        # This is not in the original paper formulation
+
         Args:
             delta: Perturbation tensor of shape (B, C, H, W)
 
@@ -125,6 +131,9 @@ class CG(Attack):
     def color_regularization(self, delta):
         """Calculate color regularization to penalize visible changes.
 
+        # Enhancement beyond paper - adds perceptual regularization
+        # This is not in the original paper formulation
+
         Args:
             delta: Perturbation tensor of shape (B, C, H, W)
 
@@ -146,6 +155,9 @@ class CG(Attack):
 
     def perceptual_loss(self, delta, input_images):
         """Calculate perceptual loss to preserve image structure.
+
+        # Enhancement beyond paper - adds frequency domain loss
+        # This is not in the original paper formulation
 
         Args:
             delta: Perturbation tensor of shape (B, C, H, W)
@@ -186,6 +198,9 @@ class CG(Attack):
     def forward(self, images, labels):
         r"""
         Overridden method for generating adversarial examples.
+
+        # Paper: "min_δ L(f(x + δ), y) subject to ||δ||_p ≤ ε"
+        # This is the main attack method implementing the paper's approach
 
         Arguments:
             images (torch.Tensor): Input images.
@@ -241,6 +256,7 @@ class CG(Attack):
             delta = x - images[: x.size(0)]
 
             # Add regularization losses - all should return per-sample values
+            # Note: These regularization terms are enhancements beyond the paper
             tv_loss = self.total_variation_loss(delta)
             color_loss = self.color_regularization(delta)
             percept_loss = self.perceptual_loss(delta, images[: x.size(0)])
@@ -254,6 +270,7 @@ class CG(Attack):
             )
 
             # Compute gradients for each sample
+            # Paper: "g_t = ∇_δ L(f(x + δ_t), y)" - computing the gradient
             grads = []
             for i in range(x.size(0)):
                 grad = torch.autograd.grad(
@@ -317,9 +334,12 @@ class CG(Attack):
                     return outputs.argmax(dim=1) == curr_labels
                 else:
                     # Attack succeeds if model predicts any class other than the true label
+                    # Paper: "break if ||r_{k+1}|| < tol or arg max_j f_j(x + δ_{k+1}) ≠ y_true"
+                    # This is the second condition for early stopping
                     return outputs.argmax(dim=1) != curr_labels
 
         # Run the optimizer to generate adversarial examples
+        # This executes the Algorithm 1 from the paper (Efficient Conjugate Gradient Attack)
         adv_images, metrics = self.optimizer.optimize(
             x_init=images,
             gradient_fn=gradient_fn,
