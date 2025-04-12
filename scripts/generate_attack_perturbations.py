@@ -14,6 +14,8 @@ from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
 import logging
 import traceback
+import seaborn as sns
+from matplotlib.colors import TwoSlopeNorm
 
 # Configure logging
 logging.basicConfig(
@@ -122,126 +124,6 @@ def analyze_perturbation(perturbation, name):
             "min_val": 0.0,
             "pixels_changed": 0.0,
         }
-
-
-def create_visualizations(
-    original, perturbed, name, metrics, class_names, idx=0, thresholds=None
-):
-    """
-    Create detailed visualization for one attack method.
-    Shows original, adversarial, and difference highlighting using L-infinity norm.
-    """
-    try:
-        if thresholds is None:
-            # Adaptive thresholds based on the perturbation magnitude
-            thresholds = {
-                "highlight": max(
-                    0.003, metrics["linf_norm"] * 0.1
-                ),  # 10% of L-infinity norm with minimum
-                "significant": max(
-                    0.01, metrics["linf_norm"] * 0.5
-                ),  # 50% of L-infinity norm with minimum
-            }
-
-        # Get image data
-        orig_img = denormalize(original).cpu()
-        adv_img = denormalize(perturbed).cpu()
-
-        # Calculate perturbation
-        perturbation = perturbed - original
-
-        # Convert to numpy for matplotlib
-        orig_np = orig_img.permute(1, 2, 0).numpy()
-        adv_np = adv_img.permute(1, 2, 0).numpy()
-
-        # Calculate pixel-wise absolute difference using L-infinity norm (max change across RGB channels)
-        pixel_diff = torch.max(torch.abs(perturbation), dim=0)[0].cpu().numpy()
-
-        # Create visualization
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-        # Original image
-        axes[0].imshow(orig_np)
-        axes[0].set_title(f"Original\nPredicted: {class_names[idx]}")
-        axes[0].axis("off")
-
-        # Adversarial image
-        axes[1].imshow(adv_np)
-        with torch.no_grad():
-            adv_pred = torch.argmax(model(perturbed.unsqueeze(0)), dim=1).item()
-        axes[1].set_title(f"Adversarial ({name})\nPredicted: {class_names[adv_pred]}")
-        axes[1].axis("off")
-
-        # Difference visualization (overlay on adversarial)
-        axes[2].imshow(adv_np)
-
-        # Create custom colormap for differences
-        # Blue for minimal changes, yellow for moderate, red for significant
-        colors = [
-            (0, 0, 1, 0),  # Transparent blue (minimal)
-            (0, 0, 1, 0.3),  # Semi-transparent blue (very small)
-            (1, 1, 0, 0.5),  # Semi-transparent yellow (moderate)
-            (1, 0, 0, 0.7),
-        ]  # Semi-transparent red (significant)
-
-        # Create mask where differences are above threshold
-        highlight_mask = pixel_diff > thresholds["highlight"]
-
-        # Calculate percentage of pixels changed for this visualization
-        pct_pixels_visible = np.mean(highlight_mask) * 100
-        logger.info(
-            f"{name}: Percentage of pixels highlighted with L-inf norm: {pct_pixels_visible:.2f}%"
-        )
-
-        # Create heatmap of differences
-        cmap = LinearSegmentedColormap.from_list("custom_diff", colors, N=100)
-
-        # Normalize difference values for colormap
-        # Small differences will be blue, large differences will be red
-        norm_diff = np.zeros_like(pixel_diff)
-        if pixel_diff.max() > 0:
-            norm_diff = np.clip(pixel_diff / thresholds["significant"], 0, 3) / 3
-
-        # Plot only where the mask is True
-        masked_diff = np.zeros_like(norm_diff)
-        masked_diff[highlight_mask] = norm_diff[highlight_mask]
-
-        # Plot heatmap on top of adversarial image
-        diff_plot = axes[2].imshow(masked_diff, cmap=cmap, alpha=0.7)
-        axes[2].set_title(
-            f"Perturbation Highlights (L-inf)\nL-inf={metrics['linf_norm']:.4f}, SSIM={metrics['ssim']:.4f}"
-        )
-        axes[2].axis("off")
-
-        # Add colorbar
-        cbar = plt.colorbar(diff_plot, ax=axes[2], orientation="vertical", shrink=0.7)
-        cbar.set_label("Perturbation Intensity")
-
-        # Add metrics as text in the plot
-        metrics_text = (
-            f"L-inf Norm: {metrics['linf_norm']:.4f}\n"
-            f"L2 Norm: {metrics['l2_norm']:.4f}\n"
-            f"SSIM: {metrics['ssim']:.4f}\n"
-            f"Visible Pixels: {pct_pixels_visible:.2f}%\n"
-            f"Changed Pixels: {metrics['pixels_changed']:.2f}%"
-        )
-
-        axes[2].text(
-            0.02,
-            0.02,
-            metrics_text,
-            transform=axes[2].transAxes,
-            fontsize=9,
-            verticalalignment="bottom",
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
-        )
-
-        plt.tight_layout()
-        return fig
-    except Exception as e:
-        logger.error(f"Error creating visualization for {name}: {str(e)}")
-        logger.error(traceback.format_exc())
-        return None
 
 
 def create_comparison_grid(original, attack_results, class_names, orig_idx):
@@ -619,21 +501,7 @@ def main():
         # Create output directory
         os.makedirs("paper/images", exist_ok=True)
 
-        # Create detailed visualizations for each attack
-        logger.info("Creating detailed visualizations...")
-        for result in attack_results:
-            safe_name = get_safe_filename(result["name"])
-            fig = create_visualizations(
-                image[0],
-                result["adv_img"],
-                result["name"],
-                result["metrics"],
-                dataset.class_names,
-                orig_pred,
-            )
-            save_figure(fig, f"paper/images/attack_details_{safe_name}.png", dpi=300)
-
-        # Create comparison grid visualization
+        # Only create and save the comparison grid
         logger.info("Creating comparison grid visualization...")
         grid_fig = create_comparison_grid(
             image[0], attack_results, dataset.class_names, orig_pred
