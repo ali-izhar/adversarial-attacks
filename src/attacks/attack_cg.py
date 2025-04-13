@@ -67,7 +67,14 @@ class CG(Attack):
 
         # Record attack parameters
         self.norm = norm
-        self.eps = eps
+        self.orig_eps = eps  # Store the original epsilon in [0,1] space
+
+        # Scale epsilon to normalized space by dividing by ImageNet std
+        mean_std = self.std.clone().detach().mean().item()
+        self.eps = (
+            eps / mean_std
+        )  # Scaling to normalized space for consistent perturbation
+
         self.n_iter = n_iter
         self.beta_method = beta_method
         self.restart_interval = restart_interval
@@ -86,7 +93,7 @@ class CG(Attack):
         # Create the optimizer with correct parameters
         self.optimizer = ConjugateGradientOptimizer(
             norm=norm,
-            eps=eps,
+            eps=self.eps,  # Use the scaled epsilon for normalized space
             n_iterations=n_iter,
             beta_method=beta_method,
             restart_interval=restart_interval,
@@ -224,6 +231,18 @@ class CG(Attack):
         else:
             target_labels = labels
 
+        # Calculate normalized min/max bounds for valid pixel ranges after denormalization
+        min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
+        max_bound = ((1 - self.mean) / self.std).to(
+            device=images.device, dtype=images.dtype
+        )
+        min_bound = min_bound.view(1, 3, 1, 1)
+        max_bound = max_bound.view(1, 3, 1, 1)
+
+        # Scale epsilon to normalized space by dividing by ImageNet std
+        mean_std = self.std.clone().detach().mean().item()
+        scaled_eps = self.eps / mean_std  # Scaling to normalized space
+
         # Use cross-entropy loss for classification
         ce_loss = nn.CrossEntropyLoss(reduction="none")
 
@@ -338,6 +357,9 @@ class CG(Attack):
                     # This is the second condition for early stopping
                     return outputs.argmax(dim=1) != curr_labels
 
+        # Create per-sample epsilon tensor with the scaled value
+        per_sample_eps = torch.ones(images.size(0), device=self.device) * scaled_eps
+
         # Run the optimizer to generate adversarial examples
         # This executes the Algorithm 1 from the paper (Efficient Conjugate Gradient Attack)
         adv_images, metrics = self.optimizer.optimize(
@@ -347,6 +369,8 @@ class CG(Attack):
             success_fn=success_fn,
             x_original=images,
             targeted=self.targeted,
+            min_bound=min_bound,
+            max_bound=max_bound,
         )
 
         # Update attack metrics from optimizer results
@@ -358,7 +382,7 @@ class CG(Attack):
         self.total_time += self.end_time - self.start_time
 
         # Ensure outputs are properly clamped
-        adv_images = torch.clamp(adv_images, 0, 1).detach()
+        adv_images = torch.clamp(adv_images, min=min_bound, max=max_bound).detach()
 
         # Evaluate success and compute perturbation metrics
         success_rate, success_mask, pred_info = self.evaluate_attack_success(
@@ -389,3 +413,79 @@ class CG(Attack):
             print(f"Time per sample: {metrics['time_per_sample']*1000:.2f}ms")
 
         return adv_images
+
+    def compute_skimage_ssim(self, img1, img2):
+        """
+        Compute SSIM using scikit-image implementation.
+
+        Args:
+            img1: First tensor of images [N,C,H,W]
+            img2: Second tensor of images [N,C,H,W]
+
+        Returns:
+            Average SSIM value across the batch
+        """
+        from skimage.metrics import structural_similarity as ssim
+        import numpy as np
+
+        # Move tensors to CPU and convert to numpy
+        img1_np = img1.detach().cpu().permute(0, 2, 3, 1).numpy()
+        img2_np = img2.detach().cpu().permute(0, 2, 3, 1).numpy()
+
+        # Calculate SSIM for each image in batch
+        ssim_values = []
+        for i in range(img1_np.shape[0]):
+            # Convert to [0,1] range - using shared scaling to preserve differences
+            # First find global min/max across both images
+            min_val = min(img1_np[i].min(), img2_np[i].min())
+            max_val = max(img1_np[i].max(), img2_np[i].max())
+
+            # Apply same normalization to both images to maintain relative differences
+            scale = max_val - min_val
+            if scale < 1e-7:  # Avoid division by zero
+                scale = 1.0
+
+            img1_norm = (img1_np[i] - min_val) / scale
+            img2_norm = (img2_np[i] - min_val) / scale
+
+            # Multi-channel SSIM - compute for each channel separately to be more sensitive
+            ssim_val = 0
+            for c in range(img1_norm.shape[2]):
+                ssim_val += ssim(
+                    img1_norm[:, :, c],
+                    img2_norm[:, :, c],
+                    data_range=1.0,
+                    gaussian_weights=True,
+                    sigma=1.5,
+                    use_sample_covariance=False,
+                )
+
+            # Average across channels
+            ssim_val /= img1_norm.shape[2]
+            ssim_values.append(ssim_val)
+
+        return np.mean(ssim_values)
+
+    def compute_perturbation_metrics(self, original, perturbed, success_mask=None):
+        """
+        Compute metrics to evaluate the perturbation quality.
+
+        This overrides the base class method to use scikit-image SSIM.
+
+        Args:
+            original: Original clean images
+            perturbed: Perturbed adversarial images
+            success_mask: Optional mask indicating successful perturbations
+
+        Returns:
+            Dictionary with perturbation metrics
+        """
+        # Get base metrics from parent class
+        metrics = super().compute_perturbation_metrics(
+            original, perturbed, success_mask
+        )
+
+        # Override SSIM calculation with scikit-image implementation
+        metrics["ssim"] = self.compute_skimage_ssim(original, perturbed)
+
+        return metrics

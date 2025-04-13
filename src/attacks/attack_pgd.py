@@ -104,16 +104,33 @@ class PGD(Attack):
         # Calculate SSIM for each image in batch
         ssim_values = []
         for i in range(img1_np.shape[0]):
-            # Normalize to [0, 1] range for scikit-image
-            img1_norm = (img1_np[i] - img1_np[i].min()) / (
-                img1_np[i].max() - img1_np[i].min() + 1e-8
-            )
-            img2_norm = (img2_np[i] - img2_np[i].min()) / (
-                img2_np[i].max() - img2_np[i].min() + 1e-8
-            )
+            # Convert to [0,1] range - using shared scaling to preserve differences
+            # First find global min/max across both images
+            min_val = min(img1_np[i].min(), img2_np[i].min())
+            max_val = max(img1_np[i].max(), img2_np[i].max())
 
-            # Multi-channel SSIM (average over channels)
-            ssim_val = ssim(img1_norm, img2_norm, channel_axis=2, data_range=1.0)
+            # Apply same normalization to both images to maintain relative differences
+            scale = max_val - min_val
+            if scale < 1e-7:  # Avoid division by zero
+                scale = 1.0
+
+            img1_norm = (img1_np[i] - min_val) / scale
+            img2_norm = (img2_np[i] - min_val) / scale
+
+            # Multi-channel SSIM - compute for each channel separately to be more sensitive
+            ssim_val = 0
+            for c in range(img1_norm.shape[2]):
+                ssim_val += ssim(
+                    img1_norm[:, :, c],
+                    img2_norm[:, :, c],
+                    data_range=1.0,
+                    gaussian_weights=True,
+                    sigma=1.5,
+                    use_sample_covariance=False,
+                )
+
+            # Average across channels
+            ssim_val /= img1_norm.shape[2]
             ssim_values.append(ssim_val)
 
         return np.mean(ssim_values)
