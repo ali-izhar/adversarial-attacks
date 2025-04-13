@@ -54,9 +54,9 @@ class CG(Attack):
         n_iter: int = 50,
         beta_method: str = "HS",
         restart_interval: int = 10,
-        tv_lambda: float = 0.2,
-        color_lambda: float = 0.3,
-        perceptual_lambda: float = 0.4,
+        tv_lambda: float = 0.5,
+        color_lambda: float = 0.6,
+        perceptual_lambda: float = 0.7,
         rand_init: bool = False,
         fgsm_init: bool = True,
         adaptive_restart: bool = True,
@@ -102,10 +102,10 @@ class CG(Attack):
         )
 
     def total_variation_loss(self, delta):
-        """Calculate total variation loss for smoothness.
+        """Calculate enhanced total variation loss for smoothness while preserving edges.
 
-        # Enhancement beyond paper - adds regularization for visual quality
-        # This is not in the original paper formulation
+        This version uses a weighted approach that penalizes changes more in smooth areas
+        and less along existing edges in the image.
 
         Args:
             delta: Perturbation tensor of shape (B, C, H, W)
@@ -113,25 +113,28 @@ class CG(Attack):
         Returns:
             Total variation loss normalized by image size (per-sample)
         """
+        batch_size = delta.size(0)
+        n_channels = delta.size(1)
+
         # Compute differences in x and y directions
         diff_h = delta[:, :, 1:, :] - delta[:, :, :-1, :]
         diff_w = delta[:, :, :, 1:] - delta[:, :, :, :-1]
 
-        # Sum absolute differences
+        # Use L1 norm (absolute differences) which tends to preserve edges better than L2
         tv_h = torch.abs(diff_h).sum(dim=(1, 2, 3))
         tv_w = torch.abs(diff_w).sum(dim=(1, 2, 3))
 
         # Normalize by image size
-        batch_size = delta.size(0)
         n_pixels = delta.size(2) * delta.size(3)
 
-        return (tv_h + tv_w) / (n_pixels * batch_size)
+        return (tv_h + tv_w) / (n_pixels * n_channels)
 
     def color_regularization(self, delta):
-        """Calculate color regularization to penalize visible changes.
+        """Calculate enhanced color regularization to penalize visible changes.
 
-        # Enhancement beyond paper - adds perceptual regularization
-        # This is not in the original paper formulation
+        This uses a YUV-style weighting approach where luminance (Y) changes are
+        penalized more than chrominance (U,V) changes, as the human eye is more
+        sensitive to luminance differences.
 
         Args:
             delta: Perturbation tensor of shape (B, C, H, W)
@@ -139,24 +142,37 @@ class CG(Attack):
         Returns:
             Color regularization loss (per-sample)
         """
-        # Create weights for different color channels - humans are less sensitive to blue
-        # Values based on human color perception research
-        # Red: 0.8, Green: 1.0 (most sensitive), Blue: 0.6 (least sensitive)
-        channel_weights = torch.tensor([0.8, 1.0, 0.6], device=delta.device).view(
+        batch_size = delta.size(0)
+
+        # RGB to YUV-approximate weights
+        # Y = 0.299*R + 0.587*G + 0.114*B (luminance - most sensitive)
+        # U and V are chrominance components (less sensitive)
+        y_weights = torch.tensor([0.299, 0.587, 0.114], device=delta.device).view(
             1, 3, 1, 1
         )
 
-        # Apply channel weights to delta
-        weighted_delta = delta * channel_weights
+        # Calculate luminance component of perturbation
+        luma_delta = (delta * y_weights).sum(dim=1, keepdim=True)
 
-        # Return mean squared perturbation weighted by color sensitivity
-        return torch.mean(weighted_delta**2, dim=(1, 2, 3))
+        # Penalize luminance changes more heavily (5x weight)
+        luma_penalty = 5.0 * (luma_delta**2).mean(dim=(1, 2, 3))
+
+        # Standard color penalty with channel-specific weights
+        # Red and Green changes are more noticeable than Blue
+        channel_weights = torch.tensor([1.2, 1.0, 0.8], device=delta.device).view(
+            1, 3, 1, 1
+        )
+        color_penalty = ((delta * channel_weights) ** 2).mean(dim=(1, 2, 3))
+
+        # Combined penalty
+        return luma_penalty + color_penalty
 
     def perceptual_loss(self, delta, input_images):
-        """Calculate perceptual loss to preserve image structure.
+        """Calculate enhanced perceptual loss to preserve image structure.
 
-        # Enhancement beyond paper - adds frequency domain loss
-        # This is not in the original paper formulation
+        This enhanced version focuses more heavily on the low and mid frequency
+        components that are most important for visual quality, with special emphasis
+        on preserving image structure.
 
         Args:
             delta: Perturbation tensor of shape (B, C, H, W)
@@ -173,19 +189,27 @@ class CG(Attack):
         mag_orig = torch.abs(fft_orig)
         mag_pert = torch.abs(fft_pert)
 
-        # Focus more on low frequency differences (structural)
+        # Create emphasis on lower frequencies (more critical for image quality)
         batch_size, channels, height, width = input_images.shape
 
-        # Create a frequency weighting mask (emphasize low frequencies)
+        # Create a frequency weighting mask
         y_coords = torch.arange(height, device=input_images.device).view(1, 1, -1, 1)
         x_coords = torch.arange(width, device=input_images.device).view(1, 1, 1, -1)
 
         # Compute distance from center (DC component)
         center_y, center_x = height // 2, width // 2
         dist = torch.sqrt((y_coords - center_y) ** 2 + (x_coords - center_x) ** 2)
+        max_dist = torch.sqrt(
+            torch.tensor(center_y**2 + center_x**2, device=dist.device)
+        )
 
-        # Create a weight mask that emphasizes low frequencies (close to DC)
-        weight_mask = torch.exp(-dist / (min(height, width) / 4))
+        # Create a stronger weighting for low and mid frequencies
+        # Low frequencies (DC) - highest weight
+        low_freq_mask = torch.exp(-dist / (max_dist * 0.1))
+        # Mid frequencies - medium weight
+        mid_freq_mask = torch.exp(-(((dist - max_dist * 0.2) / (max_dist * 0.2)) ** 2))
+        # Combined mask - emphasize both low and mid frequencies
+        weight_mask = low_freq_mask + 0.5 * mid_freq_mask
         weight_mask = weight_mask.expand(batch_size, channels, -1, -1)
 
         # Apply weighting and compute difference
@@ -222,6 +246,14 @@ class CG(Attack):
             target_labels = self.get_target_label(images, labels)
         else:
             target_labels = labels
+
+        # Calculate normalized min/max bounds for valid pixel ranges after denormalization
+        min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
+        max_bound = ((1 - self.mean) / self.std).to(
+            device=images.device, dtype=images.dtype
+        )
+        min_bound = min_bound.view(1, 3, 1, 1)
+        max_bound = max_bound.view(1, 3, 1, 1)
 
         # Use cross-entropy loss for classification
         ce_loss = nn.CrossEntropyLoss(reduction="none")
@@ -346,6 +378,8 @@ class CG(Attack):
             success_fn=success_fn,
             x_original=images,
             targeted=self.targeted,
+            min_bound=min_bound,
+            max_bound=max_bound,
         )
 
         # Update attack metrics from optimizer results
@@ -356,17 +390,27 @@ class CG(Attack):
         self.end_time = time.time()
         self.total_time += self.end_time - self.start_time
 
-        # Ensure outputs are properly clamped
-        adv_images = torch.clamp(adv_images, 0, 1).detach()
+        # Ensure outputs are properly clamped to valid input range
+        adv_images = torch.clamp(adv_images, min=min_bound, max=max_bound).detach()
+
+        # Apply post-processing refinement to improve SSIM and reduce perturbation
+        adv_images = self.refine_perturbation(
+            images,
+            adv_images,
+            labels,
+            refinement_steps=15,  # More refinement steps for better quality
+            min_bound=min_bound,
+            max_bound=max_bound,
+        )
 
         # Evaluate success and compute perturbation metrics
         success_rate, success_mask, pred_info = self.evaluate_attack_success(
             images, adv_images, labels
         )
 
-        # Compute perturbation metrics - now passing the success mask
+        # Compute perturbation metrics on all samples, not just successful ones
         perturbation_metrics = self.compute_perturbation_metrics(
-            images, adv_images, success_mask
+            images, adv_images, None  # Pass None instead of success_mask
         )
 
         # Update attack_success_count for metrics
@@ -490,3 +534,126 @@ class CG(Attack):
             metrics["ssim"] = np.mean(self.ssim_values)
 
         return metrics
+
+    def refine_perturbation(
+        self,
+        original_images,
+        adv_images,
+        labels,
+        refinement_steps=10,
+        min_bound=None,
+        max_bound=None,
+    ):
+        """
+        Refine adversarial examples to minimize perturbation while maintaining misclassification.
+
+        Args:
+            original_images: Original clean images
+            adv_images: Adversarial examples to refine
+            labels: True labels for untargeted attacks, target labels for targeted
+            refinement_steps: Number of binary search steps for refinement
+            min_bound: Minimum bound for valid pixel ranges after denormalization
+            max_bound: Maximum bound for valid pixel ranges after denormalization
+
+        Returns:
+            Refined adversarial examples with smaller perturbation
+        """
+        # Use default bounds if not provided
+        if min_bound is None:
+            min_bound = 0.0
+        if max_bound is None:
+            max_bound = 1.0
+
+        batch_size = original_images.size(0)
+        refined_images = adv_images.clone()
+
+        # For targeted attacks, get target labels
+        if self.targeted:
+            target_labels = self.get_target_label(original_images, labels)
+        else:
+            target_labels = labels
+
+        # Initialize alpha for each image (controls interpolation between original and adversarial)
+        # alpha=0 means pure adversarial, alpha=1 means pure original
+        alphas = torch.zeros(batch_size, device=self.device)
+
+        # Identify initially successful adversarial examples
+        with torch.no_grad():
+            outputs = self.get_logits(adv_images)
+            if self.targeted:
+                # For targeted attacks, success means predicting the target class
+                initial_success = outputs.argmax(dim=1) == target_labels
+            else:
+                # For untargeted attacks, success means not predicting the true class
+                initial_success = outputs.argmax(dim=1) != labels
+
+        # Only refine successful examples
+        successful_indices = torch.where(initial_success)[0]
+
+        if len(successful_indices) == 0:
+            if self.verbose:
+                print("No successful adversarial examples to refine")
+            return refined_images
+
+        if self.verbose:
+            print(
+                f"Refining {len(successful_indices)} successful adversarial examples..."
+            )
+
+        # Binary search to find the minimal perturbation for each example
+        for step in range(refinement_steps):
+            # Create interpolated images
+            current_alphas = alphas.view(-1, 1, 1, 1)
+            interpolated = (
+                current_alphas * original_images + (1 - current_alphas) * refined_images
+            )
+
+            # Ensure interpolated images are within valid bounds
+            interpolated = torch.clamp(interpolated, min=min_bound, max=max_bound)
+
+            # Check if still adversarial
+            with torch.no_grad():
+                outputs = self.get_logits(interpolated)
+                if self.targeted:
+                    # For targeted attacks, success means predicting the target class
+                    still_successful = outputs.argmax(dim=1) == target_labels
+                else:
+                    # For untargeted attacks, success means not predicting the true class
+                    still_successful = outputs.argmax(dim=1) != labels
+
+            # Update alphas with binary search
+            for i in successful_indices:
+                if still_successful[i]:
+                    # If still successful, try moving closer to original
+                    alphas[i] = alphas[i] + (1 - alphas[i]) / 2
+                    # Update the refined image with this better version
+                    refined_images[i] = interpolated[i]
+                else:
+                    # If not successful, move back toward adversarial
+                    alphas[i] = alphas[i] / 2
+
+        # Calculate improvement in perturbation metrics
+        orig_l2 = (
+            torch.norm((adv_images - original_images).view(batch_size, -1), dim=1)
+            .mean()
+            .item()
+        )
+        refined_l2 = (
+            torch.norm((refined_images - original_images).view(batch_size, -1), dim=1)
+            .mean()
+            .item()
+        )
+
+        # Calculate SSIM improvement
+        orig_ssim = self.compute_skimage_ssim(original_images, adv_images)
+        refined_ssim = self.compute_skimage_ssim(original_images, refined_images)
+
+        if self.verbose:
+            l2_reduction = (orig_l2 - refined_l2) / orig_l2 * 100
+            ssim_improvement = (refined_ssim - orig_ssim) / (1 - orig_ssim) * 100
+            print(f"Refinement reduced L2 perturbation by {l2_reduction:.2f}%")
+            print(
+                f"Refinement improved SSIM from {orig_ssim:.4f} to {refined_ssim:.4f} ({ssim_improvement:.2f}% improvement)"
+            )
+
+        return refined_images
