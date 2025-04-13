@@ -265,14 +265,21 @@ class ConjugateGradientOptimizer:
 
         # Choose appropriate initial step size based on norm type and epsilon
         if self.norm.lower() == "l2":
-            # For L2, use a smaller fraction of epsilon
-            initial_step = eps.squeeze() * 0.2  # 20% of epsilon
+            # For L2, use a larger fraction of epsilon
+            initial_step = (
+                eps.squeeze() * 0.8
+            )  # Increased from 0.5 to 0.8 (80% of epsilon)
         else:
-            # For Linf, we can be more aggressive
-            initial_step = eps.squeeze() * 0.5  # 50% of epsilon
+            # For Linf, we can be even more aggressive
+            initial_step = (
+                eps.squeeze() * 0.95
+            )  # Increased from 0.8 to 0.95 (95% of epsilon)
 
         # Ensure positive step size and make sure it's a tensor with batch dimension
-        initial_step = torch.maximum(initial_step, torch.ones_like(initial_step) * 0.01)
+        # Use a larger minimum step size to ensure we don't get stuck with tiny steps
+        initial_step = torch.maximum(
+            initial_step, torch.ones_like(initial_step) * 0.1
+        )  # Increased from 0.05 to 0.1
 
         # Ensure initial_step has a batch dimension
         if initial_step.dim() == 0:
@@ -387,16 +394,13 @@ class ConjugateGradientOptimizer:
         x_original: torch.Tensor,
         gradient_fn: Callable[[torch.Tensor], torch.Tensor],
         targeted: bool = False,
-        alpha: float = 0.7,  # More aggressive initialization (70% of epsilon)
+        alpha: float = 0.9,  # Increased from 0.7 - Use 90% of epsilon for initialization
         eps: torch.Tensor = None,
         min_bound: Optional[torch.Tensor] = None,
         max_bound: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Initialize adversarial examples using Fast Gradient Sign Method.
-
-        # This is an enhancement beyond the paper's random initialization
-        # to provide a better starting point closer to the decision boundary
 
         Args:
             x_original: Original clean images
@@ -412,51 +416,54 @@ class ConjugateGradientOptimizer:
         """
         batch_size = x_original.shape[0]
 
-        # Compute initial gradient with gradient tracking
-        x_copy = x_original.clone().detach().requires_grad_(True)
-        grad = gradient_fn(x_copy)
+        # Compute initial gradient safely with torch.enable_grad()
+        with torch.enable_grad():
+            x_copy = x_original.clone().detach().requires_grad_(True)
+            grad = gradient_fn(x_copy)
 
-        # For targeted attacks, gradient direction is reversed
-        if targeted:
-            grad = -grad
+            # For targeted attacks, gradient direction is reversed
+            if targeted:
+                grad = -grad
 
-        # Initialize perturbation tensor
-        delta = torch.zeros_like(x_original)
+            # Initialize perturbation tensor
+            delta = torch.zeros_like(x_original)
 
-        # Apply FGSM perturbation with per-sample epsilon
-        for i in range(batch_size):
-            # Get epsilon for this sample
-            sample_eps = eps[i].item() if eps is not None else self.eps
+            # Apply FGSM perturbation with per-sample epsilon
+            for i in range(batch_size):
+                # Get epsilon for this sample
+                sample_eps = eps[i].item() if eps is not None else self.eps
 
-            if self.norm.lower() == "l2":
-                # For L2, normalize gradient to unit norm and scale
-                grad_flat = grad[i : i + 1].reshape(1, -1)
-                grad_norm = torch.norm(grad_flat, p=2) + 1e-10
-                normalized_grad = grad[i : i + 1] / grad_norm
+                if self.norm.lower() == "l2":
+                    # For L2, normalize gradient to unit norm and scale
+                    grad_flat = grad[i : i + 1].reshape(1, -1)
+                    grad_norm = torch.norm(grad_flat, p=2) + 1e-10
+                    normalized_grad = grad[i : i + 1] / grad_norm
 
-                # Scale by alpha * epsilon
-                delta[i : i + 1] = normalized_grad * (sample_eps * alpha)
-            else:  # Linf norm
-                # For Linf, use sign and scale
-                delta[i : i + 1] = torch.sign(grad[i : i + 1]) * (sample_eps * alpha)
+                    # Scale by alpha * epsilon - use higher alpha
+                    delta[i : i + 1] = normalized_grad * (sample_eps * alpha)
+                else:  # Linf norm
+                    # For Linf, use sign and scale
+                    delta[i : i + 1] = torch.sign(grad[i : i + 1]) * (
+                        sample_eps * alpha
+                    )
 
-        # Apply perturbation
-        x_adv = x_original + delta
+            # Apply perturbation
+            x_adv = x_original + delta
 
-        # Project each sample individually to ensure constraints
-        for i in range(batch_size):
-            sample_eps = eps[i].item() if eps is not None else self.eps
-            x_adv[i : i + 1] = project_adversarial_example(
-                x_adv[i : i + 1],
-                x_original[i : i + 1],
-                sample_eps,
-                self.norm,
-                min_bound=min_bound,
-                max_bound=max_bound,
-            )
+            # Project each sample individually to ensure constraints
+            for i in range(batch_size):
+                sample_eps = eps[i].item() if eps is not None else self.eps
+                x_adv[i : i + 1] = project_adversarial_example(
+                    x_adv[i : i + 1],
+                    x_original[i : i + 1],
+                    sample_eps,
+                    self.norm,
+                    min_bound=min_bound,
+                    max_bound=max_bound,
+                )
 
-        # Ensure result is valid image
-        x_adv = torch.clamp(x_adv, min=min_bound, max=max_bound)
+            # Ensure result is valid image
+            x_adv = torch.clamp(x_adv, min=min_bound, max=max_bound)
 
         return x_adv
 
@@ -515,7 +522,7 @@ class ConjugateGradientOptimizer:
                 x_original,
                 gradient_fn,
                 targeted=targeted,
-                alpha=0.7,  # Use 70% of epsilon for initialization
+                alpha=0.9,  # Use 90% of epsilon for initialization
                 eps=per_sample_eps,
                 min_bound=min_bound,
                 max_bound=max_bound,
@@ -779,6 +786,48 @@ class ConjugateGradientOptimizer:
                     print(
                         f"Iteration {i+1}/{self.n_iterations}, Success rate: {success_rate:.2f}%"
                     )
+
+        # If we still don't have enough successful examples after all iterations,
+        # implement a fallback mechanism similar to LBFGS
+        if not success.all() and success_fn is not None:
+            # Get mask of failed samples
+            failed = ~success
+
+            # Only process if there are any failed samples
+            if failed.any():
+                # For failed samples, create stronger perturbations
+                failed_indices = failed.nonzero().squeeze(1)
+
+                for idx in failed_indices:
+                    # Create a more aggressive perturbation using full epsilon
+                    if self.norm.lower() == "l2":
+                        # Create a spherical perturbation with magnitude eps
+                        noise = torch.randn_like(x_original[idx : idx + 1])
+                        noise_flat = noise.view(noise.shape[0], -1)
+                        noise_norm = torch.norm(noise_flat, p=2) + 1e-10
+                        noise = noise * per_sample_eps[idx] / noise_norm
+                    else:  # linf norm
+                        # Uniform perturbation across the full epsilon range
+                        noise = torch.zeros_like(x_original[idx : idx + 1]).uniform_(
+                            -per_sample_eps[idx], per_sample_eps[idx]
+                        )
+
+                    # Apply the full perturbation
+                    x_temp = x_original[idx : idx + 1] + noise
+
+                    # Ensure it's in valid range
+                    x_temp = torch.clamp(x_temp, min=min_bound, max=max_bound)
+
+                    # Check if this is successful
+                    if success_fn is not None:
+                        with torch.no_grad():
+                            new_success = success_fn(x_temp)
+
+                        # If successful, update the result
+                        if new_success.item():
+                            x_adv[idx : idx + 1] = x_temp
+                            success[idx] = True
+                            successful[idx] = True
 
         # Final projection to ensure constraints
         if x_original is not None:

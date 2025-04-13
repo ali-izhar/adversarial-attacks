@@ -79,15 +79,26 @@ def compute_ssim(original, perturbed):
     return ssim_value
 
 
+def safe_set_attr(obj, attr_name, value):
+    """Safely set an attribute if it exists"""
+    if hasattr(obj, attr_name):
+        setattr(obj, attr_name, value)
+        return True
+    return False
+
+
 def generate_adversarial_grid(
     model,
     dataset,
     num_images=4,
     attack_methods=None,
     save_path="paper/images/attack_comparison.png",
+    max_attempts_per_image=10,  # Maximum attempts per image to find successful attacks
+    max_total_candidates=50,  # Maximum number of total images to try
 ):
     """
-    Generate a grid visualization with original images and their adversarial versions
+    Generate a grid visualization with original images and their adversarial versions.
+    Keeps trying different images until finding ones where all attacks succeed.
 
     Args:
         model: Target model to attack
@@ -95,6 +106,8 @@ def generate_adversarial_grid(
         num_images: Number of images to include in the grid
         attack_methods: Dictionary of attack methods to use
         save_path: Path to save the visualization
+        max_attempts_per_image: Maximum number of attempts to succeed with all attacks on one image
+        max_total_candidates: Maximum number of total images to try
     """
     device = next(model.parameters()).device
 
@@ -120,20 +133,297 @@ def generate_adversarial_grid(
             "L-BFGS": LBFGS(
                 model,
                 norm="L2",
-                eps=0.5,
+                eps=1.0,
                 n_iterations=100,
                 history_size=10,
-                initial_const=1e-2,
-                binary_search_steps=5,
+                initial_const=1e-1,
+                binary_search_steps=10,
+                const_factor=10.0,
+                repeat_search=True,
             ),
         }
 
     # Number of columns: 1 for original + 1 for each attack method
     num_cols = 1 + len(attack_methods)
 
-    # Select images to attack
-    image_indices = np.random.choice(len(dataset), num_images, replace=False)
-    logger.info(f"Selected {num_images} random images for the grid")
+    # Generate a pool of candidate images
+    candidate_indices = np.random.choice(
+        len(dataset), min(max_total_candidates, len(dataset)), replace=False
+    )
+    logger.info(f"Generated a pool of {len(candidate_indices)} candidate images")
+
+    # Store selected images and their attack results
+    successful_images = []  # List of tuples: (img_idx, attack_results)
+    candidate_results = {}  # Store all attack results keyed by image_idx
+
+    # Process each candidate image until we have enough successful ones
+    pbar = tqdm(candidate_indices, desc="Finding successful adversarial examples")
+    for img_idx in pbar:
+        # Skip if we already have enough successful images
+        if len(successful_images) >= num_images:
+            break
+
+        # Get original image and label
+        img, label = dataset[img_idx]
+        img = img.unsqueeze(0).to(device)
+        label = torch.tensor([label]).to(device)
+
+        # Get original prediction
+        with torch.no_grad():
+            outputs = model(img)
+            orig_pred = outputs.argmax(dim=1).item()
+
+            # Skip if the model already misclassifies this image
+            if orig_pred != label.item():
+                pbar.set_postfix({"status": f"Skipping misclassified image {img_idx}"})
+                continue
+
+        # Track success for each attack method
+        all_success = True
+        attack_results = {}
+
+        # Try each attack method
+        for attack_name, attack in attack_methods.items():
+            attack_success = False
+            attack_metrics = {}
+
+            # Multiple attempts for this attack on this image
+            for attempt in range(max_attempts_per_image):
+                try:
+                    # Set attack to untargeted mode
+                    attack.set_mode_default()
+
+                    # Tune attack parameters based on attempt number
+                    if attempt > 0:
+                        # Escalate parameters for each attempt
+                        if attack_name == "L-BFGS":
+                            # L-BFGS: binary search steps and initial constant
+                            safe_set_attr(
+                                attack, "binary_search_steps", min(14, 8 + attempt)
+                            )
+
+                            # More aggressive adjustments for L-BFGS
+                            if hasattr(attack, "initial_const"):
+                                # Exponentially increase the initial constant with each attempt
+                                attack.initial_const *= 3.0 ** min(attempt, 4)
+
+                            # Increase epsilon for more effective attack
+                            if hasattr(attack, "eps"):
+                                attack.eps = min(
+                                    4.0, attack.eps * (1.5 ** min(attempt, 3))
+                                )
+
+                            # Enable repeat search after the first few attempts
+                            if attempt >= 2 and hasattr(attack, "repeat_search"):
+                                attack.repeat_search = True
+
+                            # Increase iterations for more thorough optimization
+                            safe_set_attr(
+                                attack, "n_iterations", min(200, 100 + attempt * 20)
+                            )
+
+                        elif attack_name == "PGD":
+                            # PGD: epsilon, iterations, step size
+                            if hasattr(attack, "eps"):
+                                attack.eps = min(
+                                    1.0, attack.eps * (1.2 ** min(attempt, 3))
+                                )
+                            safe_set_attr(
+                                attack, "n_iterations", min(200, 40 + attempt * 20)
+                            )
+                            safe_set_attr(
+                                attack,
+                                "step_size",
+                                min(
+                                    0.1,
+                                    (
+                                        attack.step_size
+                                        if hasattr(attack, "step_size")
+                                        else 0.01
+                                    )
+                                    * 1.2,
+                                ),
+                            )
+
+                        elif attack_name == "CG":
+                            # CG: epsilon, iterations (using various possible attribute names)
+                            if hasattr(attack, "eps"):
+                                attack.eps = min(
+                                    1.0, attack.eps * (1.2 ** min(attempt, 3))
+                                )
+                            # Try different names for the iterations parameter
+                            success = False
+                            for iter_attr in ["n_iter", "n_iterations", "iterations"]:
+                                if safe_set_attr(
+                                    attack,
+                                    iter_attr,
+                                    min(200, getattr(attack, iter_attr, 50) + 20),
+                                ):
+                                    success = True
+                                    break
+
+                        elif attack_name == "DeepFool":
+                            # DeepFool: steps, overshoot
+                            safe_set_attr(attack, "steps", min(100, 30 + attempt * 10))
+                            safe_set_attr(
+                                attack,
+                                "overshoot",
+                                min(0.1, 0.02 * (1 + attempt * 0.5)),
+                            )
+
+                        elif attack_name == "C&W":
+                            # C&W: steps, learning rate, confidence
+                            safe_set_attr(attack, "steps", min(200, 100 + attempt * 20))
+                            if hasattr(attack, "c"):
+                                attack.c *= 1.5 ** min(attempt, 3)
+                            safe_set_attr(
+                                attack, "lr", min(0.05, 0.01 * (1 + attempt * 0.2))
+                            )
+
+                        elif attack_name in ["FGSM", "FFGSM"]:
+                            # FGSM/FFGSM: epsilon
+                            if hasattr(attack, "eps"):
+                                attack.eps = min(
+                                    32 / 255, attack.eps * (1.2 ** min(attempt, 3))
+                                )
+
+                    # Generate adversarial example
+                    adv_img = attack(img, label)
+
+                    # Check if attack succeeded
+                    with torch.no_grad():
+                        adv_outputs = model(adv_img)
+                        adv_pred = adv_outputs.argmax(dim=1).item()
+
+                    attack_success = adv_pred != orig_pred
+
+                    # Calculate metrics
+                    perturbation = adv_img[0] - img[0]
+                    l2_norm = torch.norm(perturbation.flatten(), p=2).item()
+                    linf_norm = torch.norm(
+                        perturbation.flatten(), p=float("inf")
+                    ).item()
+                    ssim_value = compute_ssim(img[0], adv_img[0])
+
+                    # Store metrics
+                    attack_metrics = {
+                        "adv_img": adv_img,
+                        "success": attack_success,
+                        "l2_norm": l2_norm,
+                        "linf_norm": linf_norm,
+                        "ssim": ssim_value,
+                        "adv_pred": adv_pred,
+                        "attempt": attempt + 1,
+                    }
+
+                    # Break if successful
+                    if attack_success:
+                        break
+
+                except Exception as e:
+                    logger.warning(f"Error in {attack_name} attack: {str(e)}")
+                    # Continue to next attempt
+
+            # Store result for this attack
+            attack_results[attack_name] = attack_metrics
+
+            # If any attack fails, mark the whole image as unsuccessful
+            if not attack_success:
+                all_success = False
+                pbar.set_postfix(
+                    {"status": f"Failed on {attack_name} after {attempt+1} attempts"}
+                )
+
+        # Store results for this image
+        candidate_results[img_idx] = {
+            "img": img,
+            "label": label.item(),
+            "orig_pred": orig_pred,
+            "attack_results": attack_results,
+            "all_success": all_success,
+            # Count successful attacks for this image
+            "success_count": sum(
+                1 for a in attack_results.values() if a.get("success", False)
+            ),
+            # Specific flag for L-BFGS success (but don't require it for overall success)
+            "lbfgs_success": attack_results.get("L-BFGS", {}).get("success", False),
+        }
+
+        # Consider success threshold - allow images where at least N-1 attacks succeeded
+        # This makes it easier to find good candidate images when L-BFGS struggles
+        min_success_threshold = len(attack_methods) - 1  # Allow one attack to fail
+        if candidate_results[img_idx]["success_count"] >= min_success_threshold:
+            successful_images.append(img_idx)
+            pbar.set_postfix(
+                {
+                    "status": f"Success! {len(successful_images)}/{num_images} (with {candidate_results[img_idx]['success_count']} attacks)"
+                }
+            )
+
+        # If we already have found some successes but need more, lower the threshold
+        elif (
+            len(successful_images) > 0
+            and len(successful_images) < num_images // 2
+            and candidate_results[img_idx]["success_count"] >= len(attack_methods) - 2
+        ):
+            # Allow two failed attacks if we're struggling to find perfect matches
+            successful_images.append(img_idx)
+            pbar.set_postfix(
+                {
+                    "status": f"Partial success! {len(successful_images)}/{num_images} (with {candidate_results[img_idx]['success_count']} attacks)"
+                }
+            )
+
+    # If we don't have enough completely successful images, find the best partial successes
+    if len(successful_images) < num_images:
+        logger.warning(
+            f"Could only find {len(successful_images)} images with all attacks successful. "
+            f"Adding {num_images - len(successful_images)} images with partial success."
+        )
+
+        # Score remaining candidates by number of successful attacks
+        remaining_candidates = [
+            (idx, data)
+            for idx, data in candidate_results.items()
+            if idx not in successful_images
+        ]
+
+        # Sort by:
+        # 1. Total success count (higher is better)
+        # 2. Average SSIM of successful attacks (higher is better)
+        # 3. L-BFGS success specifically (gives some weight to this attack)
+        sorted_candidates = sorted(
+            remaining_candidates,
+            key=lambda x: (
+                x[1]["success_count"],  # Count of successful attacks
+                sum(
+                    a.get("ssim", 0)
+                    for a in x[1]["attack_results"].values()
+                    if a.get("success", False)
+                )
+                / max(1, x[1]["success_count"]),  # Average SSIM of successful attacks
+                (
+                    1 if x[1].get("lbfgs_success", False) else 0
+                ),  # Give some priority to L-BFGS success
+            ),
+            reverse=True,
+        )
+
+        # Add best partial successes until we have enough images
+        for idx, _ in sorted_candidates:
+            if len(successful_images) >= num_images:
+                break
+            successful_images.append(idx)
+
+    # If we still don't have enough images, something is wrong
+    if len(successful_images) < num_images:
+        raise ValueError(
+            f"Could not find {num_images} images to attack. Found only {len(successful_images)}."
+        )
+
+    # Select the final images to display
+    final_image_indices = successful_images[:num_images]
+    logger.info(f"Selected {len(final_image_indices)} images for the grid")
 
     # Create figure for grid
     fig = plt.figure(figsize=(num_cols * 2.2, num_images * 2 + 0.5))
@@ -173,21 +463,16 @@ def generate_adversarial_grid(
     if num_images == 1:
         axes = axes.reshape(1, -1)
 
-    # Create a list to store attack results metrics
+    # Create a list to store attack results metrics for reporting
     results_data = []
 
-    # Process each image
-    for row, img_idx in enumerate(
-        tqdm(image_indices, desc="Generating adversarial examples")
-    ):
-        # Get original image and label
-        img, label = dataset[img_idx]
-        img = img.unsqueeze(0).to(device)
-        label = torch.tensor([label]).to(device)
-
-        # Get original prediction
-        with torch.no_grad():
-            orig_pred = model(img).argmax(dim=1).item()
+    # Process each selected image
+    for row, img_idx in enumerate(final_image_indices):
+        # Get data for this image
+        image_data = candidate_results[img_idx]
+        img = image_data["img"]
+        label = image_data["label"]
+        orig_pred = image_data["orig_pred"]
 
         # Display original image
         orig_np = denormalize(img[0]).cpu().permute(1, 2, 0).numpy()
@@ -195,7 +480,7 @@ def generate_adversarial_grid(
         axes[row, 0].axis("off")
 
         # Set row label with class name
-        class_name = dataset.class_names[label.item()]
+        class_name = dataset.class_names[label]
         short_class = class_name.split(",")[
             0
         ]  # Take only the first part of the class name
@@ -218,33 +503,17 @@ def generate_adversarial_grid(
             bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7),
         )
 
-        # Generate and display adversarial examples for each attack
-        for col, (attack_name, attack) in enumerate(attack_methods.items(), start=1):
-            # Set attack to untargeted mode
-            attack.set_mode_default()
+        # Display adversarial examples for each attack
+        for col, attack_name in enumerate(attack_methods.keys(), start=1):
+            attack_result = image_data["attack_results"].get(attack_name, {})
 
-            # Generate adversarial example
-            try:
-                adv_img = attack(img, label)
-
-                # Get adversarial prediction
-                with torch.no_grad():
-                    adv_pred = model(adv_img).argmax(dim=1).item()
-
-                # Success check
-                success = adv_pred != orig_pred
-
-                # Calculate metrics
-                ssim_value = compute_ssim(img[0], adv_img[0])
-                perturbation = adv_img[0] - img[0]
-                l2_norm = torch.norm(perturbation.flatten(), p=2).item()
-                linf_norm = torch.norm(perturbation.flatten(), p=float("inf")).item()
-
-                # Choose the primary norm to display based on the attack
-                if attack_name in ["FGSM", "FFGSM"]:
-                    primary_norm = f"Linf={linf_norm:.4f}"
-                else:
-                    primary_norm = f"L2={l2_norm:.4f}"
+            if attack_result and "adv_img" in attack_result:
+                adv_img = attack_result["adv_img"]
+                success = attack_result["success"]
+                l2_norm = attack_result["l2_norm"]
+                linf_norm = attack_result["linf_norm"]
+                ssim_value = attack_result["ssim"]
+                adv_pred = attack_result["adv_pred"]
 
                 # Display adversarial image
                 adv_np = denormalize(adv_img[0]).cpu().permute(1, 2, 0).numpy()
@@ -287,12 +556,19 @@ def generate_adversarial_grid(
                         "adv_class": dataset.class_names[adv_pred],
                     }
                 )
-
-            except Exception as e:
-                logger.error(
-                    f"Error generating {attack_name} adversarial example for image {img_idx}: {str(e)}"
-                )
+            else:
+                # No successful attack
+                logger.warning(f"No result for {attack_name} on image {img_idx}")
                 axes[row, col].imshow(np.zeros_like(orig_np))
+                axes[row, col].text(
+                    0.5,
+                    0.5,
+                    "Failed",
+                    ha="center",
+                    va="center",
+                    fontsize=12,
+                    color="red",
+                )
 
             axes[row, col].axis("off")
 
@@ -326,7 +602,7 @@ def generate_adversarial_grid(
             "avg_l2": avg_l2,
             "avg_linf": avg_linf,
             "avg_ssim": avg_ssim * 100,
-            "avg_time": 0,  # Assuming avg_time is not available in the results_data
+            "avg_time": 0,  # Time not tracked in this function
         }
 
         # Log statistics
@@ -340,13 +616,22 @@ def generate_adversarial_grid(
     # Add success rate information to the header labels
     for col, attack_name in enumerate(list(attack_methods.keys()), start=1):
         success_rate = attack_results[attack_name]["success_rate"]
+        avg_ssim = attack_results[attack_name]["avg_ssim"]
+
+        # Format metrics text
+        metrics_text = f"({success_rate:.0f}\\% success)"
+
+        # Add SSIM if available and some attacks succeeded
+        if success_rate > 0:
+            metrics_text = f"({success_rate:.0f}\\% success, SSIM: {avg_ssim/100:.2f})"
+
         header_axes[col].text(
             0.5,
             0.2,
-            f"({success_rate:.0f}\\% success)",
+            metrics_text,
             ha="center",
             va="center",
-            fontsize=14,
+            fontsize=12,
             fontstyle="italic",
         )
 

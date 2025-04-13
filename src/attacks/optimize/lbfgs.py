@@ -41,18 +41,18 @@ class LBFGSOptimizer:
         self,
         norm: str = "L2",
         eps: float = 0.5,
-        n_iterations: int = 50,
-        history_size: int = 10,
+        n_iterations: int = 100,
+        history_size: int = 20,
         line_search_fn: str = "strong_wolfe",
-        max_line_search: int = 20,
+        max_line_search: int = 30,
         initial_step: float = 1.0,
         rand_init: bool = True,
-        init_std: float = 0.01,
+        init_std: float = 0.05,
         early_stopping: bool = True,
-        initial_const: float = 1e-2,
-        binary_search_steps: int = 5,
-        const_factor: float = 10.0,  # Factor to multiply constant by when no solution is found
-        repeat_search: bool = False,  # Whether to repeat search with upper bound on last step
+        initial_const: float = 1.0,
+        binary_search_steps: int = 10,
+        const_factor: float = 15.0,
+        repeat_search: bool = True,
         verbose: bool = False,
     ):
         """
@@ -204,10 +204,27 @@ class LBFGSOptimizer:
                 eta = torch.randn_like(x_init) * self.init_std
                 eta_flat = eta.view(eta.shape[0], -1)
                 eta_norm = torch.norm(eta_flat, p=2, dim=1).view(-1, 1, 1, 1)
+                # Use full epsilon for initialization to create stronger starting point
                 eta = eta * self.eps / (eta_norm + 1e-12)
 
             # Apply initial perturbation and clip to valid range
             x_init = torch.clamp(x_original + eta, min=min_bound, max=max_bound)
+
+            # Apply a few steps of gradient ascent to create better starting points
+            if gradient_fn is not None:
+                for _ in range(3):  # Just a few steps to improve initialization
+                    x_temp = x_init.clone().detach().requires_grad_(True)
+                    grad = gradient_fn(x_temp)
+                    # Use sign of gradient with small step size
+                    step_size = self.eps * 0.1
+                    x_init = torch.clamp(
+                        x_init + step_size * grad.sign(), min=min_bound, max=max_bound
+                    )
+                    # Project back to epsilon ball
+                    if self.norm in ["l2", "linf"]:
+                        x_init = self._project_perturbation(
+                            x_init, x_original, min_bound=min_bound, max_bound=max_bound
+                        )
 
         # Initialize metrics
         start_time = time.time()
@@ -218,8 +235,14 @@ class LBFGSOptimizer:
         best_l2 = torch.ones(batch_size, device=device) * 1e10
 
         # Binary search for optimal constants
-        lower_bound = torch.zeros(batch_size, device=device)
-        upper_bound = torch.ones(batch_size, device=device) * 1e10
+        # Initialize lower_bound to a small positive value and upper_bound to a large value
+        # This allows more effective searching of the constant space
+        lower_bound = (
+            torch.ones(batch_size, device=device) * 1e-3
+        )  # Start from small positive value
+        upper_bound = (
+            torch.ones(batch_size, device=device) * 1e12
+        )  # Use much larger upper bound
         const = torch.ones(batch_size, device=device) * self.initial_const
 
         # Function to check success
@@ -282,8 +305,15 @@ class LBFGSOptimizer:
                 # Current constants as tensor
                 const_tensor = const.clone()
 
+                # Apply scaling to the adversarial loss to make it more competitive with the L2 penalty
+                # Typical adversarial losses are much smaller than L2 distances, so we need to scale them
+                loss_scale = (
+                    1000.0  # Scale factor to make the adversarial loss more significant
+                )
+
                 # Combined loss: adversarial loss + constant * L2 penalty
-                combined_loss = adv_loss + const_tensor * l2_dist
+                # Give more emphasis to the adversarial loss component
+                combined_loss = loss_scale * adv_loss + const_tensor * l2_dist
                 loss_value = combined_loss.mean().item()
 
                 # Compute gradient for scipy
@@ -400,12 +430,67 @@ class LBFGSOptimizer:
                 # Continue to next binary search step
 
         # If we didn't find any successful adversarial examples,
-        # just use the last iteration as output but make some perturbation
-        # This ensures metrics can be calculated even with 0% success rate
+        # create a stronger perturbation rather than a tiny one
         if not success.any():
-            # Apply a small perturbation to ensure some metrics can be calculated
-            noise = torch.zeros_like(x_original).uniform_(-self.eps / 10, self.eps / 10)
+            # Apply a much larger perturbation to create an actual adversarial example
+            # Rather than using tiny perturbations (-eps/10 to eps/10), use full epsilon range
+            # Generate random noise scaled to epsilon
+            if self.norm == "l2":
+                # Create a spherical perturbation with magnitude eps
+                noise = torch.randn_like(x_original)
+                noise_flat = noise.view(noise.shape[0], -1)
+                noise_norm = torch.norm(noise_flat, p=2, dim=1).view(-1, 1, 1, 1)
+                noise = noise * self.eps / (noise_norm + 1e-12)
+            else:  # linf norm
+                noise = torch.zeros_like(x_original).uniform_(-self.eps, self.eps)
+
+            # Apply the full perturbation
             best_adv = torch.clamp(x_original + noise, min=min_bound, max=max_bound)
+
+            # Run a few gradient steps to make the perturbation more effective
+            for i in range(5):  # 5 gradient steps to make it more adversarial
+                temp_x = best_adv.clone().detach().requires_grad_(True)
+
+                # Get the model output
+                outputs = temp_x
+                for _ in range(3):  # Apply gradient multiple times for stronger effect
+                    if temp_x.grad is not None:
+                        temp_x.grad.zero_()
+
+                    # Forward pass
+                    outputs = temp_x
+                    if hasattr(temp_x, "requires_grad"):
+                        outputs = loss_fn(temp_x)
+
+                        # Backward pass to get gradient
+                        if isinstance(outputs, torch.Tensor) and outputs.numel() > 0:
+                            outputs.sum().backward()
+
+                    # If we have a gradient, apply it
+                    if temp_x.grad is not None and temp_x.grad.abs().sum() > 0:
+                        # For untargeted attacks, follow the gradient to maximize loss
+                        # The step size is adaptive based on the gradient magnitude
+                        step_size = self.eps * 0.1 / (temp_x.grad.abs().mean() + 1e-12)
+                        update = step_size * temp_x.grad.sign()
+
+                        # Apply the update
+                        temp_x = temp_x.detach() + update
+                        temp_x = torch.clamp(temp_x, min=min_bound, max=max_bound)
+
+                        # Project to stay within epsilon constraint
+                        if self.norm in ["l2", "linf"]:
+                            temp_x = self._project_perturbation(
+                                temp_x,
+                                x_original,
+                                min_bound=min_bound,
+                                max_bound=max_bound,
+                            )
+                        temp_x.requires_grad_(True)
+
+                best_adv = temp_x.detach()
+
+            # Ensure it's properly bounded and projected
+            best_adv = torch.clamp(best_adv, min=min_bound, max=max_bound)
             if self.norm in ["l2", "linf"]:
                 best_adv = self._project_perturbation(
                     best_adv, x_original, min_bound=min_bound, max_bound=max_bound

@@ -46,14 +46,14 @@ class LBFGS(Attack):
         model,
         norm: str = "L2",
         eps: float = 0.5,
-        n_iterations: int = 50,
-        history_size: int = 10,
-        initial_const: float = 1e-2,
-        binary_search_steps: int = 5,
-        const_factor: float = 10.0,
+        n_iterations: int = 100,
+        history_size: int = 20,
+        initial_const: float = 1.0,
+        binary_search_steps: int = 10,
+        const_factor: float = 15.0,
         repeat_search: bool = True,
         rand_init: bool = True,
-        init_std: float = 0.01,
+        init_std: float = 0.05,
         early_stopping: bool = True,
         verbose: bool = False,
         device: Optional[torch.device] = None,
@@ -239,31 +239,76 @@ class LBFGS(Attack):
             # Get appropriate labels for the current batch
             curr_labels = target_labels[: x.size(0)]
 
-            # Classification loss
             if self.targeted:
-                # For targeted attacks, minimize negative CE loss to target class
-                loss = -ce_loss(outputs, curr_labels)
+                # Get the target class logit
+                target_logits = outputs.gather(1, curr_labels.unsqueeze(1)).squeeze(1)
+
+                # Get the highest logit of other classes
+                other_logits = outputs.clone()
+                other_logits.scatter_(1, curr_labels.unsqueeze(1), float("-inf"))
+                highest_other_logits = other_logits.max(1)[0]
+
+                # Margin loss: ensuring target class has higher logit by at least 'confidence'
+                margin = highest_other_logits - target_logits + confidence
+                # For targeted attacks, we want to minimize this margin
+                loss = torch.clamp(margin, min=0).mean()
             else:
-                # For untargeted attacks, maximize CE loss to true class
-                loss = ce_loss(outputs, curr_labels)
+                # Get the true class logit
+                true_logits = outputs.gather(1, curr_labels.unsqueeze(1)).squeeze(1)
+
+                # Get the highest logit of other classes
+                other_logits = outputs.clone()
+                other_logits.scatter_(1, curr_labels.unsqueeze(1), float("-inf"))
+                highest_other_logits = other_logits.max(1)[0]
+
+                # Margin loss: ensuring true class has lower logit by at least 'confidence'
+                margin = true_logits - highest_other_logits + confidence
+                # For untargeted attacks, we want to maximize this margin
+                loss = -torch.clamp(margin, min=0).mean()
 
             # Compute gradient
-            loss.mean().backward()
+            loss.backward()
             grad = x.grad.clone()
             x.grad = None
 
             return grad
 
         # Define the loss function that returns per-sample loss values
+        confidence = 10.0  # Confidence parameter for stronger adversarial examples
+
         def loss_fn(x):
             with torch.no_grad():
                 outputs = self.get_logits(x)
                 curr_labels = target_labels[: x.size(0)]
 
                 if self.targeted:
-                    loss = -ce_loss(outputs, curr_labels)
+                    # Get the target class logit
+                    target_logits = outputs.gather(1, curr_labels.unsqueeze(1)).squeeze(
+                        1
+                    )
+
+                    # Get the highest logit of other classes
+                    other_logits = outputs.clone()
+                    other_logits.scatter_(1, curr_labels.unsqueeze(1), float("-inf"))
+                    highest_other_logits = other_logits.max(1)[0]
+
+                    # Margin loss: ensuring target class has higher logit by at least 'confidence'
+                    margin = highest_other_logits - target_logits + confidence
+                    # For targeted attacks, we want to minimize this margin
+                    loss = torch.clamp(margin, min=0)
                 else:
-                    loss = ce_loss(outputs, curr_labels)
+                    # Get the true class logit
+                    true_logits = outputs.gather(1, curr_labels.unsqueeze(1)).squeeze(1)
+
+                    # Get the highest logit of other classes
+                    other_logits = outputs.clone()
+                    other_logits.scatter_(1, curr_labels.unsqueeze(1), float("-inf"))
+                    highest_other_logits = other_logits.max(1)[0]
+
+                    # Margin loss: ensuring true class has lower logit by at least 'confidence'
+                    margin = true_logits - highest_other_logits + confidence
+                    # For untargeted attacks, we want to maximize this margin
+                    loss = -torch.clamp(margin, min=0)
 
                 return loss
 
