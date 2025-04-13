@@ -1,1 +1,1 @@
-"""Results and plots for adversarial attack methods"""
+"""Configuration for the adversarial attack methods"""

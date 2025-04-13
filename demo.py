@@ -7,7 +7,7 @@ import torchvision.transforms as transforms
 from PIL import Image
 import argparse
 
-from src.attacks.attack_cg import ConjugateGradient
+from src.attacks.attack_cg import CG
 from src.attacks.attack_lbfgs import LBFGS
 from src.attacks.attack_pgd import PGD
 from src.attacks.baseline import CW, DeepFool, FFGSM, FGSM
@@ -290,7 +290,7 @@ class AdversarialAttackDemo:
             # ConjugateGradient parameters
             n_iterations = kwargs.get("steps", 50)
             line_search_max_iter = kwargs.get("max_line_search", 10)
-            attack = ConjugateGradient(
+            attack = CG(
                 model=self.model,
                 norm=norm,
                 eps=epsilon,
