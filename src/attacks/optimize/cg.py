@@ -264,22 +264,16 @@ class ConjugateGradientOptimizer:
             dir_deriv[non_descent] = dir_deriv_fixed
 
         # Choose appropriate initial step size based on norm type and epsilon
+        # Use a more conservative approach similar to PGD
         if self.norm.lower() == "l2":
-            # For L2, use a larger fraction of epsilon
-            initial_step = (
-                eps.squeeze() * 0.8
-            )  # Increased from 0.5 to 0.8 (80% of epsilon)
+            # For L2, use a moderate fraction of epsilon (50%)
+            initial_step = eps.squeeze() * 0.5
         else:
-            # For Linf, we can be even more aggressive
-            initial_step = (
-                eps.squeeze() * 0.95
-            )  # Increased from 0.8 to 0.95 (95% of epsilon)
+            # For Linf, use step size similar to PGD (50% of epsilon)
+            initial_step = eps.squeeze() * 0.5
 
         # Ensure positive step size and make sure it's a tensor with batch dimension
-        # Use a larger minimum step size to ensure we don't get stuck with tiny steps
-        initial_step = torch.maximum(
-            initial_step, torch.ones_like(initial_step) * 0.1
-        )  # Increased from 0.05 to 0.1
+        initial_step = torch.maximum(initial_step, torch.ones_like(initial_step) * 0.01)
 
         # Ensure initial_step has a batch dimension
         if initial_step.dim() == 0:
@@ -395,7 +389,7 @@ class ConjugateGradientOptimizer:
         x_original: torch.Tensor,
         gradient_fn: Callable[[torch.Tensor], torch.Tensor],
         targeted: bool = False,
-        alpha: float = 0.7,  # Use 70% of epsilon for initialization
+        alpha: float = 0.5,  # 50% of epsilon for initialization
         eps: torch.Tensor = None,
         min_bound: Optional[torch.Tensor] = None,
         max_bound: Optional[torch.Tensor] = None,
@@ -524,13 +518,45 @@ class ConjugateGradientOptimizer:
                 x_original,
                 gradient_fn,
                 targeted=targeted,
-                alpha=0.7,  # Use 70% of epsilon for initialization
+                alpha=0.5,  # 50% of epsilon for initialization
                 eps=per_sample_eps,
                 min_bound=min_bound,
                 max_bound=max_bound,
             )
             # Count gradient calls for initialization
             gradient_calls += 1
+
+            # Apply a few small gradient steps to improve initialization
+            for _ in range(2):  # 2 extra gradient steps
+                x_temp = x_adv.clone().detach().requires_grad_(True)
+                grad = gradient_fn(x_temp)
+                # Take a small step in gradient direction
+                step_size = 0.2  # 20% of epsilon
+                if self.norm.lower() == "l2":
+                    # Normalize gradient for L2
+                    grad_flat = grad.reshape(batch_size, -1)
+                    grad_norm = torch.norm(grad_flat, p=2, dim=1).view(-1, 1, 1, 1)
+                    grad = grad / (grad_norm + 1e-10)
+                    # Apply step
+                    x_adv = x_adv + step_size * per_sample_eps.view(-1, 1, 1, 1) * grad
+                else:  # Linf
+                    # Use sign for Linf
+                    x_adv = x_adv + step_size * per_sample_eps.view(
+                        -1, 1, 1, 1
+                    ) * torch.sign(grad)
+
+                # Project back to valid range and epsilon constraint
+                for i in range(batch_size):
+                    x_adv[i : i + 1] = project_adversarial_example(
+                        x_adv[i : i + 1],
+                        x_original[i : i + 1],
+                        per_sample_eps[i],
+                        self.norm,
+                        min_bound=min_bound,
+                        max_bound=max_bound,
+                    )
+                gradient_calls += 1
+
         elif self.rand_init and x_original is not None:
             # δ₀ ← U(-0.01, 0.01)ⁿ - Random initialization
             x_adv = torch.zeros_like(x_original)

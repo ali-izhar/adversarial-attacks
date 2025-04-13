@@ -15,6 +15,7 @@ import numpy as np
 
 from .baseline.attack import Attack
 from .optimize.cg import ConjugateGradientOptimizer
+from .optimize.projections import project_adversarial_example
 
 
 class CG(Attack):
@@ -44,6 +45,7 @@ class CG(Attack):
         adaptive_restart (bool): If True, dynamically restart based on conjugacy loss.
         early_stopping (bool): If True, stop when adversarial goal is achieved.
         verbose (bool): If True, print progress updates.
+        strict_epsilon_constraint (bool): If True, strictly enforce the epsilon constraint.
     """
 
     def __init__(
@@ -54,21 +56,29 @@ class CG(Attack):
         n_iter: int = 50,
         beta_method: str = "HS",
         restart_interval: int = 10,
-        tv_lambda: float = 0.5,
-        color_lambda: float = 0.6,
-        perceptual_lambda: float = 0.7,
-        rand_init: bool = False,
+        tv_lambda: float = 0.05,
+        color_lambda: float = 0.05,
+        perceptual_lambda: float = 0.05,
+        rand_init: bool = True,
         fgsm_init: bool = True,
         adaptive_restart: bool = True,
         early_stopping: bool = True,
         verbose: bool = False,
+        strict_epsilon_constraint: bool = True,
     ):
         # Initialize the Attack base class
         super().__init__("CG", model)
 
         # Record attack parameters
         self.norm = norm
-        self.eps = eps  # No scaling - use as is
+        self.orig_eps = eps  # Store original epsilon specified in [0,1] space
+
+        # Scale epsilon to normalized space by dividing by ImageNet std
+        mean_std = self.std.clone().detach().mean().item()
+        self.eps = (
+            eps / mean_std
+        )  # Scaling to normalized space for consistent perturbation
+
         self.n_iter = n_iter
         self.beta_method = beta_method
         self.restart_interval = restart_interval
@@ -80,6 +90,7 @@ class CG(Attack):
         self.adaptive_restart = adaptive_restart
         self.early_stopping = early_stopping
         self.verbose = verbose
+        self.strict_epsilon_constraint = strict_epsilon_constraint
 
         # Set up supported modes
         self.supported_mode = ["default", "targeted"]
@@ -87,7 +98,7 @@ class CG(Attack):
         # Create the optimizer with correct parameters
         self.optimizer = ConjugateGradientOptimizer(
             norm=norm,
-            eps=eps,  # Pass original epsilon
+            eps=self.eps,  # Pass the scaled epsilon for normalized space
             n_iterations=n_iter,
             beta_method=beta_method,
             restart_interval=restart_interval,
@@ -390,18 +401,41 @@ class CG(Attack):
         self.end_time = time.time()
         self.total_time += self.end_time - self.start_time
 
+        # Strictly enforce epsilon constraint if enabled, but ensure minimal perturbation size
+        if self.strict_epsilon_constraint:
+            batch_size = images.shape[0]
+            for i in range(batch_size):
+                # Calculate current perturbation magnitude
+                delta = adv_images[i : i + 1] - images[i : i + 1]
+                if self.norm.lower() == "l2":
+                    delta_norm = torch.norm(delta.flatten(), p=2).item()
+                else:  # Linf
+                    delta_norm = torch.norm(delta.flatten(), p=float("inf")).item()
+
+                # Only project if perturbation exceeds epsilon
+                if delta_norm > self.eps:
+                    adv_images[i : i + 1] = project_adversarial_example(
+                        adv_images[i : i + 1],
+                        images[i : i + 1],
+                        self.eps,
+                        self.norm,
+                        min_bound=min_bound,
+                        max_bound=max_bound,
+                    )
+
         # Ensure outputs are properly clamped to valid input range
         adv_images = torch.clamp(adv_images, min=min_bound, max=max_bound).detach()
 
         # Apply post-processing refinement to improve SSIM and reduce perturbation
-        adv_images = self.refine_perturbation(
-            images,
-            adv_images,
-            labels,
-            refinement_steps=15,  # More refinement steps for better quality
-            min_bound=min_bound,
-            max_bound=max_bound,
-        )
+        if metrics["success_rate"] > 0:  # Only refine if we have successful examples
+            adv_images = self.refine_perturbation(
+                images,
+                adv_images,
+                labels,
+                refinement_steps=10,  # Reduced from 15 to 10 for less aggressive refinement
+                min_bound=min_bound,
+                max_bound=max_bound,
+            )
 
         # Evaluate success and compute perturbation metrics
         success_rate, success_mask, pred_info = self.evaluate_attack_success(

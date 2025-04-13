@@ -364,10 +364,40 @@ def create_attack(model, attack_type, config, targeted=False, pgd_variant=None):
     if attack_type == "CG":
         # Get CG parameters from config
         params = attack_params["CG"][attack_mode]
-        eps_value = params["eps_values"]["Linf"][0]  # Default to first epsilon value
+        eps_value = params["eps_values"][norm_type][0]  # Default to first epsilon value
         eps = parse_fraction(eps_value)
 
-        attack = CG(model, eps=eps)
+        # Get parameters from config with sensible defaults
+        n_iter = params.get("n_iter", 50)
+        beta_method = params.get("beta_method", "HS")
+        restart_interval = params.get("restart_interval", 10)
+        tv_lambda = params.get("tv_lambda", 0.05)
+        color_lambda = params.get("color_lambda", 0.05)
+        perceptual_lambda = params.get("perceptual_lambda", 0.05)
+        rand_init = params.get("rand_init", True)
+        fgsm_init = params.get("fgsm_init", True)
+        adaptive_restart = params.get("adaptive_restart", True)
+        early_stopping = params.get("early_stopping", True)
+        strict_epsilon_constraint = params.get("strict_epsilon_constraint", True)
+
+        # Create CG with parameters from config
+        attack = CG(
+            model,
+            norm=norm_type,
+            eps=eps,
+            n_iter=n_iter,
+            beta_method=beta_method,
+            restart_interval=restart_interval,
+            tv_lambda=tv_lambda,
+            color_lambda=color_lambda,
+            perceptual_lambda=perceptual_lambda,
+            rand_init=rand_init,
+            fgsm_init=fgsm_init,
+            adaptive_restart=adaptive_restart,
+            early_stopping=early_stopping,
+            strict_epsilon_constraint=strict_epsilon_constraint,
+            verbose=True,  # Enable verbose output for debugging
+        )
         attack_name = f"CG (ε={eps:.4f})"
 
     elif attack_type == "LBFGS":
