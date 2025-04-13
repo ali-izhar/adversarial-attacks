@@ -51,31 +51,24 @@ class CG(Attack):
         model,
         norm: str = "L2",
         eps: float = 0.5,
-        n_iter: int = 100,  # Increased from 50
+        n_iter: int = 50,
         beta_method: str = "HS",
         restart_interval: int = 10,
-        tv_lambda: float = 0.0,
-        color_lambda: float = 0.0,
-        perceptual_lambda: float = 0.0,
-        rand_init: bool = True,  # Enable random initialization
+        tv_lambda: float = 0.2,
+        color_lambda: float = 0.3,
+        perceptual_lambda: float = 0.4,
+        rand_init: bool = False,
         fgsm_init: bool = True,
         adaptive_restart: bool = True,
         early_stopping: bool = True,
         verbose: bool = False,
     ):
-        # Initialize the base Attack class
+        # Initialize the Attack base class
         super().__init__("CG", model)
 
         # Record attack parameters
         self.norm = norm
-        self.orig_eps = eps  # Store the original epsilon in [0,1] space
-
-        # Scale epsilon to normalized space by dividing by ImageNet std
-        mean_std = self.std.clone().detach().mean().item()
-        self.eps = (
-            eps / mean_std
-        )  # Scaling to normalized space for consistent perturbation
-
+        self.eps = eps  # No scaling - use as is
         self.n_iter = n_iter
         self.beta_method = beta_method
         self.restart_interval = restart_interval
@@ -94,7 +87,7 @@ class CG(Attack):
         # Create the optimizer with correct parameters
         self.optimizer = ConjugateGradientOptimizer(
             norm=norm,
-            eps=self.eps,  # Pass the scaled epsilon for normalized space
+            eps=eps,  # Pass original epsilon
             n_iterations=n_iter,
             beta_method=beta_method,
             restart_interval=restart_interval,
@@ -103,7 +96,7 @@ class CG(Attack):
             verbose=verbose,
             fgsm_init=fgsm_init,
             adaptive_restart=adaptive_restart,
-            init_std=0.05,  # Larger initial random perturbation
+            momentum=0.0,  # Don't use momentum for proper CG
             line_search_factor=0.5,
             sufficient_decrease=1e-4,
         )
@@ -230,25 +223,10 @@ class CG(Attack):
         else:
             target_labels = labels
 
-        # Calculate normalized min/max bounds for valid pixel ranges after denormalization
-        min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
-        max_bound = ((1 - self.mean) / self.std).to(
-            device=images.device, dtype=images.dtype
-        )
-        min_bound = min_bound.view(1, 3, 1, 1)
-        max_bound = max_bound.view(1, 3, 1, 1)
-
-        # Scale epsilon to normalized space by dividing by ImageNet std
-        mean_std = self.std.clone().detach().mean().item()
-        scaled_eps = self.eps / mean_std  # Scaling to normalized space
-
         # Use cross-entropy loss for classification
         ce_loss = nn.CrossEntropyLoss(reduction="none")
 
         # Define the gradient function for the optimizer
-        # Add confidence parameter for margin-based loss
-        confidence = 10.0  # Use same confidence as LBFGS for consistency
-
         def gradient_fn(x):
             # Ensure gradients are enabled
             x.requires_grad_(True)
@@ -257,66 +235,32 @@ class CG(Attack):
             outputs = self.get_logits(x)
 
             # Get appropriate labels for the current batch
+            # This handles cases when we're only processing a subset of samples
             if self.targeted:
+                # For targeted, use target labels matching the current batch size
                 curr_labels = target_labels[: x.size(0)]
             else:
+                # For untargeted, use true labels matching the current batch size
                 curr_labels = labels[: x.size(0)]
 
-            # Implement margin-based loss like in LBFGS
-            batch_losses = []
-            for i in range(x.size(0)):
-                curr_output = outputs[i : i + 1]
-                curr_label = curr_labels[i : i + 1]
-
-                if self.targeted:
-                    # Get the target class logit
-                    target_logits = curr_output.gather(
-                        1, curr_label.unsqueeze(1)
-                    ).squeeze(1)
-
-                    # Get the highest logit of other classes
-                    other_logits = curr_output.clone()
-                    other_logits.scatter_(1, curr_label.unsqueeze(1), float("-inf"))
-                    highest_other_logits = other_logits.max(1)[0]
-
-                    # Margin loss: ensuring target class has higher logit by at least 'confidence'
-                    margin = highest_other_logits - target_logits + confidence
-                    # For targeted attacks, we want to minimize this margin
-                    loss = torch.clamp(margin, min=0)
-                else:
-                    # Get the true class logit
-                    true_logits = curr_output.gather(
-                        1, curr_label.unsqueeze(1)
-                    ).squeeze(1)
-
-                    # Get the highest logit of other classes
-                    other_logits = curr_output.clone()
-                    other_logits.scatter_(1, curr_label.unsqueeze(1), float("-inf"))
-                    highest_other_logits = other_logits.max(1)[0]
-
-                    # Margin loss: ensuring true class has lower logit by at least 'confidence'
-                    margin = true_logits - highest_other_logits + confidence
-                    # For untargeted attacks, we want to maximize this margin
-                    loss = -torch.clamp(margin, min=0)
-
-                batch_losses.append(loss)
-
-            # Combine batch losses
-            class_loss = torch.cat(batch_losses)
-
-            # Scale the loss to make it more significant - helps with small epsilons
-            loss_scale = 1000.0
-            class_loss = loss_scale * class_loss
+            # Classification loss
+            if self.targeted:
+                # For targeted attacks, minimize negative CE loss to target class
+                class_loss = -ce_loss(outputs, curr_labels)
+            else:
+                # For untargeted attacks, maximize CE loss to true class
+                class_loss = ce_loss(outputs, curr_labels)
 
             # Compute current perturbation
             delta = x - images[: x.size(0)]
 
-            # Add regularization losses (all are set to 0.0 by default)
+            # Add regularization losses - all should return per-sample values
+            # Note: These regularization terms are enhancements beyond the paper
             tv_loss = self.total_variation_loss(delta)
             color_loss = self.color_regularization(delta)
             percept_loss = self.perceptual_loss(delta, images[: x.size(0)])
 
-            # Combine losses with weights
+            # Combine losses with weights - keeping per-sample values
             total_loss = (
                 class_loss
                 + self.tv_lambda * tv_loss
@@ -324,7 +268,8 @@ class CG(Attack):
                 + self.perceptual_lambda * percept_loss
             )
 
-            # Compute gradients
+            # Compute gradients for each sample
+            # Paper: "g_t = ∇_δ L(f(x + δ_t), y)" - computing the gradient
             grads = []
             for i in range(x.size(0)):
                 grad = torch.autograd.grad(
@@ -348,51 +293,11 @@ class CG(Attack):
                 else:
                     curr_labels = labels[: x.size(0)]
 
-                # Implement margin-based loss like in LBFGS
-                batch_losses = []
-                for i in range(x.size(0)):
-                    curr_output = outputs[i : i + 1]
-                    curr_label = curr_labels[i : i + 1]
-
-                    if self.targeted:
-                        # Get the target class logit
-                        target_logits = curr_output.gather(
-                            1, curr_label.unsqueeze(1)
-                        ).squeeze(1)
-
-                        # Get the highest logit of other classes
-                        other_logits = curr_output.clone()
-                        other_logits.scatter_(1, curr_label.unsqueeze(1), float("-inf"))
-                        highest_other_logits = other_logits.max(1)[0]
-
-                        # Margin loss: ensuring target class has higher logit by at least 'confidence'
-                        margin = highest_other_logits - target_logits + confidence
-                        # For targeted attacks, we want to minimize this margin
-                        loss = torch.clamp(margin, min=0)
-                    else:
-                        # Get the true class logit
-                        true_logits = curr_output.gather(
-                            1, curr_label.unsqueeze(1)
-                        ).squeeze(1)
-
-                        # Get the highest logit of other classes
-                        other_logits = curr_output.clone()
-                        other_logits.scatter_(1, curr_label.unsqueeze(1), float("-inf"))
-                        highest_other_logits = other_logits.max(1)[0]
-
-                        # Margin loss: ensuring true class has lower logit by at least 'confidence'
-                        margin = true_logits - highest_other_logits + confidence
-                        # For untargeted attacks, we want to maximize this margin
-                        loss = -torch.clamp(margin, min=0)
-
-                    batch_losses.append(loss)
-
-                # Combine batch losses
-                class_loss = torch.cat(batch_losses)
-
-                # Scale the loss to make it more significant - helps with small epsilons
-                loss_scale = 1000.0
-                class_loss = loss_scale * class_loss
+                # Classification loss
+                if self.targeted:
+                    class_loss = -ce_loss(outputs, curr_labels)
+                else:
+                    class_loss = ce_loss(outputs, curr_labels)
 
                 # Compute current perturbation
                 delta = x - images[: x.size(0)]
@@ -432,9 +337,6 @@ class CG(Attack):
                     # This is the second condition for early stopping
                     return outputs.argmax(dim=1) != curr_labels
 
-        # Create per-sample epsilon tensor with the scaled value
-        per_sample_eps = torch.ones(images.size(0), device=self.device) * scaled_eps
-
         # Run the optimizer to generate adversarial examples
         # This executes the Algorithm 1 from the paper (Efficient Conjugate Gradient Attack)
         adv_images, metrics = self.optimizer.optimize(
@@ -444,8 +346,6 @@ class CG(Attack):
             success_fn=success_fn,
             x_original=images,
             targeted=self.targeted,
-            min_bound=min_bound,
-            max_bound=max_bound,
         )
 
         # Update attack metrics from optimizer results
@@ -457,7 +357,7 @@ class CG(Attack):
         self.total_time += self.end_time - self.start_time
 
         # Ensure outputs are properly clamped
-        adv_images = torch.clamp(adv_images, min=min_bound, max=max_bound).detach()
+        adv_images = torch.clamp(adv_images, 0, 1).detach()
 
         # Evaluate success and compute perturbation metrics
         success_rate, success_mask, pred_info = self.evaluate_attack_success(
