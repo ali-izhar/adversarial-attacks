@@ -1,24 +1,4 @@
-"""Simplified Projected Gradient Descent (PGD) optimization method.
-
-This file implements a clean, efficient PGD optimizer for generating adversarial examples
-against neural networks, following the approach of Madry et al. 2017.
-
-Key features:
-- Simple implementation of the core PGD algorithm
-- Support for L2 and Linf perturbation norms
-- Optional random initialization
-- Early stopping capability
-
-Expected inputs:
-- Initial images to perturb
-- Gradient function that computes gradients of the adversarial loss
-- Success function that determines if adversarial criteria are met (optional)
-- Original images (for projection constraints)
-
-Expected outputs:
-- Optimized adversarial examples
-- Basic metrics (iterations, success rate)
-"""
+"""Projected Gradient Descent (PGD) optimization method."""
 
 import torch
 import time
@@ -26,13 +6,9 @@ from typing import Tuple, Dict, Any, Optional, Callable
 
 
 class PGDOptimizer:
-    """
-    Simplified Projected Gradient Descent (PGD) optimization method.
-
-    PGD is a first-order method that iteratively updates the adversarial examples
+    """PGD is a first-order method that iteratively updates the adversarial examples
     by taking a step in the gradient direction and then projecting the perturbed
-    inputs back onto a feasible set defined by a norm constraint.
-    """
+    inputs back onto a feasible set defined by a norm constraint."""
 
     def __init__(
         self,
@@ -80,6 +56,8 @@ class PGDOptimizer:
         gradient_fn: Callable[[torch.Tensor], torch.Tensor],
         success_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         x_original: Optional[torch.Tensor] = None,
+        min_bound: Optional[torch.Tensor] = None,
+        max_bound: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Run PGD optimization to generate adversarial examples.
@@ -89,6 +67,8 @@ class PGDOptimizer:
             gradient_fn: Function to compute gradients of the loss w.r.t input
             success_fn: Optional function to determine if adversarial criteria are met
             x_original: Original input tensor (for projection constraints)
+            min_bound: Optional minimum bound for clamping (for normalized inputs)
+            max_bound: Optional maximum bound for clamping (for normalized inputs)
 
         Returns:
             Tuple of (adversarial examples, metrics dictionary)
@@ -108,6 +88,12 @@ class PGDOptimizer:
         if x_original is None:
             x_original = x_init
 
+        # Use default clamping bounds if not provided
+        if min_bound is None:
+            min_bound = 0.0
+        if max_bound is None:
+            max_bound = 1.0
+
         # Initialize perturbation - this corresponds to the initialization step in the algorithm
         # "Initialize δ₀ ~ U(-0.01,0.01)ⁿ" (random initialization within small range)
         if self.rand_init:
@@ -124,8 +110,8 @@ class PGDOptimizer:
             eta = torch.zeros_like(x_init)
 
         # Apply initial perturbation and clip to valid image range
-        # This ensures x + δ ∈ [0,1]ⁿ as required by the paper
-        x_adv = torch.clamp(x_original + eta, 0.0, 1.0)
+        # This ensures x + δ ∈ [min_bound, max_bound] for normalized inputs
+        x_adv = torch.clamp(x_original + eta, min=min_bound, max=max_bound)
 
         # Initialize metrics
         start_time = time.time()
@@ -205,10 +191,10 @@ class PGDOptimizer:
                 )
                 delta = delta * factor
 
-            # Apply projected perturbation and clip to valid range
+            # Apply projected perturbation and clip to valid image range
             # This implements the final step in the algorithm:
-            # "x_{t+1} ← Π_{[0,1]^n}(x + δ_{t+1})" (clipping to valid image range)
-            x_adv = torch.clamp(x_original + delta, 0.0, 1.0)
+            # "x_{t+1} ← Π_{[min_bound,max_bound]}(x + δ_{t+1})" for clamping to valid range
+            x_adv = torch.clamp(x_original + delta, min=min_bound, max=max_bound)
 
             # Check for success - part of the early stopping condition
             if success_fn is not None:
