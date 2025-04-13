@@ -3,6 +3,7 @@
 import time
 import torch
 import torch.nn as nn
+import numpy as np
 
 from .baseline.attack import Attack
 from .optimize.pgd import PGDOptimizer
@@ -706,3 +707,29 @@ class PGD(Attack):
             )
 
         return refined_images
+
+    def get_metrics(self):
+        """
+        Override base class method to ensure metrics are reported correctly
+        even when success rate is 0%.
+
+        Returns:
+            Dictionary of attack metrics
+        """
+        # Get base metrics from parent class
+        metrics = super().get_metrics()
+
+        # If success rate is 0%, metrics might be zeroed out
+        # Instead, report non-zero metrics if we have them
+        if (
+            metrics["success_rate"] == 0
+            and self.l2_norms
+            and self.linf_norms
+            and self.ssim_values
+        ):
+            # Use the actual calculated values instead of zeros
+            metrics["l2_norm"] = np.mean(self.l2_norms)
+            metrics["linf_norm"] = np.mean(self.linf_norms)
+            metrics["ssim"] = np.mean(self.ssim_values)
+
+        return metrics

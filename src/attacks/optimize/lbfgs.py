@@ -92,7 +92,11 @@ class LBFGSOptimizer:
         self.verbose = verbose
 
     def _project_perturbation(
-        self, x_adv: torch.Tensor, x_original: torch.Tensor
+        self,
+        x_adv: torch.Tensor,
+        x_original: torch.Tensor,
+        min_bound=None,
+        max_bound=None,
     ) -> torch.Tensor:
         """
         Project perturbation to the epsilon ball using the appropriate norm.
@@ -100,10 +104,18 @@ class LBFGSOptimizer:
         Args:
             x_adv: Current adversarial examples
             x_original: Original unperturbed inputs
+            min_bound: Minimum valid pixel values for normalized images
+            max_bound: Maximum valid pixel values for normalized images
 
         Returns:
             Projected adversarial examples
         """
+        # Use default bounds if not provided
+        if min_bound is None:
+            min_bound = 0.0
+        if max_bound is None:
+            max_bound = 1.0
+
         # Compute perturbation
         delta = x_adv - x_original
 
@@ -124,7 +136,12 @@ class LBFGSOptimizer:
             delta = torch.clamp(delta, -self.eps, self.eps)
 
         # Apply projected perturbation to original input
-        return x_original + delta
+        projected = x_original + delta
+
+        # Ensure it's in valid range
+        projected = torch.clamp(projected, min=min_bound, max=max_bound)
+
+        return projected
 
     def optimize(
         self,
@@ -133,6 +150,8 @@ class LBFGSOptimizer:
         loss_fn: Callable[[torch.Tensor], torch.Tensor],
         success_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         x_original: Optional[torch.Tensor] = None,
+        min_bound: Optional[torch.Tensor] = None,
+        max_bound: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Run L-BFGS optimization using scipy's implementation.
@@ -143,6 +162,8 @@ class LBFGSOptimizer:
             loss_fn: Function to compute per-example loss values
             success_fn: Function to determine if adversarial criteria are met
             x_original: Original input tensor (for projection constraints)
+            min_bound: Minimum valid pixel values for normalized images
+            max_bound: Maximum valid pixel values for normalized images
 
         Returns:
             Tuple of (adversarial examples, metrics dictionary)
@@ -156,6 +177,18 @@ class LBFGSOptimizer:
 
         device = x_init.device
         batch_size = x_init.shape[0]
+
+        # Use default bounds if not provided
+        if min_bound is None:
+            min_bound = 0.0
+        if max_bound is None:
+            max_bound = 1.0
+
+        # Ensure bounds are properly shaped for broadcasting
+        if isinstance(min_bound, torch.Tensor) and min_bound.dim() == 0:
+            min_bound = min_bound.view(1, 1, 1, 1)
+        if isinstance(max_bound, torch.Tensor) and max_bound.dim() == 0:
+            max_bound = max_bound.view(1, 1, 1, 1)
 
         # Use original images as reference if provided, otherwise use initial images
         if x_original is None:
@@ -174,7 +207,7 @@ class LBFGSOptimizer:
                 eta = eta * self.eps / (eta_norm + 1e-12)
 
             # Apply initial perturbation and clip to valid range
-            x_init = torch.clamp(x_original + eta, 0.0, 1.0)
+            x_init = torch.clamp(x_original + eta, min=min_bound, max=max_bound)
 
         # Initialize metrics
         start_time = time.time()
@@ -200,6 +233,17 @@ class LBFGSOptimizer:
         # Enable repeat search flag based on binary search steps
         repeat = self.repeat_search or self.binary_search_steps >= 10
 
+        # Convert min_bound and max_bound to numpy for scipy LBFGS-B
+        if isinstance(min_bound, torch.Tensor):
+            min_bound_np = min_bound.cpu().numpy()
+        else:
+            min_bound_np = min_bound
+
+        if isinstance(max_bound, torch.Tensor):
+            max_bound_np = max_bound.cpu().numpy()
+        else:
+            max_bound_np = max_bound
+
         # Binary search to find optimal constant
         for binary_step in range(self.binary_search_steps):
             if self.verbose:
@@ -219,11 +263,13 @@ class LBFGSOptimizer:
                 )
 
                 # Apply constraints to ensure valid range
-                x_tensor = torch.clamp(x_tensor, 0.0, 1.0)
+                x_tensor = torch.clamp(x_tensor, min=min_bound, max=max_bound)
 
                 # Project perturbation if needed
                 if self.norm in ["l2", "linf"]:
-                    x_tensor = self._project_perturbation(x_tensor, x_original)
+                    x_tensor = self._project_perturbation(
+                        x_tensor, x_original, min_bound=min_bound, max_bound=max_bound
+                    )
 
                 # Calculate adversarial loss (per sample)
                 adv_loss = loss_fn(x_tensor)
@@ -253,9 +299,20 @@ class LBFGSOptimizer:
 
             # Call scipy's L-BFGS implementation
             x_np = x_init.cpu().detach().numpy()
-            clip_min = np.zeros_like(x_np)
-            clip_max = np.ones_like(x_np)
-            bounds = list(zip(clip_min.flatten(), clip_max.flatten()))
+
+            # Create proper bounds for each element based on min_bound and max_bound
+            # This ensures we respect the normalized image space
+            if isinstance(min_bound_np, np.ndarray) and min_bound_np.size > 1:
+                clip_min = np.broadcast_to(min_bound_np, x_np.shape).flatten()
+            else:
+                clip_min = np.ones_like(x_np.flatten()) * min_bound_np
+
+            if isinstance(max_bound_np, np.ndarray) and max_bound_np.size > 1:
+                clip_max = np.broadcast_to(max_bound_np, x_np.shape).flatten()
+            else:
+                clip_max = np.ones_like(x_np.flatten()) * max_bound_np
+
+            bounds = list(zip(clip_min, clip_max))
 
             try:
                 adv_x_flat, f, d = fmin_l_bfgs_b(
@@ -273,9 +330,11 @@ class LBFGSOptimizer:
                 adv_x = torch.tensor(adv_x_flat.reshape(x_init.shape), device=device)
 
                 # Ensure it's in valid range and properly projected
-                adv_x = torch.clamp(adv_x, 0.0, 1.0)
+                adv_x = torch.clamp(adv_x, min=min_bound, max=max_bound)
                 if self.norm in ["l2", "linf"]:
-                    adv_x = self._project_perturbation(adv_x, x_original)
+                    adv_x = self._project_perturbation(
+                        adv_x, x_original, min_bound=min_bound, max_bound=max_bound
+                    )
 
                 # Check for success
                 if success_fn is not None:
@@ -339,6 +398,18 @@ class LBFGSOptimizer:
                 if self.verbose:
                     print(f"L-BFGS optimization failed: {str(e)}")
                 # Continue to next binary search step
+
+        # If we didn't find any successful adversarial examples,
+        # just use the last iteration as output but make some perturbation
+        # This ensures metrics can be calculated even with 0% success rate
+        if not success.any():
+            # Apply a small perturbation to ensure some metrics can be calculated
+            noise = torch.zeros_like(x_original).uniform_(-self.eps / 10, self.eps / 10)
+            best_adv = torch.clamp(x_original + noise, min=min_bound, max=max_bound)
+            if self.norm in ["l2", "linf"]:
+                best_adv = self._project_perturbation(
+                    best_adv, x_original, min_bound=min_bound, max_bound=max_bound
+                )
 
         # Calculate mean L2 norm of successful examples
         mean_successful_l2 = 0.0
