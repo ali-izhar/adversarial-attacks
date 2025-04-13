@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """
-Generate grid visualization of adversarial examples from multiple baseline attack methods.
+Generate grid visualization of adversarial examples from multiple attack methods.
 Shows original images in the first column and corresponding adversarial examples in subsequent columns.
+Includes both baseline and optimization-based attack methods.
 """
 
 import os
@@ -14,6 +15,18 @@ import logging
 import traceback
 import argparse
 from tqdm import tqdm
+
+# Configure matplotlib to use LaTeX for text rendering
+plt.rcParams.update(
+    {
+        "text.usetex": True,
+        "font.family": "serif",
+        "font.serif": ["Computer Modern Roman"],
+        "font.size": 14,
+        "axes.titlesize": 16,
+        "axes.labelsize": 14,
+    }
+)
 
 # Configure logging
 logging.basicConfig(
@@ -29,10 +42,17 @@ sys.path.insert(0, project_root)
 
 from src.datasets.imagenet import get_dataset
 from src.models.wrappers import get_model
+
+# Baseline attacks
 from src.attacks.baseline.attack_fgsm import FGSM
 from src.attacks.baseline.attack_ffgsm import FFGSM
 from src.attacks.baseline.attack_deepfool import DeepFool
 from src.attacks.baseline.attack_cw import CW
+
+# Optimization-based attacks
+from src.attacks.attack_pgd import PGD
+from src.attacks.attack_cg import CG
+from src.attacks.attack_lbfgs import LBFGS
 
 
 def denormalize(x):
@@ -62,9 +82,9 @@ def compute_ssim(original, perturbed):
 def generate_adversarial_grid(
     model,
     dataset,
-    num_images=10,
+    num_images=4,
     attack_methods=None,
-    save_path="paper/images/adversarial_grid.png",
+    save_path="paper/images/attack_comparison.png",
 ):
     """
     Generate a grid visualization with original images and their adversarial versions
@@ -81,10 +101,31 @@ def generate_adversarial_grid(
     # Default attack methods if none provided
     if attack_methods is None:
         attack_methods = {
+            # Baseline methods
             "FGSM": FGSM(model, eps=8 / 255),
             "FFGSM": FFGSM(model, eps=8 / 255, alpha=0.4 * 8 / 255),
             "DeepFool": DeepFool(model, steps=50, overshoot=0.02, top_k_classes=10),
             "C&W": CW(model, c=1.0, kappa=0, steps=100, lr=0.01),
+            # Optimization methods
+            "PGD": PGD(
+                model,
+                norm="Linf",
+                eps=8 / 255,
+                n_iterations=40,
+                step_size=2 / 255,
+                rand_init=True,
+                early_stopping=True,
+            ),
+            "CG": CG(model, eps=0.5),
+            "L-BFGS": LBFGS(
+                model,
+                norm="L2",
+                eps=0.5,
+                n_iterations=100,
+                history_size=10,
+                initial_const=1e-2,
+                binary_search_steps=5,
+            ),
         }
 
     # Number of columns: 1 for original + 1 for each attack method
@@ -105,9 +146,17 @@ def generate_adversarial_grid(
     # Create header row for method names
     header_axes = []
     for col, name in enumerate(["Original"] + list(attack_methods.keys())):
+        # Escape special LaTeX characters for rendering
+        display_name = name.replace("&", "\\&")
         header_ax = fig.add_subplot(gs[0, col])
         header_ax.text(
-            0.5, 0.5, name, ha="center", va="center", fontsize=14, fontweight="bold"
+            0.5,
+            0.5,
+            display_name,
+            ha="center",
+            va="center",
+            fontsize=18,
+            fontweight="bold",
         )
         header_ax.axis("off")
         header_axes.append(header_ax)
@@ -150,7 +199,7 @@ def generate_adversarial_grid(
         short_class = class_name.split(",")[
             0
         ]  # Take only the first part of the class name
-        axes[row, 0].set_ylabel(f"{short_class}", fontsize=10)
+        axes[row, 0].set_ylabel(f"{short_class}", fontsize=14)
 
         # Show predicted class on original image
         pred_class = dataset.class_names[orig_pred].split(",")[0]
@@ -163,7 +212,7 @@ def generate_adversarial_grid(
             0.95,
             f"{pred_class}",
             transform=axes[row, 0].transAxes,
-            fontsize=8,
+            fontsize=12,
             ha="center",
             va="top",
             bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7),
@@ -219,7 +268,7 @@ def generate_adversarial_grid(
                         0.95,
                         f"{adv_class}",
                         transform=axes[row, col].transAxes,
-                        fontsize=8,
+                        fontsize=12,
                         ha="center",
                         va="top",
                         bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7),
@@ -294,10 +343,10 @@ def generate_adversarial_grid(
         header_axes[col].text(
             0.5,
             0.2,
-            f"({success_rate:.0f}% success)",
+            f"({success_rate:.0f}\\% success)",
             ha="center",
             va="center",
-            fontsize=10,
+            fontsize=14,
             fontstyle="italic",
         )
 
@@ -336,14 +385,14 @@ def main():
     parser.add_argument(
         "--num_images",
         type=int,
-        default=10,
+        default=4,
         help="Number of images to include in the grid",
     )
     parser.add_argument("--model", type=str, default="resnet18", help="Model to attack")
     parser.add_argument(
         "--output",
         type=str,
-        default="paper/images/adversarial_grid.png",
+        default="paper/images/attack_comparison.png",
         help="Output file path",
     )
     args = parser.parse_args()
