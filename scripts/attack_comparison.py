@@ -4,11 +4,11 @@ untargeted and targeted attacks on a specific ImageNet image.
 
 USAGE::
     >>> python attack_comparison.py
-    >>> python attack_comparison.py --image_idx <image_index>
-    >>> python attack_comparison.py --show_all
+    >>> python attack_comparison.py --idx <image_index>
+    >>> python attack_comparison.py --all
 
 image_index: index of the image to use from the ImageNet dataset
-show_all: show all attacks [FGSM, FFGSM, DeepFool, CW, PGD, CG, LBFGS] (default: only untargeted CW)
+all: show all attacks [FGSM, FFGSM, DeepFool, CW, PGD, CG, LBFGS] (default: only untargeted CW)
 """
 
 import argparse
@@ -99,13 +99,14 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Visualize different attack methods")
     parser.add_argument(
-        "--image_idx",
+        "--idx",
+        "-i",
         type=int,
         default=None,
         help="Index of ImageNet image to use (default: find first saluki image)",
     )
     parser.add_argument(
-        "--show_all",
+        "--all",
         action="store_true",
         help="Show all attacks instead of just untargeted/targeted CW",
     )
@@ -123,7 +124,7 @@ def main():
     dataset = get_dataset("imagenet", data_dir="data", max_samples=1000)
 
     # Select image
-    image_idx = args.image_idx
+    image_idx = args.idx
     if image_idx is None:
         # Find saluki image (class 176)
         for idx, (_, label) in enumerate(dataset):
@@ -154,7 +155,7 @@ def main():
 
         predictions["Original"] = {"pred": orig_pred, "conf": orig_conf}
 
-    if args.show_all:
+    if args.all:
         # Define all attacks
         attacks = {}
 
@@ -181,10 +182,14 @@ def main():
             norm="L2",
             eps=3.0 / 255.0,
             n_iter=50,
-            tv_lambda=0.1,
-            color_lambda=0.1,
-            perceptual_lambda=0.1,
+            tv_lambda=0.05,
+            color_lambda=0.05,
+            perceptual_lambda=0.05,
+            rand_init=True,
+            fgsm_init=True,
+            adaptive_restart=True,
             early_stopping=True,
+            strict_epsilon_constraint=True,
         )
         attacks["L-BFGS"] = LBFGS(
             model,
@@ -256,7 +261,7 @@ def main():
     # Create visualization
     plt.rcParams["figure.facecolor"] = "white"
 
-    if args.show_all:
+    if args.all:
         # Configure full layout with all attacks
         num_rows = 3  # Original, Perturbation, Adversarial
         num_cols = len(adv_examples) + 1  # All attacks + original
@@ -521,7 +526,7 @@ def main():
     # Save the figure
     os.makedirs("images", exist_ok=True)
     output_filename = (
-        "attack_comparison_full.png" if args.show_all else "attack_comparison.png"
+        "attack_comparison_full.png" if args.all else "attack_comparison.png"
     )
     plt.savefig(
         f"images/{output_filename}",
