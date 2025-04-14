@@ -1,12 +1,14 @@
+#!/usr/bin/env python
+
 """Carlini-Wagner (CW) adversarial attack implementation.
 
 Some code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
 """
 
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import time
 
 from .attack import Attack
 
@@ -24,10 +26,8 @@ class CW(Attack):
             :math:`minimize \Vert\frac{1}{2}(tanh(w)+1)-x\Vert^2_2+c\cdot f(\frac{1}{2}(tanh(w)+1))`
         kappa (float): kappa (also written as 'confidence') in the paper. (Default: 0)
             :math:`f(x')=max(max\{Z(x')_i:i\neq t\} -Z(x')_t, - \kappa)`
-        steps (int): number of steps. (Default: 1000)
+        steps (int): number of steps. (Default: 100)
         lr (float): learning rate of the Adam optimizer. (Default: 0.01)
-
-    .. warning:: With default c, you can't easily get adversarial images. Set higher c like 1.
 
     Shape:
         - images: :math:`(N, C, H, W)` normalized images with ImageNet mean/std
@@ -35,7 +35,7 @@ class CW(Attack):
         - output: :math:`(N, C, H, W)` normalized adversarial images.
 
     Examples::
-        >>> attack = CW(model, c=1, kappa=0, steps=1000, lr=0.01)
+        >>> attack = CW(model, c=1, kappa=0, steps=100, lr=0.01)
         >>> adv_images = attack(images, labels)
 
     Note:
@@ -50,25 +50,23 @@ class CW(Attack):
             model: Target model to attack
             c: Box constraint parameter (default: 1)
             kappa: Confidence parameter (default: 0)
-            steps: Number of optimization steps (default: 1000)
+            steps: Number of optimization steps (default: 100)
             lr: Learning rate for Adam optimizer (default: 0.01)
         """
         super().__init__("CW", model)
-        self.c = c  # Box constraint parameter - trade-off between distortion and attack success
-        self.kappa = (
-            kappa  # Confidence parameter - controls the margin in misclassification
-        )
-        self.steps = steps  # Number of optimization steps
-        self.lr = (
-            lr  # Learning rate for Adam optimizer (instead of line search in paper)
-        )
+        # Box constraint parameter - trade-off between distortion and attack success
+        self.c = c
+        # Confidence parameter - controls the margin in misclassification
+        self.kappa = kappa
+        # Number of optimization steps
+        self.steps = steps
+        # Learning rate for Adam optimizer (instead of line search in paper)
+        self.lr = lr
         # CW supports both targeted and untargeted attacks
         self.supported_mode = ["default", "targeted"]
 
     def forward(self, images, labels):
-        r"""
-        Overridden.
-        """
+        r"""Overridden."""
         # Track time for performance metrics
         start_time = time.time()
 
@@ -107,9 +105,8 @@ class CW(Attack):
 
         # Loss functions for optimization
         MSELoss = nn.MSELoss(reduction="none")  # Used for L2 distance calculation
-        Flatten = (
-            nn.Flatten()
-        )  # Needed to flatten spatial dimensions for L2 calculation
+        # Needed to flatten spatial dimensions for L2 calculation
+        Flatten = nn.Flatten()
 
         # Higher learning rates when steps are limited
         # This is a practical adaptation (not in the paper) to work with fewer iterations
@@ -222,8 +219,7 @@ class CW(Attack):
         return best_adv_images
 
     def tanh_space(self, x, min_bound, max_bound):
-        """
-        Convert from optimization space to normalized image space using tanh.
+        """Convert from optimization space to normalized image space using tanh.
 
         This implements the key C&W transformation:
         x_adv = 0.5*(tanh(w) + 1) scaled to the appropriate range
@@ -242,8 +238,7 @@ class CW(Attack):
         return min_bound + (max_bound - min_bound) * normalized
 
     def inverse_tanh_space(self, x, min_bound, max_bound):
-        """
-        Convert from normalized image space to optimization space using inverse tanh.
+        """Convert from normalized image space to optimization space using inverse tanh.
 
         This implements the inverse of the C&W transformation:
         w = atanh(2 * (x_scaled - 0.5))
@@ -265,9 +260,7 @@ class CW(Attack):
         return self.atanh(2 * x_01 - 1)  # maps from [0,1] to [-1,1], then applies atanh
 
     def atanh(self, x):
-        """
-        Compute inverse hyperbolic tangent.
-
+        """Compute inverse hyperbolic tangent.
         Used to convert from normalized image space to unbounded optimization space.
         """
         # Clamp to ensure we're in [-1+eps, 1-eps] to avoid numerical instability
@@ -276,8 +269,7 @@ class CW(Attack):
         return 0.5 * torch.log((1 + x) / (1 - x))
 
     def f(self, outputs, labels):
-        """
-        Compute the f-function loss for CW attack.
+        """Compute the f-function loss for CW attack.
 
         This implements the paper's function:
         f(x') = max(max{Z(x')_i: i≠t} - Z(x')_t, -κ)

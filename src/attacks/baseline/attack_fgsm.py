@@ -1,11 +1,13 @@
+#!/usr/bin/env python
+
 """Fast Gradient Sign Method (FGSM) adversarial attack implementation.
 
 Some code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
 """
 
+import time
 import torch
 import torch.nn as nn
-import time
 
 from .attack import Attack
 
@@ -51,27 +53,33 @@ class FGSM(Attack):
         # Scale epsilon to normalized space by dividing by ImageNet std
         # This makes the perturbation magnitude consistent across channels
         mean_std = self.std.clone().detach().mean().item()
-        self.eps = (
-            eps / mean_std
-        )  # Scaling to normalized space for consistent perturbation
+        # Scale epsilon to normalized space for consistent perturbation
+        self.eps = eps / mean_std
 
         # FGSM supports both untargeted and targeted attacks
         self.supported_mode = ["default", "targeted"]
 
     def forward(self, images, labels):
-        r"""
-        Overridden.
-        """
+        r"""Overridden."""
+        # Track time for performance metrics
+        start_time = time.time()
+
         # Clone and detach input images to avoid modifying the original data
         images = images.clone().detach().to(self.device)
         labels = labels.clone().detach().to(self.device)
 
-        # Note start time for performance tracking
-        start_time = time.time()
-
         # For targeted attacks, get the target labels
         if self.targeted:
             target_labels = self.get_target_label(images, labels)
+
+        # Calculate normalized min/max bounds for valid pixel values
+        min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
+        max_bound = ((1 - self.mean) / self.std).to(
+            device=images.device, dtype=images.dtype
+        )
+
+        min_bound = min_bound.view(1, 3, 1, 1)
+        max_bound = max_bound.view(1, 3, 1, 1)
 
         # Use cross-entropy loss for classification tasks
         # This implements L(f(x+δ), y) from the paper's formulation
@@ -108,17 +116,6 @@ class FGSM(Attack):
         # FGSM update: add signed gradients scaled by epsilon
         # This implements x_adv = x + ε * sign(∇_x L(f(x), y)) from the paper
         adv_images = images + self.eps * grad.sign()
-
-        # Calculate normalized min/max bounds to keep adversarial example
-        # within valid pixel ranges after denormalization
-        # This ensures that the adversarial examples are valid images
-        min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
-        max_bound = ((1 - self.mean) / self.std).to(
-            device=images.device, dtype=images.dtype
-        )
-
-        min_bound = min_bound.view(1, 3, 1, 1)
-        max_bound = max_bound.view(1, 3, 1, 1)
 
         # Clamp to valid normalized range
         # This enforces the constraint ||δ||_∞ ≤ ε indirectly by ensuring

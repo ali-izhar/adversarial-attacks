@@ -1,13 +1,14 @@
+#!/usr/bin/env python
+
 """Base class for all baseline attacks.
 
 Some code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
 
-NORMALIZATION WARNING:
-When using these attacks with our framework:
-1. Our model wrappers now expect ALREADY NORMALIZED inputs from ImageNetDataset
-2. No additional normalization should be needed or applied
-3. Perturbations are applied in the normalized space [-2.64, 2.64]
-4. For reporting and visualization, we convert back to [0,1] space
+NOTE: When using these attacks with our framework:
+    1. Our model wrappers expect ALREADY NORMALIZED inputs from ImageNetDataset
+    2. No additional normalization should be needed or applied
+    3. Perturbations are applied in the normalized space [-2.64, 2.64]
+    4. For reporting and visualization, we convert back to [0,1] space
 """
 
 import time
@@ -51,12 +52,6 @@ class Attack(object):
         It automatically set device to the device where given model is.
         It basically changes training mode to eval during attack process.
         To change this, please see `set_model_training_mode`.
-
-    NORMALIZATION EXPECTATIONS:
-    - The attack methods work with normalized image inputs (ImageNet normalization)
-    - This means inputs are in range [-2.64, 2.64] with mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-    - Perturbations are computed and applied in this normalized space
-    - When clamping or visualizing, we denormalize to [0,1] range
     """
 
     def __init__(self, name, model):
@@ -87,9 +82,8 @@ class Attack(object):
         self.attack_mode = "default"  # Can be "default" or "targeted"
         self.supported_mode = ["default"]
         self.targeted = False  # Flag for targeted vs untargeted attacks
-        self._target_map_function = (
-            None  # Function to map input labels to target labels
-        )
+        # Function to map input labels to target labels
+        self._target_map_function = None
 
         # Normalization settings for input preprocessing
         # For our current framework, this should usually be None since
@@ -127,7 +121,7 @@ class Attack(object):
         self.total_time = 0
         self.attack_success_count = 0
         self.total_samples = 0
-        # Reset perturbation metrics lists - critical for proper isolation between attack configurations
+        # Reset perturbation metrics lists
         self.l2_norms = []
         self.linf_norms = []
         self.ssim_values = []
@@ -182,8 +176,7 @@ class Attack(object):
         return metrics
 
     def denormalize(self, images):
-        """
-        Convert normalized images back to [0,1] range for visualization
+        """Convert normalized images back to [0,1] range for visualization
         and accurate perturbation magnitude reporting.
 
         Args:
@@ -205,8 +198,7 @@ class Attack(object):
         return denorm_images
 
     def normalize(self, images):
-        """
-        Convert images from [0,1] range to normalized range with ImageNet stats.
+        """Convert images from [0,1] range to normalized range with ImageNet stats.
 
         Args:
             images: Images in [0,1] range
@@ -244,11 +236,6 @@ class Attack(object):
         # Forward directly - normalization handled by model or dataset
         logits = self.model(inputs)
         return logits
-
-    def increment_iteration(self):
-        """Increment iteration counter.
-        This should be called once per sample per main iteration."""
-        self.total_iterations += 1
 
     def compute_perturbation_metrics(
         self, original_images, adversarial_images, success_mask=None
@@ -465,16 +452,12 @@ class Attack(object):
         return inputs * std + mean
 
     def get_mode(self):
-        r"""
-        Get attack mode.
-        """
+        r"""Get attack mode."""
         return self.attack_mode
 
     @wrapper_method
     def set_mode_default(self):
-        r"""
-        Set attack mode as default mode (untargeted attack).
-        """
+        r"""Set attack mode as default mode (untargeted attack)."""
         self.attack_mode = "default"
         self.targeted = False
         print("Attack mode is changed to 'default.'")
@@ -821,9 +804,7 @@ class Attack(object):
 
     @staticmethod
     def to_type(inputs, type):
-        r"""
-        Convert inputs between float and int types.
-        """
+        r"""Convert inputs between float and int types."""
         if type == "int":
             if isinstance(inputs, torch.FloatTensor) or isinstance(
                 inputs, torch.cuda.FloatTensor

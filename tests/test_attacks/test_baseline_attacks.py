@@ -1,23 +1,18 @@
 #!/usr/bin/env python
-"""
-Tests for all baseline attacks.
+"""Tests for all baseline attacks (FGSM, FFGSM, DeepFool, CW)
 
-This script tests all baseline attacks (FGSM, FFGSM, DeepFool, CW, PGD)
-on a small sample of ImageNet data, using our model wrappers
-that handle normalized inputs correctly.
-
-Usage:
-    python -m tests.test_baseline.test_all_attacks
+USAGE::
+    >>> python -m tests.test_baseline.test_all_attacks
 """
 
 import os
 import sys
 import time
-import torch
 import argparse
-import matplotlib.pyplot as plt
 import yaml
+import matplotlib.pyplot as plt
 from tqdm import tqdm
+import torch
 
 # Add the project root to the path
 project_root = os.path.dirname(
@@ -27,11 +22,7 @@ sys.path.insert(0, project_root)
 
 from src.datasets.imagenet import get_dataset, get_dataloader
 from src.models.wrappers import get_model
-from src.attacks.baseline.attack_fgsm import FGSM
-from src.attacks.baseline.attack_ffgsm import FFGSM
-from src.attacks.baseline.attack_deepfool import DeepFool
-from src.attacks.baseline.attack_cw import CW
-from src.attacks.attack_pgd import PGD
+from src.attacks.baseline import FGSM, FFGSM, DeepFool, CW
 
 
 def load_config(config_path):
@@ -240,9 +231,7 @@ def test_attack(attack, model, dataset, attack_name, args):
                 continue
 
         # Attack only the correctly classified samples
-        attack_start = time.time()
         adversarial = attack(correct_inputs, correct_labels)
-        attack_time = time.time() - attack_start
 
         # Get model predictions on adversarial examples
         with torch.no_grad():
@@ -361,10 +350,6 @@ def create_attack(model, attack_type, config, targeted=False):
         if not attack_params:
             raise ValueError("Missing 'attack.params' section in config")
 
-        # Default norm type (first in the list)
-        norm_types = config.get("attack", {}).get("norm_types", ["Linf"])
-        norm_type = norm_types[0]
-
         if attack_type == "FGSM":
             # Get FGSM parameters from config
             if "FGSM" not in attack_params:
@@ -474,65 +459,6 @@ def create_attack(model, attack_type, config, targeted=False):
 
             attack = CW(model, c=c, kappa=kappa, steps=steps, lr=lr)
             attack_name = f"CW (c={c}, kappa={kappa}, steps={steps})"
-
-        elif attack_type == "PGD":
-            # Get PGD parameters from config
-            if "PGD" not in attack_params:
-                raise ValueError("Missing PGD configuration in attack params")
-
-            attack_mode = "targeted" if targeted else "untargeted"
-            if attack_mode not in attack_params["PGD"]:
-                raise ValueError(f"Missing {attack_mode} mode for PGD in config")
-
-            params = attack_params["PGD"][attack_mode]
-
-            norm = "Linf"  # Default norm
-
-            if (
-                "eps_values" not in params
-                or norm not in params["eps_values"]
-                or not params["eps_values"][norm]
-            ):
-                raise ValueError(f"Missing epsilon values for PGD with {norm} norm")
-
-            eps_value = params["eps_values"][norm][0]  # Default to first epsilon value
-            eps = parse_fraction(eps_value)
-
-            required_params = [
-                "n_iterations",
-                "alpha_type",
-                "rand_init",
-                "early_stopping",
-            ]
-            for param in required_params:
-                if param not in params:
-                    raise ValueError(f"Missing {param} parameter for PGD")
-
-            n_iterations = params["n_iterations"]
-
-            # Check for alpha init parameters based on norm
-            alpha_init_key = "alpha_init_linf" if norm == "Linf" else "alpha_init_l2"
-            if alpha_init_key not in params:
-                raise ValueError(f"Missing {alpha_init_key} parameter for PGD")
-
-            alpha_init_value = params[alpha_init_key]
-            alpha_init = parse_fraction(alpha_init_value)
-            alpha_type = params["alpha_type"]
-            rand_init = params["rand_init"]
-            early_stopping = params["early_stopping"]
-
-            attack = PGD(
-                model,
-                norm=norm,
-                eps=eps,
-                n_iterations=n_iterations,
-                alpha_init=alpha_init,
-                alpha_type=alpha_type,
-                rand_init=rand_init,
-                early_stopping=early_stopping,
-            )
-            attack_name = f"PGD ({norm}, ε={eps:.4f}, steps={n_iterations})"
-
         else:
             raise ValueError(f"Unknown attack type: {attack_type}")
 
@@ -628,7 +554,7 @@ def main(args):
     for attack_type in args.attacks:
         if attack_type.lower() == "all":
             # Load all configured attacks
-            for attack_name in ["FGSM", "FFGSM", "DeepFool", "CW", "PGD"]:
+            for attack_name in ["FGSM", "FFGSM", "DeepFool", "CW"]:
                 try:
                     attack, attack_name = create_attack(
                         model, attack_name, config, args.targeted
@@ -649,7 +575,6 @@ def main(args):
                 "FFGSM": "FFGSM",
                 "DEEPFOOL": "DeepFool",
                 "CW": "CW",
-                "PGD": "PGD",
             }
             try:
                 if attack_type_upper in attack_type_map:
@@ -791,7 +716,7 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["all"],
-        choices=["all", "fgsm", "ffgsm", "deepfool", "cw", "pgd"],
+        choices=["all", "fgsm", "ffgsm", "deepfool", "cw"],
         help="Which attacks to test",
     )
 

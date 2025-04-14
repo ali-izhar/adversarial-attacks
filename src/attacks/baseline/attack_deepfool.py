@@ -1,10 +1,12 @@
+#!/usr/bin/env python
+
 """DeepFool adversarial attack implementation.
 
 Some code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
 """
 
-import torch
 import time
+import torch
 
 from .attack import Attack
 
@@ -16,14 +18,16 @@ class DeepFool(Attack):
     Distance Measure : L2
     Arguments:
         model (nn.Module): model to attack.
-        steps (int): number of steps. (Default: 50)
+        steps (int): number of steps. (Default: 30)
         overshoot (float): parameter for enhancing the noise. (Default: 0.02)
+        early_stopping (bool): whether to stop early when all samples are fooled. (Default: True)
+        top_k_classes (int): number of top classes to consider when finding closest boundary. (Default: 5)
     Shape:
         - images: :math:`(N, C, H, W)` normalized images with ImageNet mean/std
         - labels: :math:`(N)` where each value :math:`y_i` is :math:`0 \leq y_i \leq` `number of labels`.
         - output: :math:`(N, C, H, W)` normalized adversarial images.
     Examples::
-        >>> attack = DeepFool(model, steps=50, overshoot=0.02)
+        >>> attack = DeepFool(model, steps=30, overshoot=0.02, early_stopping=True, top_k_classes=5)
         >>> adv_images = attack(images, labels)
 
     Note:
@@ -47,33 +51,31 @@ class DeepFool(Attack):
         super().__init__("DeepFool", model)
         self.steps = steps  # Maximum number of iterations
         self.overshoot = overshoot  # Parameter to enhance the noise
-        self.early_stopping = (
-            early_stopping  # Whether to stop early when all samples are fooled
-        )
-        self.top_k_classes = top_k_classes  # Only consider top-k classes for efficiency
+        # Whether to stop early when all samples are fooled
+        self.early_stopping = early_stopping
+        # Only consider top-k classes for efficiency
+        self.top_k_classes = top_k_classes
         # DeepFool only supports untargeted attacks
         self.supported_mode = ["default"]
 
     def forward(self, images, labels):
-        r"""
-        Overridden.
-        """
+        r"""Overridden."""
         # Call the main implementation and return only the adversarial images
         adv_images, _ = self.forward_return_target_labels(images, labels)
         return adv_images
 
     def forward_return_target_labels(self, images, labels):
-        r"""
-        Optimized batch implementation of DeepFool.
-        """
+        r"""Optimized batch implementation of DeepFool."""
         # Start timer for performance tracking
         start_time = time.time()
 
         # Clone and detach input images to avoid modifying the original data
         images = images.clone().detach().to(self.device)
         labels = labels.clone().detach().to(self.device)
+        batch_size = images.size(0)
 
-        batch_size = len(images)
+        if self.targeted:
+            return "Targeted attacks are not supported for DeepFool"
 
         # Calculate normalized min/max bounds for valid pixel values
         # This ensures perturbations keep the image within valid range
@@ -214,10 +216,6 @@ class DeepFool(Attack):
                 else:
                     other_classes = [indices[0].item()]
 
-            # Optimization: compute all gradients in one pass using the Jacobian
-            # This is more efficient than computing gradients separately for each class
-            jacobian_rows = []
-
             # Get gradient of true class - ∇f_{k̂(x)}(x)
             true_logit = logits[0, true_label]
             adv_x_i.grad = None
@@ -231,7 +229,6 @@ class DeepFool(Attack):
             min_distance = float("inf")
             closest_grad = None
             closest_diff = None
-            closest_class = -1
 
             # Check each class - finding j* that minimizes the distance
             for k_idx, k in enumerate(other_classes):
@@ -261,7 +258,6 @@ class DeepFool(Attack):
                     min_distance = dist
                     closest_grad = grad_diff
                     closest_diff = f_diff
-                    closest_class = k
 
             # If no valid boundary found, break
             # Practical consideration for numerical stability
@@ -291,25 +287,3 @@ class DeepFool(Attack):
 
         # Return results
         return fooled, iterations, adv_x, target_class
-
-    def _construct_jacobian(self, y, x):
-        """Construct the Jacobian matrix of model outputs with respect to inputs.
-
-        Args:
-            y: Model outputs
-            x: Input tensor
-
-        Returns:
-            Jacobian matrix
-        """
-        x_grads = []
-        for idx, y_element in enumerate(y):
-            if x.grad is not None:
-                x.grad.zero_()
-            # Compute gradients for each output element
-            y_element.backward(retain_graph=(False or idx + 1 < len(y)))
-            # Count each backward pass as a gradient call
-            self.track_gradient_calls(1)
-            x_grads.append(x.grad.clone().detach())
-        # Stack all gradients to form the Jacobian matrix
-        return torch.stack(x_grads).reshape(*y.shape, *x.shape)

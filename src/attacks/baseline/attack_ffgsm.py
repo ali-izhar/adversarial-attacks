@@ -1,11 +1,13 @@
+#!/usr/bin/env python
+
 """Fast Fast Gradient Sign Method (FFGSM) adversarial attack implementation.
 
 Some code is adapted from https://github.com/Harry24k/adversarial-attacks-pytorch
 """
 
+import time
 import torch
 import torch.nn as nn
-import time
 
 from .attack import Attack
 
@@ -70,9 +72,7 @@ class FFGSM(Attack):
         self.supported_mode = ["default", "targeted"]
 
     def forward(self, images, labels):
-        r"""
-        Overridden.
-        """
+        r"""Overridden."""
         # Start timer for performance tracking
         start_time = time.time()
 
@@ -84,12 +84,7 @@ class FFGSM(Attack):
         if self.targeted:
             target_labels = self.get_target_label(images, labels)
 
-        # Use cross-entropy loss for classification tasks
-        # This implements L(f(x+δ), y) from the paper's formulation
-        loss = nn.CrossEntropyLoss()
-
         # Calculate normalized min/max bounds for valid pixel values
-        # These bounds ensure adversarial examples are valid images after denormalization
         min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
         max_bound = ((1 - self.mean) / self.std).to(
             device=images.device, dtype=images.dtype
@@ -97,6 +92,10 @@ class FFGSM(Attack):
 
         min_bound = min_bound.view(1, 3, 1, 1)
         max_bound = max_bound.view(1, 3, 1, 1)
+
+        # Use cross-entropy loss for classification tasks
+        # This implements L(f(x+δ), y) from the paper's formulation
+        loss = nn.CrossEntropyLoss()
 
         # FFGSM Step 1: Initialize with random noise within epsilon bound
         # This corresponds to x' = x + α·sign(N(0,1)) from the paper
