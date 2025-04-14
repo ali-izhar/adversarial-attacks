@@ -1,33 +1,23 @@
 #!/usr/bin/env python
-"""
-Script to evaluate and print accuracy metrics for different models on ImageNet data.
+"""Script to evaluate and print accuracy metrics for different models on ImageNet data.
 
-This script runs inference on all available models and reports:
-- Top-1 and Top-5 accuracy
-- Inference time
-- Model parameter count
-- Confusion patterns
-
-# Basic usage (all samples)
-python tests/test_models/compare_accuracy.py
-
-# Limit samples (faster for testing)
-python tests/test_models/compare_accuracy.py --max-samples 100
-
-# Save results to file
-python tests/test_models/compare_accuracy.py --output results.json --visualize
+USAGE::
+    >>> python tests/test_models/compare_accuracy.py
+    >>> python tests/test_models/compare_accuracy.py --max-samples 100
+    >>> python tests/test_models/compare_accuracy.py --output results.json --visualize
 """
 
 import os
 import sys
 import time
 import argparse
-from collections import defaultdict
 import json
-from tabulate import tabulate
-import torch
 import matplotlib.pyplot as plt
 import numpy as np
+
+from collections import defaultdict
+from tabulate import tabulate
+import torch
 
 # Add project root to path
 project_root = os.path.dirname(
@@ -46,8 +36,7 @@ def count_parameters(model):
 
 
 def evaluate_model(model, dataloader, class_names, device):
-    """
-    Evaluate a model on the given dataloader.
+    """Evaluate a model on the given dataloader.
 
     Our model wrappers now expect pre-normalized inputs, so we use them directly.
     """

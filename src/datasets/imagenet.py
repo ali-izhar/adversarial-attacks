@@ -1,5 +1,10 @@
-"""
-Dataset loading utilities for adversarial attack evaluation.
+#!/usr/bin/env python
+"""Dataset loading utilities for adversarial attack evaluation.
+
+USAGE::
+    >>> from src.datasets.imagenet import get_dataset
+    >>> dataset = get_dataset("imagenet")
+    >>> dataloader = get_dataloader(dataset)
 
 This module provides classes and functions for loading ImageNet-style data with proper normalization.
 
@@ -12,7 +17,7 @@ IMPORTANT: Images from this dataloader are ALREADY NORMALIZED for ImageNet model
 """
 
 import os
-from typing import Tuple, Optional, List, Callable, Dict
+from typing import Tuple, Optional, List, Callable
 
 import torch
 import torchvision.transforms as transforms
@@ -21,8 +26,7 @@ from PIL import Image, UnidentifiedImageError
 
 
 class ImageNetDataset(Dataset):
-    """
-    Dataset for loading ImageNet-style data.
+    """Dataset for loading ImageNet-style data.
 
     Expected directory structure:
     - data_dir/sample_images/: Contains image files named as "nXXXXXXXX_classname.JPEG"
@@ -40,8 +44,7 @@ class ImageNetDataset(Dataset):
         transform: Optional[Callable] = None,
         max_samples: Optional[int] = None,
     ):
-        """
-        Initialize the ImageNet dataset.
+        """Initialize the ImageNet dataset.
 
         Args:
             data_dir: Base directory for the dataset (e.g., 'data/imagenet/').
@@ -102,8 +105,7 @@ class ImageNetDataset(Dataset):
     def get_image_paths(
         self, max_samples: Optional[int] = None
     ) -> List[Tuple[str, int]]:
-        """
-        Get list of (image_path, label) tuples from the sample_images directory.
+        """Get list of (image_path, label) tuples from the sample_images directory.
 
         Args:
             max_samples: Optional limit on number of samples to return.
@@ -163,8 +165,7 @@ class ImageNetDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        """
-        Retrieve the image and its label at a given index.
+        """Retrieve the image and its label at a given index.
 
         Returns:
             Tuple of (image, label) where:
@@ -194,8 +195,7 @@ def get_dataset(
     transform: Optional[Callable] = None,
     max_samples: Optional[int] = None,
 ) -> Dataset:
-    """
-    Create and return an ImageNet dataset.
+    """Create and return an ImageNet dataset.
 
     Args:
         dataset_name: Name of the dataset (must be 'imagenet').
@@ -221,8 +221,7 @@ def get_dataset(
 def get_dataloader(
     dataset: Dataset, batch_size: int = 32, shuffle: bool = False, num_workers: int = 4
 ) -> DataLoader:
-    """
-    Create a DataLoader for the provided dataset.
+    """Create a DataLoader for the provided dataset.
 
     Args:
         dataset: The dataset from which to load data.

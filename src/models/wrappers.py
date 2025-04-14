@@ -1,12 +1,6 @@
+#!/usr/bin/env python
 """
 Model wrappers for adversarial attack evaluation.
-
-This module provides wrapper classes for various pretrained models to be used
-in adversarial attack experiments. It includes:
-
-- ImageNetModel: Base abstract class defining the common interface.
-- Implementation classes for various model architectures.
-- get_model: Factory function to create model instances by name.
 
 INPUT/OUTPUT SPECIFICATIONS:
 - Input: NORMALIZED tensors in range [-2.64, 2.64] (from ImageNet normalization)
@@ -19,21 +13,24 @@ COMPATIBILITY:
 - The dataset handles proper class index mapping from synset IDs to ImageNet indices.
 - For duplicate class names in ImageNet (like 'crane', 'maillot'), the dataset ensures
   correct index assignment based on synset IDs.
+
+USAGE::
+    >>> from src.models.wrappers import get_model
+    >>> model = get_model("resnet50")
+    >>> model.to("cuda")
+    >>> model.forward(torch.randn(1, 3, 224, 224).to("cuda"))
 """
+
+from typing import List, Tuple, Union
+from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from typing import List, Tuple, Union
-from abc import ABC, abstractmethod
 
 
 class ImageNetModel(nn.Module, ABC):
-    """
-    Base class for all ImageNet model wrappers.
-
-    This abstract class defines the common interface that all model implementations
-    must follow for consistency in the adversarial attack experiments.
+    """Base class for all ImageNet model wrappers.
 
     NORMALIZATION BEHAVIOR:
     These models expect ALREADY NORMALIZED inputs from our ImageNetDataset.
@@ -84,8 +81,7 @@ class ImageNetModel(nn.Module, ABC):
 
     @abstractmethod
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the model.
+        """Forward pass through the model.
 
         Args:
             x: Input tensor of shape (batch_size, 3, height, width).
@@ -98,8 +94,7 @@ class ImageNetModel(nn.Module, ABC):
         pass
 
     def predict(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Get class predictions and probabilities for input images.
+        """Get class predictions and probabilities for input images.
 
         Args:
             x: Input tensor of shape (batch_size, 3, height, width).
@@ -119,8 +114,7 @@ class ImageNetModel(nn.Module, ABC):
     def get_gradients(
         self, x: torch.Tensor, target_class: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute input gradients with respect to the target class.
+        """Compute input gradients with respect to the target class.
 
         This is useful for gradient-based adversarial attacks like FGSM.
 
@@ -152,8 +146,7 @@ class ResNetModel(ImageNetModel):
     """ResNet model wrapper for ImageNet classification."""
 
     def __init__(self, variant: str = "resnet50", pretrained: bool = True):
-        """
-        Initialize a ResNet model.
+        """Initialize a ResNet model.
 
         Args:
             variant: ResNet variant ('resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152').
@@ -343,8 +336,7 @@ class MobileNetModel(ImageNetModel):
 
 
 def get_model(model_name: str, **kwargs) -> ImageNetModel:
-    """
-    Factory function to create a model by name.
+    """Factory function to create a model by name.
 
     Args:
         model_name: Name of the model architecture and variant, e.g.,
