@@ -1,20 +1,26 @@
 #!/usr/bin/env python
-"""
-Generate grid visualization of adversarial examples from multiple attack methods.
-Shows original images in the first column and corresponding adversarial examples in subsequent columns.
-Includes both baseline and optimization-based attack methods.
+"""Generate grid visualization of adversarial examples from multiple attack methods.
+
+USAGE::
+    >>> python attack_grid.py
+    >>> python attack_grid.py --model <model_name>
+    >>> python attack_grid.py --output <output_path>
+
+model_name: name of the model to attack (default: resnet18)
+output_path: path to save the output image (default: images/attack_comparison.png)
 """
 
 import os
 import sys
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from skimage.metrics import structural_similarity as ssim
 import logging
 import traceback
 import argparse
+import numpy as np
+import matplotlib.pyplot as plt
 from tqdm import tqdm
+from skimage.metrics import structural_similarity as ssim
+
+import torch
 
 # Configure matplotlib to use LaTeX for text rendering
 plt.rcParams.update(
@@ -92,9 +98,9 @@ def generate_adversarial_grid(
     dataset,
     num_images=4,
     attack_methods=None,
-    save_path="paper/images/attack_comparison.png",
-    max_attempts_per_image=10,  # Maximum attempts per image to find successful attacks
-    max_total_candidates=50,  # Maximum number of total images to try
+    save_path="images/attack_comparison.png",
+    max_attempts_per_image=5,  # Maximum attempts per image to find successful attacks
+    max_total_candidates=10,  # Maximum number of total images to try
 ):
     """
     Generate a grid visualization with original images and their adversarial versions.
@@ -129,7 +135,22 @@ def generate_adversarial_grid(
                 rand_init=True,
                 early_stopping=True,
             ),
-            "CG": CG(model, eps=0.5),
+            "CG": CG(
+                model,
+                norm="Linf",
+                eps=0.0314,
+                n_iter=50,
+                beta_method="HS",
+                restart_interval=10,
+                tv_lambda=0.05,
+                color_lambda=0.05,
+                perceptual_lambda=0.05,
+                rand_init=True,
+                fgsm_init=True,
+                adaptive_restart=True,
+                early_stopping=True,
+                strict_epsilon_constraint=True,
+            ),
             "L-BFGS": LBFGS(
                 model,
                 norm="L2",
@@ -646,22 +667,6 @@ def generate_adversarial_grid(
     return fig, results_data
 
 
-def create_multi_model_grid(
-    dataset, models, num_images=5, save_path="paper/images/multi_model_grid.png"
-):
-    """
-    Create a grid comparing adversarial examples across different models
-
-    Args:
-        dataset: Dataset with images
-        models: Dictionary of models {name: model}
-        num_images: Number of images to include
-        save_path: Path to save the visualization
-    """
-    # This is a placeholder for potential future extension
-    pass
-
-
 def main():
     """Main function to generate adversarial attack grid visualizations"""
     parser = argparse.ArgumentParser(
@@ -677,7 +682,7 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="paper/images/attack_comparison.png",
+        default="images/attack_comparison.png",
         help="Output file path",
     )
     args = parser.parse_args()

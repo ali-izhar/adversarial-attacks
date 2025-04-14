@@ -179,9 +179,11 @@ def main():
         )
         attacks["CG"] = CG(
             model,
-            norm="L2",
-            eps=3.0 / 255.0,
+            norm="Linf",
+            eps=0.0314,
             n_iter=50,
+            beta_method="HS",
+            restart_interval=10,
             tv_lambda=0.05,
             color_lambda=0.05,
             perceptual_lambda=0.05,

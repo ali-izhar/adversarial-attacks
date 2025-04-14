@@ -1,25 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Projected Gradient Descent Visualization with Matplotlib
-========================================================
-A script for creating high-quality visualizations of projected gradient descent
-concepts for research papers using Matplotlib.
+"""Projected Gradient Descent (PGD) projection property demonstration
 
-Author: Izhar Ali
+USAGE::
+    >>> python pgd_demo.py
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
-import matplotlib as mpl
 
 # Set Matplotlib params for paper-quality figures
 plt.rcParams.update(
     {
         "font.family": "serif",
-        # Remove the specific font that's causing issues
-        # 'font.serif': ['Computer Modern Roman'],
         "font.size": 12,
         "axes.labelsize": 12,
         "axes.titlesize": 12,
@@ -33,7 +27,6 @@ plt.rcParams.update(
     }
 )
 
-# Set random seed for reproducibility
 np.random.seed(42)
 
 
@@ -148,9 +141,9 @@ def demonstrate_contraction_property():
     plt.subplots_adjust(hspace=0.4)
 
     # Save figure
-    plt.savefig("projection_property.png", dpi=300, bbox_inches="tight")
-    plt.savefig("projection_property.pdf", bbox_inches="tight")
-    print("Saved projection_property.png and projection_property.pdf")
+    plt.savefig("images/projection_property.png", dpi=300, bbox_inches="tight")
+    plt.savefig("images/projection_property.pdf", bbox_inches="tight")
+    print("Saved images/projection_property.png and images/projection_property.pdf")
 
     plt.close()
 
@@ -417,9 +410,9 @@ def visualize_projection_effect():
 
     # Save figure
     plt.tight_layout()
-    plt.savefig("pgd_demo.png", dpi=300, bbox_inches="tight")
-    plt.savefig("pgd_demo.pdf", bbox_inches="tight")
-    print("\nSaved pgd_demo.png and pgd_demo.pdf")
+    plt.savefig("images/pgd_demo.png", dpi=300, bbox_inches="tight")
+    plt.savefig("images/pgd_demo.pdf", bbox_inches="tight")
+    print("\nSaved images/pgd_demo.png and images/pgd_demo.pdf")
 
     print("Projection effect visualization complete.")
 
@@ -430,7 +423,3 @@ if __name__ == "__main__":
     # Generate high-quality figures for paper
     demonstrate_contraction_property()
     visualize_projection_effect()
-
-    print(
-        "All demonstrations complete. Check the generated PNG/PDF files for publication-ready visualizations."
-    )
