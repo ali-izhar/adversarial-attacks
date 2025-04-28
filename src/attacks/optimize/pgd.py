@@ -135,9 +135,15 @@ class PGDOptimizer:
             # This implements the paper's early stopping condition:
             # "If arg max_j f_j(x_{t+1}) ≠ y_{true} and ||δ_{t+1} - δ_t||_p < 0.01 ||δ_t||_p"
             if self.early_stopping and success_fn is not None and success.all():
-                if self.verbose:
-                    print(f"Early stopping at iteration {i}: all examples successful")
-                break
+                # For untargeted attacks (maximize=True), run at least 5 iterations for robustness
+                if self.maximize and i < 5:
+                    pass  # Don't stop yet, ensure we run enough iterations for untargeted attacks
+                else:
+                    if self.verbose:
+                        print(
+                            f"Early stopping at iteration {i}: all examples successful"
+                        )
+                    break
 
             # Track non-successful examples for selective updating
             if self.early_stopping and success_fn is not None:

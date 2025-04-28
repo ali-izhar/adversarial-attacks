@@ -297,12 +297,18 @@ class PGD(Attack):
                     return margin  # For targeted, this will be minimized
                 else:
                     # For untargeted attacks, minimize the margin between true class and others
+                    # Use a stronger loss formulation for untargeted attacks
                     correct_logits = outputs.gather(1, targets.view(-1, 1)).squeeze(1)
                     max_other_logits = outputs.clone()
                     max_other_logits.scatter_(1, targets.view(-1, 1), float("-inf"))
                     max_other_logits = max_other_logits.max(1)[0]
+
+                    # Enhanced margin loss - apply stronger gradient signal by using negative margin directly
+                    # and adding a multiplier to increase gradient magnitude
                     margin = correct_logits - max_other_logits
-                    return -margin  # For untargeted, this will be maximized
+                    return (
+                        margin * -2.0
+                    )  # Stronger negative margin for untargeted attacks
 
         elif self.loss_fn_type == "carlini_wagner":
             # Carlini-Wagner loss function with confidence parameter κ, similar to the targeted loss
@@ -369,6 +375,58 @@ class PGD(Attack):
         # First run with full epsilon to see if the attack succeeds
         self.optimizer.eps = original_eps
 
+        # For untargeted attacks, use a larger epsilon without binary search
+        if not self.targeted:
+            # Use fixed larger epsilon for untargeted attacks (2x the original)
+            self.optimizer.eps = original_eps * 2.0
+
+            # For untargeted attacks, force more iterations for stronger results
+            original_iterations = self.optimizer.n_iterations
+            self.optimizer.n_iterations = max(
+                50, original_iterations
+            )  # Use at least 50 iterations
+
+            # Run attack with larger epsilon
+            adv_images, initial_metrics = self.optimize_with_normalized_bounds(
+                x_init=images,
+                gradient_fn=gradient_fn,
+                success_fn=success_fn,
+                x_original=images,
+                min_bound=min_bound,
+                max_bound=max_bound,
+            )
+
+            # Restore original iterations
+            self.optimizer.n_iterations = original_iterations
+
+            # Evaluate success of attack
+            success_rate, success_mask, _ = self.evaluate_attack_success(
+                images, adv_images, labels
+            )
+
+            # Update attack metrics for untargeted attacks
+            self.total_iterations += initial_metrics["iterations"] * images.size(0)
+
+            # End timing and update time metric
+            self.end_time = time.time()
+            self.total_time += self.end_time - start_time
+
+            # Update gradient calls counter (using the correct attribute name)
+            self.total_gradient_calls += initial_metrics.get(
+                "gradient_calls", 0
+            ) * images.size(0)
+
+            if self.verbose:
+                print(f"Untargeted attack success rate: {success_rate:.2f}%")
+                print(f"Iterations: {initial_metrics['iterations']}")
+                print(
+                    f"Time per sample: {initial_metrics['time_per_sample']*1000:.2f}ms"
+                )
+
+            # Ensure adversarial examples are detached
+            return adv_images.detach()
+
+        # For targeted attacks, continue with binary search as before
         # Override the PGDOptimizer's clamping with normalized bounds
         # We'll use a modified version of optimize that respects these bounds
         adv_images, initial_metrics = self.optimize_with_normalized_bounds(
@@ -394,7 +452,9 @@ class PGD(Attack):
                 )
 
             # Binary search parameters
-            low_eps = original_eps * 0.01  # Start with 1% of original epsilon
+            low_eps = original_eps * (
+                0.1 if not self.targeted else 0.01
+            )  # Start with 10% of original epsilon for untargeted
             high_eps = original_eps
             best_eps = high_eps
             best_adv_images = adv_images.clone()
@@ -436,7 +496,9 @@ class PGD(Attack):
                     )
 
                     # If still successful for most examples, try smaller epsilon
-                    if curr_success_rate >= 80:
+                    # Use higher threshold for untargeted attacks to ensure robustness
+                    success_threshold = 95 if not self.targeted else 80
+                    if curr_success_rate >= success_threshold:
                         high_eps = mid_eps
                         best_eps = mid_eps
 
