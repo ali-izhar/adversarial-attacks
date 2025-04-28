@@ -196,6 +196,9 @@ def test_attack(attack, model, dataset, attack_name, args):
     # Run attack on all batches
     total_samples = 0
     total_batches = len(dataloader)
+    total_successful = (
+        0  # Counter for successful adversarial examples across all batches
+    )
 
     print(
         f"Processing {num_samples} samples in {total_batches} batches (batch size: {batch_size})"
@@ -258,6 +261,9 @@ def test_attack(attack, model, dataset, attack_name, args):
             attack.evaluate_attack_success(correct_inputs, adversarial, correct_labels)
         )
 
+        # Count successful attacks in this batch
+        total_successful += success_mask.sum().item()
+
         # Explicitly compute perturbation metrics - this updates the attack's internal metrics
         perturbation_metrics = attack.compute_perturbation_metrics(
             correct_inputs, adversarial
@@ -296,10 +302,15 @@ def test_attack(attack, model, dataset, attack_name, args):
     # Get metrics from the attack
     attack_metrics = attack.get_metrics()
 
-    # Combine metrics
-    metrics["attack_success_rate"] = attack_metrics["success_rate"]
+    # Combine metrics - use actual total_successful count for more accuracy
+    if total_samples > 0:
+        success_rate = 100 * total_successful / total_samples
+    else:
+        success_rate = 0.0
+
+    metrics["attack_success_rate"] = success_rate
     metrics["model_accuracy"] = (
-        100 - attack_metrics["success_rate"]
+        100 - success_rate
     )  # Since attack success = 100 - model accuracy
     metrics["l2_norm"] = attack_metrics["l2_norm"]
     metrics["linf_norm"] = attack_metrics["linf_norm"]

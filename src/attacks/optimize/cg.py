@@ -477,17 +477,25 @@ class ConjugateGradientOptimizer:
         Returns:
             Tuple of (adversarial examples, metrics)
         """
+        # Start timing
+        start_time = time.time()
+
+        # Set optimization direction based on attack type
+        # For untargeted attacks (maximize=True), we want to maximize the loss
+        # For targeted attacks (maximize=False), we want to minimize the loss
+        self.maximize = not targeted
+
+        # Get device and batch size
         device = x_init.device
         batch_size = x_init.shape[0]
 
-        # Use default bounds if not provided
+        # Set default projection bounds
         if min_bound is None:
             min_bound = 0.0
         if max_bound is None:
             max_bound = 1.0
 
         # Initialize timing and metrics
-        start_time = time.time()
         iterations_done = torch.zeros(batch_size, dtype=torch.long, device=device)
         gradient_calls = torch.zeros(batch_size, dtype=torch.long, device=device)
         successful = torch.zeros(batch_size, dtype=torch.bool, device=device)

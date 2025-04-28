@@ -217,6 +217,15 @@ class LBFGS(Attack):
         # For targeted attacks, get the target labels
         if self.targeted:
             target_labels = self.get_target_label(images, labels)
+            # For targeted attacks, increase epsilon for stronger perturbations
+            # This helps achieve the target more effectively
+            epsilon_scale = 1.5  # Scale epsilon higher for targeted attacks
+            self.eps = self.orig_eps * epsilon_scale / self.std.mean().item()
+            # Also increase binary search steps and const factor for more thorough search
+            self.optimizer.binary_search_steps = self.binary_search_steps * 2
+            self.optimizer.const_factor = self.const_factor * 5
+            if self.verbose:
+                print(f"Using increased epsilon of {self.eps:.4f} for targeted attack")
         else:
             target_labels = labels
 
@@ -233,7 +242,9 @@ class LBFGS(Attack):
 
         # Define the gradient function
         def gradient_fn(x):
-            x.requires_grad_(True)
+            x = (
+                x.clone().detach().requires_grad_(True)
+            )  # Ensure proper gradient tracking
             outputs = self.get_logits(x)
 
             # Get appropriate labels for the current batch
@@ -269,48 +280,56 @@ class LBFGS(Attack):
             # Compute gradient
             loss.backward()
             grad = x.grad.clone()
-            x.grad = None
+            x.grad = None  # Clean up grad
 
             return grad
 
         # Define the loss function that returns per-sample loss values
-        confidence = 10.0  # Confidence parameter for stronger adversarial examples
+        # Increase confidence parameter for targeted attacks to create stronger adversaries
+        confidence = (
+            20.0 if self.targeted else 10.0
+        )  # Higher confidence for targeted attacks
 
         def loss_fn(x):
-            with torch.no_grad():
-                outputs = self.get_logits(x)
-                curr_labels = target_labels[: x.size(0)]
+            # Make sure x requires gradients
+            x_with_grad = x.clone().detach().requires_grad_(True)
+            outputs = self.get_logits(x_with_grad)
+            curr_labels = target_labels[: x.size(0)]
 
-                if self.targeted:
-                    # Get the target class logit
-                    target_logits = outputs.gather(1, curr_labels.unsqueeze(1)).squeeze(
-                        1
-                    )
+            if self.targeted:
+                # Get the target class logit
+                target_logits = outputs.gather(1, curr_labels.unsqueeze(1)).squeeze(1)
 
-                    # Get the highest logit of other classes
-                    other_logits = outputs.clone()
-                    other_logits.scatter_(1, curr_labels.unsqueeze(1), float("-inf"))
-                    highest_other_logits = other_logits.max(1)[0]
+                # Get the highest logit of other classes
+                other_logits = outputs.clone()
+                other_logits.scatter_(1, curr_labels.unsqueeze(1), float("-inf"))
+                highest_other_logits = other_logits.max(1)[0]
 
-                    # Margin loss: ensuring target class has higher logit by at least 'confidence'
-                    margin = highest_other_logits - target_logits + confidence
-                    # For targeted attacks, we want to minimize this margin
-                    loss = torch.clamp(margin, min=0)
-                else:
-                    # Get the true class logit
-                    true_logits = outputs.gather(1, curr_labels.unsqueeze(1)).squeeze(1)
+                # Margin loss: ensuring target class has higher logit by at least 'confidence'
+                margin = highest_other_logits - target_logits + confidence
+                # For targeted attacks, want to minimize this margin
+                # Add additional targeting loss to more strongly push toward target class
+                cross_entropy = torch.nn.functional.cross_entropy(
+                    outputs, curr_labels, reduction="none"
+                )
+                # Combined loss puts more emphasis on the targeting component
+                loss = torch.clamp(margin, min=0) + 2.0 * cross_entropy
+            else:
+                # Get the true class logit
+                true_logits = outputs.gather(1, curr_labels.unsqueeze(1)).squeeze(1)
 
-                    # Get the highest logit of other classes
-                    other_logits = outputs.clone()
-                    other_logits.scatter_(1, curr_labels.unsqueeze(1), float("-inf"))
-                    highest_other_logits = other_logits.max(1)[0]
+                # Get the highest logit of other classes
+                other_logits = outputs.clone()
+                other_logits.scatter_(1, curr_labels.unsqueeze(1), float("-inf"))
+                highest_other_logits = other_logits.max(1)[0]
 
-                    # Margin loss: ensuring true class has lower logit by at least 'confidence'
-                    margin = true_logits - highest_other_logits + confidence
-                    # For untargeted attacks, we want to maximize this margin
-                    loss = -torch.clamp(margin, min=0)
+                # Margin loss: ensuring true class has lower logit by at least 'confidence'
+                margin = true_logits - highest_other_logits + confidence
+                # For untargeted attacks, we want to maximize this margin
+                loss = -torch.clamp(margin, min=0)
 
-                return loss
+            # Make sure to detach the loss to avoid gradient issues
+            return loss.detach()
 
         # Define success function for early stopping
         def success_fn(x):

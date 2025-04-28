@@ -399,7 +399,7 @@ class LBFGSOptimizer:
                             const[i] = (lower_bound[i] + upper_bound[i]) / 2
                         else:
                             # No solution found yet, increase more aggressively
-                            const[i] *= self.const_factor
+                            const[i] = const[i] * self.const_factor
 
                 # Track overall success
                 success = success | current_success
@@ -454,40 +454,56 @@ class LBFGSOptimizer:
                 temp_x = best_adv.clone().detach().requires_grad_(True)
 
                 # Get the model output
-                outputs = temp_x
-                for _ in range(3):  # Apply gradient multiple times for stronger effect
-                    if temp_x.grad is not None:
-                        temp_x.grad.zero_()
+                outputs = (
+                    self.get_logits(temp_x) if hasattr(self, "get_logits") else temp_x
+                )
 
-                    # Forward pass
-                    outputs = temp_x
-                    if hasattr(temp_x, "requires_grad"):
-                        outputs = loss_fn(temp_x)
+                # Compute loss directly rather than relying on loss_fn which might not require grad
+                if loss_fn is not None:
+                    # Use a custom approach to ensure gradients
+                    outputs = (
+                        self.model(temp_x)
+                        if hasattr(self, "model")
+                        else (
+                            self.get_logits(temp_x)
+                            if hasattr(self, "get_logits")
+                            else None
+                        )
+                    )
 
-                        # Backward pass to get gradient
-                        if isinstance(outputs, torch.Tensor) and outputs.numel() > 0:
-                            outputs.sum().backward()
+                    # If we have valid outputs, compute a loss
+                    if outputs is not None:
+                        # Simple cross-entropy or margin loss
+                        if hasattr(temp_x, "requires_grad") and temp_x.requires_grad:
+                            loss_value = loss_fn(temp_x)
+                            if (
+                                isinstance(loss_value, torch.Tensor)
+                                and loss_value.numel() > 0
+                            ):
+                                loss_sum = loss_value.sum()
+                                if loss_sum.requires_grad:
+                                    loss_sum.backward()
 
-                    # If we have a gradient, apply it
-                    if temp_x.grad is not None and temp_x.grad.abs().sum() > 0:
-                        # For untargeted attacks, follow the gradient to maximize loss
-                        # The step size is adaptive based on the gradient magnitude
-                        step_size = self.eps * 0.1 / (temp_x.grad.abs().mean() + 1e-12)
-                        update = step_size * temp_x.grad.sign()
+                # If we have a gradient, apply it
+                if temp_x.grad is not None and temp_x.grad.abs().sum() > 0:
+                    # For untargeted attacks, follow the gradient to maximize loss
+                    # The step size is adaptive based on the gradient magnitude
+                    step_size = self.eps * 0.1 / (temp_x.grad.abs().mean() + 1e-12)
+                    update = step_size * temp_x.grad.sign()
 
-                        # Apply the update
-                        temp_x = temp_x.detach() + update
-                        temp_x = torch.clamp(temp_x, min=min_bound, max=max_bound)
+                    # Apply the update
+                    temp_x = temp_x.detach() + update
+                    temp_x = torch.clamp(temp_x, min=min_bound, max=max_bound)
 
-                        # Project to stay within epsilon constraint
-                        if self.norm in ["l2", "linf"]:
-                            temp_x = self._project_perturbation(
-                                temp_x,
-                                x_original,
-                                min_bound=min_bound,
-                                max_bound=max_bound,
-                            )
-                        temp_x.requires_grad_(True)
+                    # Project to stay within epsilon constraint
+                    if self.norm in ["l2", "linf"]:
+                        temp_x = self._project_perturbation(
+                            temp_x,
+                            x_original,
+                            min_bound=min_bound,
+                            max_bound=max_bound,
+                        )
+                    temp_x.requires_grad_(True)
 
                 best_adv = temp_x.detach()
 
