@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 """Simplified Limited-memory BFGS (L-BFGS) optimization method.
 
 This file implements an efficient L-BFGS optimizer for generating adversarial examples

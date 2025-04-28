@@ -1,12 +1,8 @@
-"""
-Test optimization attacks.
+#!/usr/bin/env python
+"""Tests for all optimization attacks (PGD, CG, LBFGS) on a small sample of ImageNet data.
 
-This script tests all optimization attacks (PGD, CG, LBFGS)
-on a small sample of ImageNet data, using our model wrappers
-that handle normalized inputs correctly.
-
-Usage:
-    python -m tests.test_attacks.test_attacks
+USAGE::
+    >>> python -m tests.test_attacks.test_optimize_attacks
 """
 
 import os
@@ -243,7 +239,19 @@ def test_attack(attack, model, dataset, attack_name, args):
         with torch.no_grad():
             adv_outputs = model(adversarial)
             _, adv_preds = torch.max(adv_outputs, 1)
-            model_accuracy = (adv_preds == correct_labels).float().mean().item() * 100
+
+            # Calculate model accuracy based on attack type
+            if args.targeted:
+                # For targeted attacks, accuracy is low when predictions match target labels
+                target_labels = attack.get_target_label(correct_inputs, correct_labels)
+                model_accuracy = (
+                    100 - (adv_preds == target_labels).float().mean().item() * 100
+                )
+            else:
+                # For untargeted attacks, accuracy is how often predictions match true labels
+                model_accuracy = (
+                    adv_preds == correct_labels
+                ).float().mean().item() * 100
 
         # Explicitly evaluate attack success - this updates the attack's internal metrics
         batch_success_rate, success_mask, (orig_preds, adv_preds) = (

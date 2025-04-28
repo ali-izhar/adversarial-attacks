@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 """Projected Gradient Descent (PGD) optimization method."""
 
 import torch

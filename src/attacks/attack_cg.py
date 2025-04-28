@@ -1,12 +1,6 @@
-"""Conjugate Gradient (CG) adversarial attack implementation.
+#!/usr/bin/env python
 
-This attack implements the Conjugate Gradient method for generating adversarial examples.
-It uses the conjugate gradient optimizer to efficiently find perturbations that cause
-misclassification with minimal visual impact.
-
-The implementation follows the same interface as other baseline attacks and integrates
-with the Attack base class for consistent evaluation and reporting.
-"""
+"""Conjugate Gradient (CG) adversarial attack implementation."""
 
 import time
 import torch
@@ -15,7 +9,13 @@ import numpy as np
 
 from .baseline.attack import Attack
 from .optimize.cg import ConjugateGradientOptimizer
-from .optimize.projections import project_adversarial_example
+from .utils import (
+    project_adversarial_example,
+    total_variation_loss,
+    color_regularization,
+    perceptual_loss,
+    refine_perturbation,
+)
 
 
 class CG(Attack):
@@ -65,6 +65,7 @@ class CG(Attack):
         early_stopping: bool = True,
         verbose: bool = False,
         strict_epsilon_constraint: bool = True,
+        refine_perturbation: bool = False,
     ):
         # Initialize the Attack base class
         super().__init__("CG", model)
@@ -91,7 +92,7 @@ class CG(Attack):
         self.early_stopping = early_stopping
         self.verbose = verbose
         self.strict_epsilon_constraint = strict_epsilon_constraint
-
+        self.refine_perturbation = refine_perturbation
         # Set up supported modes
         self.supported_mode = ["default", "targeted"]
 
@@ -112,123 +113,6 @@ class CG(Attack):
             sufficient_decrease=1e-4,
         )
 
-    def total_variation_loss(self, delta):
-        """Calculate enhanced total variation loss for smoothness while preserving edges.
-
-        This version uses a weighted approach that penalizes changes more in smooth areas
-        and less along existing edges in the image.
-
-        Args:
-            delta: Perturbation tensor of shape (B, C, H, W)
-
-        Returns:
-            Total variation loss normalized by image size (per-sample)
-        """
-        batch_size = delta.size(0)
-        n_channels = delta.size(1)
-
-        # Compute differences in x and y directions
-        diff_h = delta[:, :, 1:, :] - delta[:, :, :-1, :]
-        diff_w = delta[:, :, :, 1:] - delta[:, :, :, :-1]
-
-        # Use L1 norm (absolute differences) which tends to preserve edges better than L2
-        tv_h = torch.abs(diff_h).sum(dim=(1, 2, 3))
-        tv_w = torch.abs(diff_w).sum(dim=(1, 2, 3))
-
-        # Normalize by image size
-        n_pixels = delta.size(2) * delta.size(3)
-
-        return (tv_h + tv_w) / (n_pixels * n_channels)
-
-    def color_regularization(self, delta):
-        """Calculate enhanced color regularization to penalize visible changes.
-
-        This uses a YUV-style weighting approach where luminance (Y) changes are
-        penalized more than chrominance (U,V) changes, as the human eye is more
-        sensitive to luminance differences.
-
-        Args:
-            delta: Perturbation tensor of shape (B, C, H, W)
-
-        Returns:
-            Color regularization loss (per-sample)
-        """
-        batch_size = delta.size(0)
-
-        # RGB to YUV-approximate weights
-        # Y = 0.299*R + 0.587*G + 0.114*B (luminance - most sensitive)
-        # U and V are chrominance components (less sensitive)
-        y_weights = torch.tensor([0.299, 0.587, 0.114], device=delta.device).view(
-            1, 3, 1, 1
-        )
-
-        # Calculate luminance component of perturbation
-        luma_delta = (delta * y_weights).sum(dim=1, keepdim=True)
-
-        # Penalize luminance changes more heavily (5x weight)
-        luma_penalty = 5.0 * (luma_delta**2).mean(dim=(1, 2, 3))
-
-        # Standard color penalty with channel-specific weights
-        # Red and Green changes are more noticeable than Blue
-        channel_weights = torch.tensor([1.2, 1.0, 0.8], device=delta.device).view(
-            1, 3, 1, 1
-        )
-        color_penalty = ((delta * channel_weights) ** 2).mean(dim=(1, 2, 3))
-
-        # Combined penalty
-        return luma_penalty + color_penalty
-
-    def perceptual_loss(self, delta, input_images):
-        """Calculate enhanced perceptual loss to preserve image structure.
-
-        This enhanced version focuses more heavily on the low and mid frequency
-        components that are most important for visual quality, with special emphasis
-        on preserving image structure.
-
-        Args:
-            delta: Perturbation tensor of shape (B, C, H, W)
-            input_images: Original images of shape (B, C, H, W)
-
-        Returns:
-            Perceptual loss value (per-sample)
-        """
-        # Compute frequency domain representation
-        fft_orig = torch.fft.fft2(input_images, dim=(2, 3))
-        fft_pert = torch.fft.fft2(input_images + delta, dim=(2, 3))
-
-        # Compute magnitude difference in frequency domain
-        mag_orig = torch.abs(fft_orig)
-        mag_pert = torch.abs(fft_pert)
-
-        # Create emphasis on lower frequencies (more critical for image quality)
-        batch_size, channels, height, width = input_images.shape
-
-        # Create a frequency weighting mask
-        y_coords = torch.arange(height, device=input_images.device).view(1, 1, -1, 1)
-        x_coords = torch.arange(width, device=input_images.device).view(1, 1, 1, -1)
-
-        # Compute distance from center (DC component)
-        center_y, center_x = height // 2, width // 2
-        dist = torch.sqrt((y_coords - center_y) ** 2 + (x_coords - center_x) ** 2)
-        max_dist = torch.sqrt(
-            torch.tensor(center_y**2 + center_x**2, device=dist.device)
-        )
-
-        # Create a stronger weighting for low and mid frequencies
-        # Low frequencies (DC) - highest weight
-        low_freq_mask = torch.exp(-dist / (max_dist * 0.1))
-        # Mid frequencies - medium weight
-        mid_freq_mask = torch.exp(-(((dist - max_dist * 0.2) / (max_dist * 0.2)) ** 2))
-        # Combined mask - emphasize both low and mid frequencies
-        weight_mask = low_freq_mask + 0.5 * mid_freq_mask
-        weight_mask = weight_mask.expand(batch_size, channels, -1, -1)
-
-        # Apply weighting and compute difference
-        weighted_diff = ((mag_orig - mag_pert).abs() * weight_mask).sum(dim=(1, 2, 3))
-
-        # Normalize by image size
-        return weighted_diff / (channels * height * width)
-
     def forward(self, images, labels):
         r"""
         Overridden method for generating adversarial examples.
@@ -245,12 +129,15 @@ class CG(Attack):
         Returns:
             adversarial_images (torch.Tensor): Adversarial examples.
         """
+        # Track time for performance metrics
+        start_time = time.time()
+
+        # Reset per-batch success tracking
+        batch_attack_success_count = 0
+
         # Clone and detach input images to avoid modifying the original data
         images = images.clone().detach().to(self.device)
         labels = labels.clone().detach().to(self.device)
-
-        # Note start time for performance tracking
-        self.start_time = time.time()
 
         # For targeted attacks, get the target labels
         if self.targeted:
@@ -299,9 +186,9 @@ class CG(Attack):
 
             # Add regularization losses - all should return per-sample values
             # Note: These regularization terms are enhancements beyond the paper
-            tv_loss = self.total_variation_loss(delta)
-            color_loss = self.color_regularization(delta)
-            percept_loss = self.perceptual_loss(delta, images[: x.size(0)])
+            tv_loss = total_variation_loss(delta)
+            color_loss = color_regularization(delta)
+            percept_loss = perceptual_loss(delta, images[: x.size(0)])
 
             # Combine losses with weights - keeping per-sample values
             total_loss = (
@@ -346,9 +233,9 @@ class CG(Attack):
                 delta = x - images[: x.size(0)]
 
                 # Add regularization losses
-                tv_loss = self.total_variation_loss(delta)
-                color_loss = self.color_regularization(delta)
-                percept_loss = self.perceptual_loss(delta, images[: x.size(0)])
+                tv_loss = total_variation_loss(delta)
+                color_loss = color_regularization(delta)
+                percept_loss = perceptual_loss(delta, images[: x.size(0)])
 
                 # Combine losses with weights
                 total_loss = (
@@ -397,9 +284,13 @@ class CG(Attack):
         self.total_iterations += int(metrics["iterations"] * images.size(0))
         self.total_gradient_calls += int(metrics["gradient_calls"] * images.size(0))
 
-        # End timing
-        self.end_time = time.time()
-        self.total_time += self.end_time - self.start_time
+        # Update success count from optimizer metrics - this is critical for targeted attacks
+        if "success_rate" in metrics and metrics["success_rate"] > 0:
+            # Calculate how many samples were successful based on optimizer's success rate
+            batch_size = images.size(0)
+            success_count = int((metrics["success_rate"] / 100) * batch_size)
+            self.attack_success_count += success_count
+            self.total_samples += batch_size
 
         # Strictly enforce epsilon constraint if enabled, but ensure minimal perturbation size
         if self.strict_epsilon_constraint:
@@ -427,14 +318,20 @@ class CG(Attack):
         adv_images = torch.clamp(adv_images, min=min_bound, max=max_bound).detach()
 
         # Apply post-processing refinement to improve SSIM and reduce perturbation
-        if metrics["success_rate"] > 0:  # Only refine if we have successful examples
-            adv_images = self.refine_perturbation(
-                images,
-                adv_images,
-                labels,
-                refinement_steps=10,  # Reduced from 15 to 10 for less aggressive refinement
+        # Only refine if we have successful examples
+        if metrics["success_rate"] > 0 and self.refine_perturbation:
+            adv_images = refine_perturbation(
+                model=self.model,
+                original_images=images,
+                adv_images=adv_images,
+                labels=labels,
+                targeted=self.targeted,
+                get_target_label_fn=self.get_target_label if self.targeted else None,
+                refinement_steps=10,
                 min_bound=min_bound,
                 max_bound=max_bound,
+                device=self.device,
+                verbose=self.verbose,
             )
 
         # Evaluate success and compute perturbation metrics
@@ -442,18 +339,21 @@ class CG(Attack):
             images, adv_images, labels
         )
 
+        # Manually update attack success statistics for accurate metrics
+        self.attack_success_count += success_mask.sum().item()
+        self.total_samples += images.size(0)
+
         # Compute perturbation metrics on all samples, not just successful ones
         perturbation_metrics = self.compute_perturbation_metrics(
-            images, adv_images, None  # Pass None instead of success_mask
+            images, adv_images, None  # Pass None to compute metrics on all samples
         )
 
-        # Update attack_success_count for metrics
-        self.attack_success_count += success_mask.sum().item()
+        # Update final metrics counters
+        self.attack_success_count += batch_attack_success_count
         self.total_samples += images.size(0)
 
         # Log metrics if verbose
         if self.verbose:
-            orig_preds, adv_preds = pred_info
             print(f"Attack complete: {success_rate:.2f}% success rate")
             print(
                 f"Metrics: L2={perturbation_metrics['l2_norm']:.6f}, "
@@ -465,229 +365,8 @@ class CG(Attack):
             )
             print(f"Time per sample: {metrics['time_per_sample']*1000:.2f}ms")
 
+        # End timing
+        end_time = time.time()
+        self.total_time += end_time - start_time
+
         return adv_images
-
-    def compute_skimage_ssim(self, img1, img2):
-        """
-        Compute SSIM using scikit-image implementation.
-
-        Args:
-            img1: First tensor of images [N,C,H,W]
-            img2: Second tensor of images [N,C,H,W]
-
-        Returns:
-            Average SSIM value across the batch
-        """
-        from skimage.metrics import structural_similarity as ssim
-        import numpy as np
-
-        # Move tensors to CPU and convert to numpy
-        img1_np = img1.detach().cpu().permute(0, 2, 3, 1).numpy()
-        img2_np = img2.detach().cpu().permute(0, 2, 3, 1).numpy()
-
-        # Calculate SSIM for each image in batch
-        ssim_values = []
-        for i in range(img1_np.shape[0]):
-            # Convert to [0,1] range - using shared scaling to preserve differences
-            # First find global min/max across both images
-            min_val = min(img1_np[i].min(), img2_np[i].min())
-            max_val = max(img1_np[i].max(), img2_np[i].max())
-
-            # Apply same normalization to both images to maintain relative differences
-            scale = max_val - min_val
-            if scale < 1e-7:  # Avoid division by zero
-                scale = 1.0
-
-            img1_norm = (img1_np[i] - min_val) / scale
-            img2_norm = (img2_np[i] - min_val) / scale
-
-            # Multi-channel SSIM - compute for each channel separately to be more sensitive
-            ssim_val = 0
-            for c in range(img1_norm.shape[2]):
-                ssim_val += ssim(
-                    img1_norm[:, :, c],
-                    img2_norm[:, :, c],
-                    data_range=1.0,
-                    gaussian_weights=True,
-                    sigma=1.5,
-                    use_sample_covariance=False,
-                )
-
-            # Average across channels
-            ssim_val /= img1_norm.shape[2]
-            ssim_values.append(ssim_val)
-
-        return np.mean(ssim_values)
-
-    def compute_perturbation_metrics(self, original, perturbed, success_mask=None):
-        """
-        Compute metrics to evaluate the perturbation quality.
-
-        This overrides the base class method to use scikit-image SSIM.
-
-        Args:
-            original: Original clean images
-            perturbed: Perturbed adversarial images
-            success_mask: Optional mask indicating successful perturbations
-
-        Returns:
-            Dictionary with perturbation metrics
-        """
-        # Get base metrics from parent class
-        metrics = super().compute_perturbation_metrics(
-            original, perturbed, success_mask
-        )
-
-        # Override SSIM calculation with scikit-image implementation
-        metrics["ssim"] = self.compute_skimage_ssim(original, perturbed)
-
-        return metrics
-
-    def get_metrics(self):
-        """
-        Override base class method to ensure metrics are reported correctly
-        even when success rate is 0%.
-
-        Returns:
-            Dictionary of attack metrics
-        """
-        # Get base metrics from parent class
-        metrics = super().get_metrics()
-
-        # If success rate is 0%, metrics might be zeroed out
-        # Instead, report non-zero metrics if we have them
-        if (
-            metrics["success_rate"] == 0
-            and self.l2_norms
-            and self.linf_norms
-            and self.ssim_values
-        ):
-            # Use the actual calculated values instead of zeros
-            metrics["l2_norm"] = np.mean(self.l2_norms)
-            metrics["linf_norm"] = np.mean(self.linf_norms)
-            metrics["ssim"] = np.mean(self.ssim_values)
-
-        return metrics
-
-    def refine_perturbation(
-        self,
-        original_images,
-        adv_images,
-        labels,
-        refinement_steps=10,
-        min_bound=None,
-        max_bound=None,
-    ):
-        """
-        Refine adversarial examples to minimize perturbation while maintaining misclassification.
-
-        Args:
-            original_images: Original clean images
-            adv_images: Adversarial examples to refine
-            labels: True labels for untargeted attacks, target labels for targeted
-            refinement_steps: Number of binary search steps for refinement
-            min_bound: Minimum bound for valid pixel ranges after denormalization
-            max_bound: Maximum bound for valid pixel ranges after denormalization
-
-        Returns:
-            Refined adversarial examples with smaller perturbation
-        """
-        # Use default bounds if not provided
-        if min_bound is None:
-            min_bound = 0.0
-        if max_bound is None:
-            max_bound = 1.0
-
-        batch_size = original_images.size(0)
-        refined_images = adv_images.clone()
-
-        # For targeted attacks, get target labels
-        if self.targeted:
-            target_labels = self.get_target_label(original_images, labels)
-        else:
-            target_labels = labels
-
-        # Initialize alpha for each image (controls interpolation between original and adversarial)
-        # alpha=0 means pure adversarial, alpha=1 means pure original
-        alphas = torch.zeros(batch_size, device=self.device)
-
-        # Identify initially successful adversarial examples
-        with torch.no_grad():
-            outputs = self.get_logits(adv_images)
-            if self.targeted:
-                # For targeted attacks, success means predicting the target class
-                initial_success = outputs.argmax(dim=1) == target_labels
-            else:
-                # For untargeted attacks, success means not predicting the true class
-                initial_success = outputs.argmax(dim=1) != labels
-
-        # Only refine successful examples
-        successful_indices = torch.where(initial_success)[0]
-
-        if len(successful_indices) == 0:
-            if self.verbose:
-                print("No successful adversarial examples to refine")
-            return refined_images
-
-        if self.verbose:
-            print(
-                f"Refining {len(successful_indices)} successful adversarial examples..."
-            )
-
-        # Binary search to find the minimal perturbation for each example
-        for step in range(refinement_steps):
-            # Create interpolated images
-            current_alphas = alphas.view(-1, 1, 1, 1)
-            interpolated = (
-                current_alphas * original_images + (1 - current_alphas) * refined_images
-            )
-
-            # Ensure interpolated images are within valid bounds
-            interpolated = torch.clamp(interpolated, min=min_bound, max=max_bound)
-
-            # Check if still adversarial
-            with torch.no_grad():
-                outputs = self.get_logits(interpolated)
-                if self.targeted:
-                    # For targeted attacks, success means predicting the target class
-                    still_successful = outputs.argmax(dim=1) == target_labels
-                else:
-                    # For untargeted attacks, success means not predicting the true class
-                    still_successful = outputs.argmax(dim=1) != labels
-
-            # Update alphas with binary search
-            for i in successful_indices:
-                if still_successful[i]:
-                    # If still successful, try moving closer to original
-                    alphas[i] = alphas[i] + (1 - alphas[i]) / 2
-                    # Update the refined image with this better version
-                    refined_images[i] = interpolated[i]
-                else:
-                    # If not successful, move back toward adversarial
-                    alphas[i] = alphas[i] / 2
-
-        # Calculate improvement in perturbation metrics
-        orig_l2 = (
-            torch.norm((adv_images - original_images).view(batch_size, -1), dim=1)
-            .mean()
-            .item()
-        )
-        refined_l2 = (
-            torch.norm((refined_images - original_images).view(batch_size, -1), dim=1)
-            .mean()
-            .item()
-        )
-
-        # Calculate SSIM improvement
-        orig_ssim = self.compute_skimage_ssim(original_images, adv_images)
-        refined_ssim = self.compute_skimage_ssim(original_images, refined_images)
-
-        if self.verbose:
-            l2_reduction = (orig_l2 - refined_l2) / orig_l2 * 100
-            ssim_improvement = (refined_ssim - orig_ssim) / (1 - orig_ssim) * 100
-            print(f"Refinement reduced L2 perturbation by {l2_reduction:.2f}%")
-            print(
-                f"Refinement improved SSIM from {orig_ssim:.4f} to {refined_ssim:.4f} ({ssim_improvement:.2f}% improvement)"
-            )
-
-        return refined_images

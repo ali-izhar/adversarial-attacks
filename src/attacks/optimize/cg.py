@@ -1,10 +1,13 @@
-"""Conjugate Gradient optimization method."""
+#!/usr/bin/env python
 
-import torch
-import time
+"""Conjugate Gradient Optimizer."""
+
 from typing import Tuple, Dict, Any, Optional, Callable
 
-from .projections import project_adversarial_example
+import time
+import torch
+
+from ..utils.projections import project_adversarial_example
 
 
 class ConjugateGradientOptimizer:
@@ -74,13 +77,11 @@ class ConjugateGradientOptimizer:
         d_old: torch.Tensor,
         y: torch.Tensor = None,
     ) -> torch.Tensor:
-        """
-        Compute conjugate gradient beta parameter using various formulas.
+        """Compute conjugate gradient beta parameter using various formulas.
 
-        # Paper directly implements these three β formulas:
-        # β_t^FR = ||g_{t+1}||²/||g_t||² (Fletcher-Reeves)
-        # β_t^PR = g_{t+1}ᵀ(g_{t+1} - g_t)/(g_tᵀg_t) (Polak-Ribière)
-        # β_t^HS = g_{t+1}ᵀ(g_{t+1} - g_t)/(d_tᵀ(g_{t+1} - g_t)) (Hestenes-Stiefel)
+        β_t^FR = ||g_{t+1}||²/||g_t||² (Fletcher-Reeves)
+        β_t^PR = g_{t+1}ᵀ(g_{t+1} - g_t)/(g_tᵀg_t) (Polak-Ribière)
+        β_t^HS = g_{t+1}ᵀ(g_{t+1} - g_t)/(d_tᵀ(g_{t+1} - g_t)) (Hestenes-Stiefel)
 
         Args:
             grad_new: New gradient at current point
@@ -149,11 +150,7 @@ class ConjugateGradientOptimizer:
     def _check_conjugacy_loss(
         self, grad_new: torch.Tensor, d_old: torch.Tensor, y: torch.Tensor = None
     ) -> torch.BoolTensor:
-        """
-        Check if conjugacy is lost and restart is needed.
-
-        # Paper mentions: "periodic restart every restart_interval iterations"
-        # This is an enhancement of the paper's approach with more sophisticated restart criteria
+        """Check if conjugacy is lost and restart is needed.
 
         Conditions for restart (any of):
         1. Direction and gradient nearly parallel (> 0.2 cosine similarity)
@@ -216,12 +213,7 @@ class ConjugateGradientOptimizer:
         min_bound: Optional[torch.Tensor] = None,
         max_bound: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Improved backtracking line search satisfying Armijo condition.
-
-        # Paper uses a simple optimal step size: α_k = r_k^T r_k / (p_k^T A p_k)
-        # This is an enhancement that uses a more robust line search approach
-        # for the nonlinear case where the simple formula may not be optimal
+        """Backtracking line search satisfying Armijo condition.
 
         Args:
             x: Current point
@@ -394,11 +386,7 @@ class ConjugateGradientOptimizer:
         min_bound: Optional[torch.Tensor] = None,
         max_bound: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Initialize adversarial examples using Fast Gradient Sign Method.
-
-        # This is an enhancement beyond the paper's random initialization
-        # to provide a better starting point closer to the decision boundary
+        """Initialize adversarial examples using Fast Gradient Sign Method.
 
         Args:
             x_original: Original clean images
@@ -474,11 +462,7 @@ class ConjugateGradientOptimizer:
         min_bound: Optional[torch.Tensor] = None,
         max_bound: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """
-        Run conjugate gradient optimization to generate adversarial examples.
-
-        # This is the main function that implements Algorithm 1 from the paper:
-        # "Efficient Conjugate Gradient Attack"
+        """Run conjugate gradient optimization to generate adversarial examples.
 
         Args:
             x_init: Initial images
@@ -810,9 +794,6 @@ class ConjugateGradientOptimizer:
                     print(
                         f"Iteration {i+1}/{self.n_iterations}, Success rate: {success_rate:.2f}%"
                     )
-
-        # If we still don't have enough successful examples after all iterations,
-        # we accept the results as they are (identical to original working code)
 
         # Final projection to ensure constraints
         if x_original is not None:

@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 """Projection utilities for constraint handling in adversarial attacks."""
 
 import torch
@@ -6,8 +8,7 @@ import torch
 def project_box(
     x: torch.Tensor, min_val: torch.Tensor = 0.0, max_val: torch.Tensor = 1.0
 ) -> torch.Tensor:
-    """
-    Project tensor values to the specified range [min_val, max_val].
+    """Project tensor values to the specified range [min_val, max_val].
 
     Args:
         x: Input tensor
@@ -26,8 +27,7 @@ def project_box(
 
 
 def project_l2_ball(delta: torch.Tensor, epsilon: float) -> torch.Tensor:
-    """
-    Project perturbation tensor onto the L2 ball of radius epsilon.
+    """Project perturbation tensor onto the L2 ball of radius epsilon.
 
     Instead of only projecting when over the limit, this implementation
     forces all perturbations to have exactly epsilon magnitude when
@@ -64,8 +64,7 @@ def project_l2_ball(delta: torch.Tensor, epsilon: float) -> torch.Tensor:
 
 
 def project_linf_ball(delta: torch.Tensor, epsilon: float) -> torch.Tensor:
-    """
-    Project perturbation tensor onto the L∞ ball of radius epsilon.
+    """Project perturbation tensor onto the L∞ ball of radius epsilon.
 
     Args:
         delta: Perturbation tensor
@@ -90,8 +89,7 @@ def project_linf_ball(delta: torch.Tensor, epsilon: float) -> torch.Tensor:
 def project_perturbation(
     delta: torch.Tensor, epsilon: float, norm: str
 ) -> torch.Tensor:
-    """
-    Project perturbation according to specified norm constraints.
+    """Project perturbation according to specified norm constraints.
 
     Args:
         delta: Perturbation tensor
@@ -117,8 +115,7 @@ def project_adversarial_example(
     min_bound: torch.Tensor = None,
     max_bound: torch.Tensor = None,
 ) -> torch.Tensor:
-    """
-    Project adversarial examples onto the epsilon ball around original images
+    """Project adversarial examples onto the epsilon ball around original images
     and ensure they are valid images.
 
     Args:
