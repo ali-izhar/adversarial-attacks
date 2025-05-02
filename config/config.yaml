@@ -8,7 +8,7 @@
 # Dataset configuration
 dataset:
   name: "imagenet"
-  num_images: 1000    # Number of images to evaluate per model
+  num_images: 64    # Number of images to evaluate per model
   image_dir: "data"
 
 # Model configuration
@@ -46,7 +46,7 @@ attack:
         loss_fn: "cross_entropy"
         eps_values:
           Linf: [16/255, 32/255]  # Larger values needed for targeted attacks
-          L2: [2.0, 3.0]         # Larger perturbations for targeted attacks
+          L2: [2.0, 3.0]          # Larger perturbations for targeted attacks
 
     FFGSM:
       untargeted:
@@ -77,13 +77,13 @@ attack:
       untargeted:
         confidence_values: [0.0]   # Correct
         c_init: 1.0                # Initial c value
-        steps: 1000               # Practical compromise (more is better)
+        steps: 1000                # Practical compromise (more is better)
         learning_rate: 0.01        # Standard learning rate from original paper
         abort_early: true          # Enable early stopping for efficiency
       targeted:
         confidence_values: [5.0, 20.0]  # Multiple options to try
         c_init: 10.0               # Higher c value for targeted attacks
-        steps: 2000                     # More steps for targeted
+        steps: 1000                # More steps for targeted
         learning_rate: 0.01        # Same learning rate
         abort_early: true          # Enable early stopping for efficiency
     

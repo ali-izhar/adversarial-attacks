@@ -216,26 +216,16 @@ class CW(Attack):
         end_time = time.time()
         self.total_time += end_time - start_time
 
-        # Calculate final success metrics
-        with torch.no_grad():
-            outputs = self.get_output_with_eval_nograd(best_adv_images)
-            pre = torch.argmax(outputs, 1)
+        # --- Use Base Class for Final Evaluation & Metric Calculation ---
+        # Evaluate success of the attack using the base class method on the BEST images found
+        # This updates counts and returns the definitive success mask
+        _success_rate, success_mask, _predictions = self.evaluate_attack_success(
+            images, best_adv_images, labels  # Pass best_adv_images here
+        )
 
-            # Determine which attacks were successful
-            if self.targeted:
-                # For targeted attacks, we want predictions to match target labels
-                success_mask = pre == target_labels
-            else:
-                # For untargeted attacks, we want predictions to differ from true labels
-                success_mask = pre != labels
-
-            # Update success metrics in parent class
-            success_count = success_mask.sum().item()
-            self.attack_success_count += success_count
-            self.total_samples += batch_size
-
-            # Calculate perturbation metrics for successful attacks
-            self.compute_perturbation_metrics(images, best_adv_images, success_mask)
+        # Calculate perturbation metrics using the base class method on the BEST images found
+        # This now stores metrics for all samples AND successful samples correctly
+        self.compute_perturbation_metrics(images, best_adv_images, success_mask)
 
         # Return the best adversarial examples found
         return best_adv_images

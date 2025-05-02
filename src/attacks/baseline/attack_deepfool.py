@@ -117,38 +117,32 @@ class DeepFool(Attack):
         # Concatenate results
         adv_batch = torch.cat(adv_images, dim=0)
 
-        # Calculate number of fooled samples
-        with torch.no_grad():
-            # Use model directly instead of get_logits to avoid incrementing gradient counter during evaluation
-            preds = self.model(adv_batch).argmax(dim=1)
-            fooled_mask = preds != labels
-            fooled_count = fooled_mask.sum().item()
-
-            # Update success metrics in parent class
-            self.attack_success_count += fooled_count
-            self.total_samples += batch_size
-
-        # Calculate perturbation metrics only for successful attacks
-        perturbation_metrics = self.compute_perturbation_metrics(
-            images, adv_batch, fooled_mask
-        )
-
-        # Record metrics
-        avg_iters = sample_iterations.float().mean().item()
-        grad_calls = self.total_gradient_calls - prev_grad_calls
-        avg_grad_calls = grad_calls / batch_size
-
-        # Print stats
-        print(
-            f"DeepFool stats: avg iterations={avg_iters:.2f}, fooled {fooled_count}/{batch_size} samples, avg gradient calls={avg_grad_calls:.2f}"
-        )
-        print(
-            f"DeepFool metrics - L2: {perturbation_metrics['l2_norm']:.4f}, L∞: {perturbation_metrics['linf_norm']:.4f}, SSIM: {perturbation_metrics['ssim']:.4f}"
-        )
-
-        # Measure and record time taken
+        # Measure and record time taken (before final metric calculation)
         end_time = time.time()
         self.total_time += end_time - start_time
+
+        # --- Use Base Class for Final Evaluation & Metric Calculation ---
+        # Evaluate success of the attack using the base class method
+        # This updates counts and returns the definitive success mask
+        _success_rate, success_mask, _predictions = self.evaluate_attack_success(
+            images, adv_batch, labels
+        )
+
+        # Calculate perturbation metrics using the base class method
+        # This now stores metrics for all samples AND successful samples correctly
+        perturbation_metrics = self.compute_perturbation_metrics(
+            images, adv_batch, success_mask
+        )
+
+        # --- REMOVED Manual Evaluation Block ---
+        # with torch.no_grad():
+        #     # Use model directly instead of get_logits to avoid incrementing gradient counter during evaluation
+        #     preds = self.model(adv_batch).argmax(dim=1)
+        #     fooled_mask = preds != labels
+        #     fooled_count = fooled_mask.sum().item()
+        #     # Update success metrics in parent class
+        #     self.attack_success_count += fooled_count
+        #     self.total_samples += batch_size
 
         return adv_batch, target_preds
 
