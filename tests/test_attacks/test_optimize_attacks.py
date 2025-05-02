@@ -285,7 +285,11 @@ def parse_fraction(value):
 
 
 def create_attack(
-    model, attack_type, config, targeted=False, pgd_variant=None, norm_override=None
+    model,
+    attack_type,
+    config,
+    targeted=False,
+    norm_override=None,
 ):
     """
     Create an attack instance based on the attack type and configuration.
@@ -295,7 +299,6 @@ def create_attack(
         attack_type: Type of attack (e.g., "CG", "LBFGS", "PGD")
         config: Configuration dictionary
         targeted: Whether the attack is targeted
-        pgd_variant: Specific PGD variant to use (basic, margin, l2)
         norm_override: Override the default norm with this value if provided
 
     Returns:
@@ -305,30 +308,32 @@ def create_attack(
     attack_params = config["attack"]["params"]
     attack_mode = "targeted" if targeted else "untargeted"
 
-    # Note: Specific attacks might override this (e.g., CG uses L2)
-    default_norm_type = norm_override or config["attack"]["norm_types"][0]
+    # Determine norm type
+    norm_type = norm_override or config["attack"]["norm_types"][0]
+
+    # Define common parameters
+    eps_value = None
+    attack = None
+    attack_name = "Unknown"
 
     if attack_type == "CG":
-        # CG can use either L2 or Linf norm
-        # Use the specified norm type or the first from config by default
-        norm_type = default_norm_type
-        # Get CG parameters from config
         params = attack_params["CG"][attack_mode]
-
-        # Check if the specified norm has eps values defined, fallback to L2 if not
         if norm_type not in params["eps_values"]:
-            print(f"Warning: {norm_type} not found in CG config, falling back to L2")
+            print(
+                f"Warning: {norm_type} not found in CG config for {attack_mode}, falling back to L2"
+            )
             norm_type = "L2"
-
-        eps_value = params["eps_values"][norm_type][0]  # Default to first epsilon value
+        eps_value = params["eps_values"][norm_type][0]
         eps = parse_fraction(eps_value)
-
-        # Get parameters directly from config based on our implementation
         steps = params.get("steps", 10)
         alpha = params.get("alpha", 0.1)
         beta_method = params.get("beta_method", "PR")
+        alpha_multiplier = params.get("alpha_multiplier", 1.0)  # Get multiplier
 
-        # Create CG with parameters from config
+        # Adjust alpha for Linf
+        if norm_type == "Linf":
+            alpha *= alpha_multiplier
+
         attack = CG(
             model,
             norm=norm_type,
@@ -336,22 +341,25 @@ def create_attack(
             steps=steps,
             alpha=alpha,
             beta_method=beta_method,
+            rand_init=params.get("rand_init", False),  # Get rand_init
         )
-        attack_name = f"CG ({norm_type} ε={eps:.4f})"
+        attack_name = f"CG ({norm_type}, ε={eps:.4f})"
 
     elif attack_type == "LBFGS":
-        # LBFGS often defaults to Linf, use default_norm_type
-        norm_type = default_norm_type
-        # Get LBFGS parameters from config
         params = attack_params["LBFGS"][attack_mode]
-        eps_value = params["eps_values"][norm_type][0]  # Use appropriate norm
+        if norm_type not in params["eps_values"]:
+            print(
+                f"Warning: {norm_type} not found in LBFGS config for {attack_mode}, falling back to Linf"
+            )
+            norm_type = "Linf"
+        eps_value = params["eps_values"][norm_type][0]
         eps = parse_fraction(eps_value)
-
-        # Get enhanced LBFGS parameters with defaults if not present
         n_iterations = params.get("n_iterations", 50)
         history_size = params.get("history_size", 10)
         rand_init = params.get("rand_init", True)
         init_std = params.get("init_std", 0.01)
+        line_search_fn = params.get("line_search_fn", "strong_wolfe")
+        max_line_search = params.get("max_line_search", 10)
 
         attack = LBFGS(
             model,
@@ -361,88 +369,54 @@ def create_attack(
             history_size=history_size,
             rand_init=rand_init,
             init_std=init_std,
+            line_search_fn=line_search_fn,
+            max_line_search=max_line_search,
         )
-
-        attack_name = f"LBFGS ({norm_type} ε={eps:.4f})"
+        attack_name = f"LBFGS ({norm_type}, ε={eps:.4f})"
 
     elif attack_type == "PGD":
-        # PGD can use different norms, use default_norm_type
-        norm_type = default_norm_type
-        # Get the base PGD parameters from config
         params = attack_params["PGD"][attack_mode]
-        norm = norm_type  # Use the determined norm type
-        eps_value = params["eps_values"][norm][0]  # Default to first epsilon value
+        if norm_type not in params["eps_values"]:
+            print(
+                f"Warning: {norm_type} not found in PGD config for {attack_mode}, falling back to Linf"
+            )
+            norm_type = "Linf"
+        eps_value = params["eps_values"][norm_type][0]
         eps = parse_fraction(eps_value)
 
-        # If a specific PGD variant is specified, use that configuration
-        if pgd_variant:
-            # Get variant configuration from config file
-            if pgd_variant in config["attack"]["params"]["PGD"]["variants"]:
-                variant_config = config["attack"]["params"]["PGD"]["variants"][
-                    pgd_variant
-                ]
-                variant_params = variant_config["params"].copy()
-
-                # Set epsilon based on config file
-                variant_params["eps"] = eps
-
-                # Parse any fraction values
-                for param, value in variant_params.items():
-                    if isinstance(value, str) and "/" in value:
-                        variant_params[param] = parse_fraction(value)
-
-                # Create attack with the specific variant parameters
-                attack = PGD(model, **variant_params)
-                attack_name = f"{variant_config['name']} (ε={eps:.4f})"
-
-                # Add information about special features to the name
-                if variant_params.get("loss_fn") != "cross_entropy":
-                    attack_name += f", {variant_params.get('loss_fn')} loss"
-            else:
-                print(
-                    f"Warning: PGD variant '{pgd_variant}' not found in config, using default"
-                )
-                # Fall back to standard PGD parameters
-                n_iterations = params["n_iterations"]
-                step_size_key = f"step_size_{norm.lower()}"
-                step_size = parse_fraction(params[step_size_key])
-                rand_init = params["rand_init"]
-                early_stopping = params["early_stopping"]
-                loss_fn = params.get("loss_fn", "cross_entropy")
-
-                attack = PGD(
-                    model,
-                    norm=norm,
-                    eps=eps,
-                    n_iterations=n_iterations,
-                    step_size=step_size,
-                    loss_fn=loss_fn,
-                    rand_init=rand_init,
-                    early_stopping=early_stopping,
-                )
-                attack_name = (
-                    f"PGD ({norm}, ε={eps:.4f}, steps={n_iterations}, {loss_fn})"
-                )
-        else:
-            # Use standard PGD parameters from config
-            n_iterations = params["n_iterations"]
-            step_size_key = f"step_size_{norm.lower()}"
-            step_size = parse_fraction(params[step_size_key])
-            rand_init = params["rand_init"]
-            early_stopping = params["early_stopping"]
-            loss_fn = params.get("loss_fn", "cross_entropy")
-
-            attack = PGD(
-                model,
-                norm=norm,
-                eps=eps,
-                n_iterations=n_iterations,
-                step_size=step_size,
-                loss_fn=loss_fn,
-                rand_init=rand_init,
-                early_stopping=early_stopping,
+        # Determine step size based on norm
+        step_size_key = f"step_size_{norm_type.lower()}"
+        if step_size_key not in params:
+            print(
+                f"Warning: {step_size_key} not found in PGD config for {attack_mode}, using default 0.01"
             )
-            attack_name = f"PGD ({norm}, ε={eps:.4f}, steps={n_iterations}, {loss_fn})"
+            step_size = 0.01
+        else:
+            step_size = parse_fraction(params[step_size_key])
+
+        # Get other PGD parameters from the simplified config
+        n_iterations = params.get("n_iterations", 40)
+        loss_fn = params.get("loss_fn", "cross_entropy")
+        rand_init = params.get("rand_init", True)
+        early_stopping = params.get("early_stopping", True)
+        refine_steps = params.get("refine_steps", 0)
+        use_binary_search_eps = params.get("use_binary_search_eps", False)
+
+        attack = PGD(
+            model,
+            norm=norm_type,
+            eps=eps,
+            n_iterations=n_iterations,
+            step_size=step_size,
+            loss_fn=loss_fn,
+            rand_init=rand_init,
+            early_stopping=early_stopping,
+            refine_steps=refine_steps,
+            use_binary_search_eps=use_binary_search_eps,
+        )
+        attack_name = (
+            f"PGD ({norm_type}, ε={eps:.4f}, steps={n_iterations}, loss={loss_fn})"
+        )
 
     else:
         raise ValueError(f"Unknown attack type: {attack_type}")
@@ -513,70 +487,29 @@ def main(args):
 
     # Initialize attacks based on config
     attacks = []
+    attack_types_to_test = set()
 
-    # Map attack request to creation function
-    for attack_type in args.attacks:
-        if attack_type.lower() == "all":
-            # Load all configured attacks
-            for attack_name in ["CG", "LBFGS", "PGD"]:
-                try:
-                    attack, attack_name = create_attack(
-                        model,
-                        attack_name,
-                        config,
-                        args.targeted,
-                        norm_override=args.norm,
-                    )
-                    attacks.append((attack, attack_name))
-                except Exception as e:
-                    print(f"Error creating attack {attack_name}: {e}")
-        elif attack_type.lower() == "pgd":
-            # If pgd_variant is specified, create that specific variant
-            if args.pgd_variant:
-                try:
-                    attack, attack_name = create_attack(
-                        model,
-                        "PGD",
-                        config,
-                        args.targeted,
-                        pgd_variant=args.pgd_variant,
-                        norm_override=args.norm,
-                    )
-                    attacks.append((attack, attack_name))
-                except Exception as e:
-                    print(f"Error creating PGD variant {args.pgd_variant}: {e}")
-            else:
-                # Create default PGD
-                try:
-                    attack, attack_name = create_attack(
-                        model, "PGD", config, args.targeted, norm_override=args.norm
-                    )
-                    attacks.append((attack, attack_name))
-                except Exception as e:
-                    print(f"Error creating PGD attack: {e}")
-        else:
-            # Load specific attack type (normalize to uppercase for consistent comparison)
-            attack_type_upper = attack_type.upper()
-            # Map to correct case based on known attack types
-            attack_type_map = {
-                "CG": "CG",
-                "LBFGS": "LBFGS",
-                "PGD": "PGD",
-            }
-            try:
-                if attack_type_upper in attack_type_map:
-                    attack, attack_name = create_attack(
-                        model,
-                        attack_type_map[attack_type_upper],
-                        config,
-                        args.targeted,
-                        norm_override=args.norm,
-                    )
-                    attacks.append((attack, attack_name))
-                else:
-                    print(f"Unknown attack type: {attack_type}")
-            except Exception as e:
-                print(f"Error creating attack {attack_type}: {e}")
+    if "all" in args.attacks:
+        attack_types_to_test.update(["CG", "LBFGS", "PGD"])
+    else:
+        for attack_type in args.attacks:
+            attack_types_to_test.add(attack_type.upper())
+
+    for attack_type in attack_types_to_test:
+        try:
+            attack, attack_name = create_attack(
+                model,
+                attack_type,  # Pass normalized upper case type
+                config,
+                args.targeted,
+                norm_override=args.norm,
+            )
+            attacks.append((attack, attack_name))
+        except Exception as e:
+            print(f"Error creating attack {attack_type}: {e}")
+            import traceback
+
+            traceback.print_exc()
 
     # Test each attack and collect results
     all_metrics = []
@@ -691,16 +624,6 @@ if __name__ == "__main__":
         default=["all"],
         choices=["all", "cg", "lbfgs", "pgd"],
         help="Which attacks to test",
-    )
-
-    # PGD variant selection
-    parser.add_argument(
-        "--pgd-variant",
-        "-pv",
-        type=str,
-        choices=["basic", "momentum", "l2"],
-        default="momentum",
-        help="Specific PGD variant to test (for --attacks pgd)",
     )
 
     # Test parameters

@@ -112,6 +112,32 @@ attack:
           L2: [2.0, 4.0]                # Larger L2 budgets for targeted
           Linf: [16/255, 32/255]        # Larger Linf budgets for targeted
 
+    PGD:
+      untargeted:
+        loss_fn: "cross_entropy"   # Standard cross-entropy often more effective initially
+        n_iterations: 40           # Standard iteration count
+        step_size_linf: 2.5/255    # Slightly larger step size for Linf
+        step_size_l2: 0.1          # Step size for L2 (eps / (steps / 4) heuristic approx)
+        rand_init: true            # Use random start
+        early_stopping: true       # Stop early if attack succeeds
+        refine_steps: 0            # No refinement for untargeted by default
+        use_binary_search_eps: false # No epsilon search for untargeted
+        eps_values:
+          Linf: [8/255]            # Standard Linf epsilon
+          L2: [1.0, 2.0]           # Common L2 epsilons
+      targeted:
+        loss_fn: "carlini_wagner"  # CW loss often better for targeted
+        n_iterations: 200          # More iterations needed for targeted
+        step_size_linf: 2.5/255    # Slightly larger step size for Linf
+        step_size_l2: 0.15         # Step size for L2
+        rand_init: true            # Use random start
+        early_stopping: true       # Stop early if attack succeeds
+        refine_steps: 0           # Disable refinement until attack succeeds
+        use_binary_search_eps: false # Disable eps search until attack succeeds
+        eps_values:
+          Linf: [16/255, 32/255]   # Larger Linf epsilons
+          L2: [2.0, 3.0]           # Larger L2 epsilons
+
     LBFGS:
       untargeted:
         loss_fn: "cross_entropy"
@@ -141,60 +167,6 @@ attack:
         eps_values:
           Linf: [16/255, 32/255]  # Larger bounds for targeted
           L2: [2.0, 4.0]          # Larger L2 bounds
-
-    PGD:
-      # PGD variants for testing different configurations
-      variants:
-        basic:
-          name: "PGD (Basic)"
-          params:
-            norm: "Linf"
-            n_iterations: 40
-            step_size: 2/255
-            loss_fn: "cross_entropy"
-            rand_init: true
-            early_stopping: true
-        
-        momentum:
-          name: "PGD (Margin)"
-          params:
-            norm: "Linf"
-            n_iterations: 40
-            step_size: 2/255
-            loss_fn: "margin"
-            rand_init: true
-            early_stopping: true
-        
-        l2:
-          name: "PGD (L2)"
-          params:
-            norm: "L2"
-            n_iterations: 40
-            step_size: 0.1
-            loss_fn: "cross_entropy"
-            rand_init: true
-            early_stopping: true
-      
-      untargeted:
-        loss_fn: "margin"         # Better loss function than cross_entropy
-        n_iterations: 40           # From Madry et al. (2017)
-        step_size_linf: 2/255      # Step size (standard practice)
-        step_size_l2: 0.1          # Step size for L2 attacks
-        rand_init: true            # Random initialization (important for PGD)
-        early_stopping: true       # Stop when attack succeeds
-        eps_values:
-          Linf: [8/255]           # Standard from Madry et al. (2017)
-          L2: [1.0, 2.0]          # Common L2 bounds
-      targeted:
-        loss_fn: "carlini_wagner"  # Better for targeted attacks
-        n_iterations: 100          # More iterations for targeted
-        step_size_linf: 2/255      # Same step size ratio
-        step_size_l2: 0.15         # Slightly larger for targeted
-        rand_init: true            # Random initialization
-        early_stopping: true       # Stop when attack succeeds
-        eps_values:
-          Linf: [16/255, 32/255]  # Larger eps for targeted
-          L2: [2.0, 3.0]          # Larger L2 bounds
 
 # Target method configuration for targeted attacks
 target_methods:
