@@ -190,15 +190,16 @@ def test_attack(attack, model, dataset, attack_name, args):
     else:
         attack.set_mode_default()
 
-    # Track successful adversarial examples for visualization
-    successful_examples = []
-
     # Run attack on all batches
     total_samples = 0
     total_batches = len(dataloader)
-    total_successful = (
-        0  # Counter for successful adversarial examples across all batches
-    )
+
+    # Apply max_batches limit if specified
+    if args.max_batches > 0 and args.max_batches < total_batches:
+        total_batches = args.max_batches
+        print(f"Limiting test to first {total_batches} batches as requested")
+    else:
+        print(f"Running test on all {total_batches} batches")
 
     print(
         f"Processing {num_samples} samples in {total_batches} batches (batch size: {batch_size})"
@@ -207,6 +208,10 @@ def test_attack(attack, model, dataset, attack_name, args):
     for batch_idx, (inputs, labels) in enumerate(
         tqdm(dataloader, desc=f"{attack_name}", total=total_batches)
     ):
+        # Break if we've reached the max_batches limit
+        if args.max_batches > 0 and batch_idx >= args.max_batches:
+            break
+
         # Ensure inputs and labels are the right type and on the right device
         inputs = inputs.to(args.device).float()  # Explicitly convert to float32
         labels = labels.to(args.device)
@@ -221,9 +226,6 @@ def test_attack(attack, model, dataset, attack_name, args):
             # Skip samples that are already misclassified
             correct_mask = original_preds == labels
             if not correct_mask.any():
-                print(
-                    f"  All samples in batch {batch_idx+1}/{total_batches} are already misclassified, skipping"
-                )
                 continue
 
             # Only attack correctly classified samples
@@ -234,98 +236,22 @@ def test_attack(attack, model, dataset, attack_name, args):
                 continue
 
         # Attack only the correctly classified samples
-        attack_start = time.time()
         adversarial = attack(correct_inputs, correct_labels)
-        attack_time = time.time() - attack_start
 
-        # Get model predictions on adversarial examples
-        with torch.no_grad():
-            adv_outputs = model(adversarial)
-            _, adv_preds = torch.max(adv_outputs, 1)
-
-            # Calculate model accuracy based on attack type
-            if args.targeted:
-                # For targeted attacks, accuracy is low when predictions match target labels
-                target_labels = attack.get_target_label(correct_inputs, correct_labels)
-                model_accuracy = (
-                    100 - (adv_preds == target_labels).float().mean().item() * 100
-                )
-            else:
-                # For untargeted attacks, accuracy is how often predictions match true labels
-                model_accuracy = (
-                    adv_preds == correct_labels
-                ).float().mean().item() * 100
-
-        # Explicitly evaluate attack success - this updates the attack's internal metrics
-        batch_success_rate, success_mask, (orig_preds, adv_preds) = (
-            attack.evaluate_attack_success(correct_inputs, adversarial, correct_labels)
-        )
-
-        # Count successful attacks in this batch
-        total_successful += success_mask.sum().item()
-
-        # Explicitly compute perturbation metrics - this updates the attack's internal metrics
-        perturbation_metrics = attack.compute_perturbation_metrics(
-            correct_inputs, adversarial
-        )
-
-        # Display batch results
-        print(
-            f"  Batch {batch_idx+1}/{total_batches}: "
-            f"Attack Success = {batch_success_rate:.2f}%, "
-            f"Model Accuracy = {model_accuracy:.2f}%, "
-            f"L2: {perturbation_metrics['l2_norm']:.4f}, "
-            f"L∞: {perturbation_metrics['linf_norm']:.4f}, "
-            f"SSIM: {perturbation_metrics['ssim']:.4f}"
-        )
-
-        # Save a successful example for visualization
-        if success_mask.any() and len(successful_examples) < args.num_vis:
-            success_idx = torch.where(success_mask)[0][0].item()
-
-            original_img = correct_inputs[success_idx].cpu()
-            adversarial_img = adversarial[success_idx].cpu()
-            original_label_idx = correct_labels[success_idx].item()
-            adv_pred_idx = adv_preds[success_idx].item()
-
-            successful_examples.append(
-                {
-                    "original": original_img,
-                    "adversarial": adversarial_img,
-                    "original_label": class_names[original_label_idx],
-                    "original_idx": original_label_idx,
-                    "adv_prediction": class_names[adv_pred_idx],
-                    "adv_idx": adv_pred_idx,
-                }
-            )
-
-    # Get metrics from the attack
+    # Get metrics from the attack AFTER processing all batches
     attack_metrics = attack.get_metrics()
 
-    # Combine metrics - use actual total_successful count for more accuracy
-    if total_samples > 0:
-        success_rate = 100 * total_successful / total_samples
-    else:
-        success_rate = 0.0
-
-    metrics["attack_success_rate"] = success_rate
+    # Combine metrics
+    metrics["attack_success_rate"] = attack_metrics["success_rate"]
     metrics["model_accuracy"] = (
-        100 - success_rate
+        100 - attack_metrics["success_rate"]
     )  # Since attack success = 100 - model accuracy
     metrics["l2_norm"] = attack_metrics["l2_norm"]
     metrics["linf_norm"] = attack_metrics["linf_norm"]
     metrics["ssim"] = attack_metrics["ssim"]
-
-    # Ensure metrics are non-zero even if not reported correctly
-    metrics["time_per_sample"] = attack_metrics.get(
-        "time_per_sample", 0.001
-    )  # Default to 1ms if missing
-    metrics["iterations"] = attack_metrics.get(
-        "iterations", 1.0
-    )  # Default to 1 if missing
-    metrics["gradient_calls"] = attack_metrics.get(
-        "gradient_calls", 1.0
-    )  # Default to 1 if missing
+    metrics["time_per_sample"] = attack_metrics["time_per_sample"]
+    metrics["iterations"] = attack_metrics["iterations"]
+    metrics["gradient_calls"] = attack_metrics["gradient_calls"]
 
     # Print metrics summary
     print(f"\nMetrics for {attack_name}:")
@@ -339,18 +265,11 @@ def test_attack(attack, model, dataset, attack_name, args):
     if "gradient_calls" in attack_metrics:
         print(f"  Average gradient calls: {metrics['gradient_calls']:.2f}")
 
-    # Create visualizations
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    for i, example in enumerate(successful_examples):
-        plot_images(
-            original=example["original"],
-            adversarial=example["adversarial"],
-            attack_name=attack_name,
-            original_label=f"{example['original_label']} ({example['original_idx']})",
-            adv_prediction=f"{example['adv_prediction']} ({example['adv_idx']})",
-            save_path=f"{args.output_dir}/{attack_name.lower().replace(' ', '_')}_example_{i+1}.png",
-        )
+    attack_mode = "targeted" if args.targeted else "untargeted"
+    print(f"\nResults for {attack_name} complete.")
+    print(f"Attack mode: {attack_mode.upper()}")
+    if args.targeted:
+        print(f"Target method: {args.target_method}")
 
     return metrics
 
@@ -365,7 +284,9 @@ def parse_fraction(value):
     return float(value)
 
 
-def create_attack(model, attack_type, config, targeted=False, pgd_variant=None):
+def create_attack(
+    model, attack_type, config, targeted=False, pgd_variant=None, norm_override=None
+):
     """
     Create an attack instance based on the attack type and configuration.
 
@@ -375,6 +296,7 @@ def create_attack(model, attack_type, config, targeted=False, pgd_variant=None):
         config: Configuration dictionary
         targeted: Whether the attack is targeted
         pgd_variant: Specific PGD variant to use (basic, margin, l2)
+        norm_override: Override the default norm with this value if provided
 
     Returns:
         tuple: (attack_instance, attack_name)
@@ -383,65 +305,51 @@ def create_attack(model, attack_type, config, targeted=False, pgd_variant=None):
     attack_params = config["attack"]["params"]
     attack_mode = "targeted" if targeted else "untargeted"
 
-    # Default norm type (first in the list)
-    norm_type = config["attack"]["norm_types"][0]
+    # Note: Specific attacks might override this (e.g., CG uses L2)
+    default_norm_type = norm_override or config["attack"]["norm_types"][0]
 
     if attack_type == "CG":
+        # CG can use either L2 or Linf norm
+        # Use the specified norm type or the first from config by default
+        norm_type = default_norm_type
         # Get CG parameters from config
         params = attack_params["CG"][attack_mode]
+
+        # Check if the specified norm has eps values defined, fallback to L2 if not
+        if norm_type not in params["eps_values"]:
+            print(f"Warning: {norm_type} not found in CG config, falling back to L2")
+            norm_type = "L2"
+
         eps_value = params["eps_values"][norm_type][0]  # Default to first epsilon value
         eps = parse_fraction(eps_value)
 
-        # Increase epsilon for targeted attacks
-        if targeted:
-            eps = min(eps * 2.0, 0.25)  # Double epsilon for targeted but cap at 0.25
-
-        # Get parameters from config with sensible defaults
-        n_iter = params.get("n_iter", 50)
-        beta_method = params.get("beta_method", "HS")
-        restart_interval = params.get("restart_interval", 10)
-        tv_lambda = params.get("tv_lambda", 0.05)
-        color_lambda = params.get("color_lambda", 0.05)
-        perceptual_lambda = params.get("perceptual_lambda", 0.05)
-        rand_init = params.get("rand_init", True)
-        fgsm_init = params.get("fgsm_init", True)
-        adaptive_restart = params.get("adaptive_restart", True)
-        early_stopping = params.get("early_stopping", True)
-        strict_epsilon_constraint = params.get("strict_epsilon_constraint", True)
+        # Get parameters directly from config based on our implementation
+        steps = params.get("steps", 10)
+        alpha = params.get("alpha", 0.1)
+        beta_method = params.get("beta_method", "PR")
 
         # Create CG with parameters from config
         attack = CG(
             model,
             norm=norm_type,
             eps=eps,
-            n_iter=n_iter,
+            steps=steps,
+            alpha=alpha,
             beta_method=beta_method,
-            restart_interval=restart_interval,
-            tv_lambda=tv_lambda,
-            color_lambda=color_lambda,
-            perceptual_lambda=perceptual_lambda,
-            rand_init=rand_init,
-            fgsm_init=fgsm_init,
-            adaptive_restart=adaptive_restart,
-            early_stopping=early_stopping,
-            strict_epsilon_constraint=strict_epsilon_constraint,
-            verbose=True,  # Enable verbose output for debugging
         )
-        attack_name = f"CG (ε={eps:.4f})"
+        attack_name = f"CG ({norm_type} ε={eps:.4f})"
 
     elif attack_type == "LBFGS":
+        # LBFGS often defaults to Linf, use default_norm_type
+        norm_type = default_norm_type
         # Get LBFGS parameters from config
         params = attack_params["LBFGS"][attack_mode]
-        eps_value = params["eps_values"]["Linf"][0]  # Default to first epsilon value
+        eps_value = params["eps_values"][norm_type][0]  # Use appropriate norm
         eps = parse_fraction(eps_value)
 
         # Get enhanced LBFGS parameters with defaults if not present
         n_iterations = params.get("n_iterations", 50)
         history_size = params.get("history_size", 10)
-        initial_const = params.get("initial_const", 1e-2)
-        binary_search_steps = params.get("binary_search_steps", 5)
-        const_factor = params.get("const_factor", 10.0)
-        repeat_search = params.get("repeat_search", True)
         rand_init = params.get("rand_init", True)
         init_std = params.get("init_std", 0.01)
 
@@ -451,20 +359,18 @@ def create_attack(model, attack_type, config, targeted=False, pgd_variant=None):
             eps=eps,
             n_iterations=n_iterations,
             history_size=history_size,
-            initial_const=initial_const,
-            binary_search_steps=binary_search_steps,
-            const_factor=const_factor,
-            repeat_search=repeat_search,
             rand_init=rand_init,
             init_std=init_std,
         )
 
-        attack_name = f"LBFGS (ε={eps:.4f}, bs_steps={binary_search_steps})"
+        attack_name = f"LBFGS ({norm_type} ε={eps:.4f})"
 
     elif attack_type == "PGD":
+        # PGD can use different norms, use default_norm_type
+        norm_type = default_norm_type
         # Get the base PGD parameters from config
         params = attack_params["PGD"][attack_mode]
-        norm = "Linf"  # Default norm
+        norm = norm_type  # Use the determined norm type
         eps_value = params["eps_values"][norm][0]  # Default to first epsilon value
         eps = parse_fraction(eps_value)
 
@@ -559,6 +465,10 @@ def main(args):
     print(f"Loading configuration from {config_path}")
     config = load_config(config_path)
 
+    # Print norm being used
+    if args.norm:
+        print(f"Using specified norm: {args.norm}")
+
     # Validate targeted attack parameters
     if args.targeted and not args.target_method:
         print("Error: --target-method must be specified when --targeted is set")
@@ -611,7 +521,11 @@ def main(args):
             for attack_name in ["CG", "LBFGS", "PGD"]:
                 try:
                     attack, attack_name = create_attack(
-                        model, attack_name, config, args.targeted
+                        model,
+                        attack_name,
+                        config,
+                        args.targeted,
+                        norm_override=args.norm,
                     )
                     attacks.append((attack, attack_name))
                 except Exception as e:
@@ -626,6 +540,7 @@ def main(args):
                         config,
                         args.targeted,
                         pgd_variant=args.pgd_variant,
+                        norm_override=args.norm,
                     )
                     attacks.append((attack, attack_name))
                 except Exception as e:
@@ -634,7 +549,7 @@ def main(args):
                 # Create default PGD
                 try:
                     attack, attack_name = create_attack(
-                        model, "PGD", config, args.targeted
+                        model, "PGD", config, args.targeted, norm_override=args.norm
                     )
                     attacks.append((attack, attack_name))
                 except Exception as e:
@@ -651,7 +566,11 @@ def main(args):
             try:
                 if attack_type_upper in attack_type_map:
                     attack, attack_name = create_attack(
-                        model, attack_type_map[attack_type_upper], config, args.targeted
+                        model,
+                        attack_type_map[attack_type_upper],
+                        config,
+                        args.targeted,
+                        norm_override=args.norm,
                     )
                     attacks.append((attack, attack_name))
                 else:
@@ -792,8 +711,8 @@ if __name__ == "__main__":
         "--max-batches",
         "-mb",
         type=int,
-        default=1,
-        help="Maximum number of batches to test per attack",
+        default=0,  # Changed default to 0 for unlimited like baseline
+        help="Maximum number of batches to test per attack (0 = unlimited)",
     )
     parser.add_argument(
         "--num-vis",
@@ -801,6 +720,16 @@ if __name__ == "__main__":
         type=int,
         default=3,
         help="Number of adversarial examples to visualize per attack",
+    )
+
+    # Norm selection
+    parser.add_argument(
+        "--norm",
+        "-N",
+        type=str,
+        choices=["L2", "Linf"],
+        default=None,
+        help="Norm to use for attack (default: from config)",
     )
 
     # Output parameters

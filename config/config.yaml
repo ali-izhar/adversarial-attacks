@@ -92,37 +92,25 @@ attack:
     # ---------------------
     CG:
       untargeted:
-        loss_fn: "cross_entropy"
-        n_iter: 50                      # Parameter name matches our implementation
-        beta_method: "HS"               # Changed to match our implementation (HS = Hestenes-Stiefel)
-        restart_interval: 10            # Renamed to match our implementation
-        tv_lambda: 0.05                 # Added regularization parameter
-        color_lambda: 0.05              # Added regularization parameter
-        perceptual_lambda: 0.05         # Added regularization parameter
-        rand_init: true                 # Random initialization within epsilon ball
-        fgsm_init: true                 # Added FGSM initialization
-        adaptive_restart: true          # Added adaptive restart parameter
-        early_stopping: true            # Stop when attack succeeds
-        strict_epsilon_constraint: true # Added parameter to strictly enforce epsilon
-        eps_values:
-          Linf: [8/255, 16/255]         # Common values from adversarial literature
-          L2: [1.0, 2.0]                # Standard L2 bounds
+        loss_fn: "cross_entropy"        # Loss function used
+        steps: 40                       # Number of iterations
+        alpha: 0.05                     # Step size for L2 (alpha = eps / (steps / 4) heuristic)
+        alpha_multiplier: 40.0          # Alpha multiplier for Linf (gives ~2/255 step size)
+        beta_method: "PR"               # Beta calculation: 'PR' (Polak-Ribière) or 'FR' (Fletcher-Reeves)
+        rand_init: true                 # Random initialization helps escape local minima
+        eps_values:                     
+          L2: [1.0, 2.0]                # Common L2 perturbation budgets
+          Linf: [8/255, 16/255]         # Common Linf perturbation budgets
       targeted:
-        loss_fn: "cross_entropy"
-        n_iter: 100                     # More iterations for targeted attacks
-        beta_method: "HS"               # Hestenes-Stiefel formula
-        restart_interval: 15            # Less frequent restarts for targeted
-        tv_lambda: 0.03                 # Lower regularization for targeted attacks
-        color_lambda: 0.03              # Lower regularization for targeted attacks 
-        perceptual_lambda: 0.03         # Lower regularization for targeted attacks
-        rand_init: true                 # Random initialization
-        fgsm_init: true                 # FGSM initialization
-        adaptive_restart: true          # Adaptive restart for better convergence
-        early_stopping: true            # Stop when attack succeeds
-        strict_epsilon_constraint: true # Strictly enforce epsilon constraint
+        loss_fn: "cross_entropy"        # Loss function used (negated for targeted)
+        steps: 60                       # More iterations for targeted
+        alpha: 0.067                    # Step size (alpha = eps / (steps / 4) heuristic)
+        alpha_multiplier: 40.0          # Alpha multiplier for Linf (gives ~2.5/255 step size)
+        beta_method: "PR"               # Beta calculation
+        rand_init: true                 # Random initialization helps escape local minima
         eps_values:
-          Linf: [16/255, 32/255]        # Larger perturbations for targeted
-          L2: [2.0, 4.0]                # Larger L2 bounds for targeted
+          L2: [2.0, 4.0]                # Larger L2 budgets for targeted
+          Linf: [16/255, 32/255]        # Larger Linf budgets for targeted
 
     LBFGS:
       untargeted:
