@@ -61,12 +61,9 @@ class FFGSM(Attack):
         self.eps = eps / mean_std  # Scaling to normalized space
         self.alpha = alpha / mean_std  # Alpha is the step size for the gradient update
 
-        # Validate that alpha is less than or equal to epsilon
-        # This ensures the gradient step doesn't exceed the total perturbation budget
-        if self.alpha > self.eps:
-            raise ValueError(
-                f"alpha ({self.alpha}) must be less than or equal to eps ({self.eps})"
-            )
+        # Note: In Wong et al. "Fast is better than free: Revisiting adversarial training",
+        # they recommend alpha = 1.25*epsilon, which is greater than epsilon.
+        # Therefore, we don't enforce alpha <= epsilon constraint here.
 
         # FFGSM supports both untargeted and targeted attacks
         self.supported_mode = ["default", "targeted"]
@@ -79,6 +76,7 @@ class FFGSM(Attack):
         # Clone and detach input images to avoid modifying the original data
         images = images.clone().detach().to(self.device)
         labels = labels.clone().detach().to(self.device)
+        batch_size = images.size(0)
 
         # For targeted attacks, get the target labels
         if self.targeted:
@@ -93,9 +91,18 @@ class FFGSM(Attack):
         min_bound = min_bound.view(1, 3, 1, 1)
         max_bound = max_bound.view(1, 3, 1, 1)
 
+        # Keep track of best adversarial examples (for metrics)
+        best_adv_images = images.clone().detach()
+        best_L2 = 1e10 * torch.ones((len(images))).to(self.device)
+        dim = len(images.shape)
+
         # Use cross-entropy loss for classification tasks
         # This implements L(f(x+δ), y) from the paper's formulation
         loss = nn.CrossEntropyLoss()
+        MSELoss = nn.MSELoss(reduction="none")  # Used for L2 distance calculation
+        Flatten = (
+            nn.Flatten()
+        )  # Needed to flatten spatial dimensions for L2 calculation
 
         # FFGSM Step 1: Initialize with random noise within epsilon bound
         # This corresponds to x' = x + α·sign(N(0,1)) from the paper
@@ -114,7 +121,7 @@ class FFGSM(Attack):
         outputs = self.get_logits(adv_images)
 
         # FFGSM is a single-step method (after random initialization)
-        self.total_iterations += images.size(0)
+        self.total_iterations += batch_size
 
         # Calculate loss based on attack mode
         if self.targeted:
@@ -144,8 +151,39 @@ class FFGSM(Attack):
         # This implements the final projection step to ensure valid images
         adv_images = torch.clamp(images + delta, min=min_bound, max=max_bound).detach()
 
+        # Calculate L2 distance between original and adversarial images
+        current_L2 = MSELoss(Flatten(adv_images), Flatten(images)).sum(dim=1)
+
+        # Evaluate success of the attack and track metrics
+        with torch.no_grad():
+            adv_outputs = self.get_output_with_eval_nograd(adv_images)
+            pre = torch.argmax(adv_outputs, 1)
+
+            # Different success conditions based on attack mode
+            if self.targeted:
+                # For targeted attacks, we want predictions to match target labels
+                condition = (pre == target_labels).float()
+            else:
+                # For untargeted attacks, we want predictions to differ from true labels
+                condition = (pre != labels).float()
+
+            # Update best adversarial examples and track L2 norms
+            mask = condition * (best_L2 > current_L2)
+            best_L2 = mask * current_L2 + (1 - mask) * best_L2
+
+            # Update best adversarial images (only keep successful attacks with better L2)
+            mask = mask.view([-1] + [1] * (dim - 1))
+            best_adv_images = mask * adv_images + (1 - mask) * best_adv_images
+
+            # Update attack success count
+            self.attack_success_count += condition.sum().item()
+            self.total_samples += batch_size
+
+        # Calculate perturbation metrics for final report
+        self.compute_perturbation_metrics(images, best_adv_images, condition.bool())
+
         # Measure and record time taken
         end_time = time.time()
         self.total_time += end_time - start_time
 
-        return adv_images
+        return best_adv_images

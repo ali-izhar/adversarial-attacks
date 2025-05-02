@@ -248,12 +248,23 @@ class ConjugateGradientOptimizer:
         # we should use steepest descent instead
         non_descent = dir_deriv >= 0
 
+        # If maximizing, flip the check - for maximization, we want dir_deriv < 0
+        if hasattr(self, "maximize") and self.maximize:
+            non_descent = dir_deriv <= 0
+
         direction_modified = direction.clone()
         if non_descent.any():
-            direction_modified[non_descent] = -current_grad[non_descent]
-            # Recompute directional derivative for corrected directions
-            dir_deriv_fixed = -(current_grad_flat[non_descent] ** 2).sum(dim=1)
-            dir_deriv[non_descent] = dir_deriv_fixed
+            # For maximization, use gradient direction instead of negative gradient
+            if hasattr(self, "maximize") and self.maximize:
+                direction_modified[non_descent] = current_grad[non_descent]
+                # Recompute directional derivative for corrected directions
+                dir_deriv_fixed = (current_grad_flat[non_descent] ** 2).sum(dim=1)
+                dir_deriv[non_descent] = dir_deriv_fixed
+            else:
+                direction_modified[non_descent] = -current_grad[non_descent]
+                # Recompute directional derivative for corrected directions
+                dir_deriv_fixed = -(current_grad_flat[non_descent] ** 2).sum(dim=1)
+                dir_deriv[non_descent] = dir_deriv_fixed
 
         # Choose appropriate initial step size based on norm type and epsilon
         # Use a more conservative approach similar to PGD
@@ -275,7 +286,15 @@ class ConjugateGradientOptimizer:
         alpha = initial_step.clone()
 
         # Armijo condition threshold: f(x) + c*α*∇f(x)ᵀd where c is the sufficient decrease param
-        armijo_threshold = current_loss + self.sufficient_decrease * alpha * dir_deriv
+        # For maximization, flip the sign of the directional derivative term
+        if hasattr(self, "maximize") and self.maximize:
+            armijo_threshold = (
+                current_loss - self.sufficient_decrease * alpha * dir_deriv
+            )
+        else:
+            armijo_threshold = (
+                current_loss + self.sufficient_decrease * alpha * dir_deriv
+            )
 
         # Track which samples have made progress
         made_progress = torch.zeros(batch_size, dtype=torch.bool, device=x.device)

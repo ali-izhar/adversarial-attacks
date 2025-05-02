@@ -392,6 +392,10 @@ def create_attack(model, attack_type, config, targeted=False, pgd_variant=None):
         eps_value = params["eps_values"][norm_type][0]  # Default to first epsilon value
         eps = parse_fraction(eps_value)
 
+        # Increase epsilon for targeted attacks
+        if targeted:
+            eps = min(eps * 2.0, 0.25)  # Double epsilon for targeted but cap at 0.25
+
         # Get parameters from config with sensible defaults
         n_iter = params.get("n_iter", 50)
         beta_method = params.get("beta_method", "HS")

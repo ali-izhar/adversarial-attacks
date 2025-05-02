@@ -123,9 +123,6 @@ class FGSM(Attack):
             cost, images, retain_graph=False, create_graph=False
         )[0]
 
-        # Explicitly track gradient calls (one per sample in batch)
-        self.track_gradient_calls(batch_size)
-
         # FGSM update: add signed gradients scaled by epsilon
         # This implements x_adv = x + ε * sign(∇_x L(f(x), y)) from the paper
         adv_images = images + self.eps * grad.sign()

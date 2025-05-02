@@ -8,7 +8,7 @@
 # Dataset configuration
 dataset:
   name: "imagenet"
-  num_images: 10    # Number of images to evaluate per model
+  num_images: 1000    # Number of images to evaluate per model
   image_dir: "data"
 
 # Model configuration
@@ -26,7 +26,7 @@ evaluation:
 
 # Attack method configuration
 attack:
-  method: "DeepFool"  # Options: FGSM, FFGSM, DeepFool, CW, PGD, CG, LBFGS
+  method: "CW"  # Options: FGSM, FFGSM, DeepFool, CW, PGD, CG, LBFGS
   norm_types:
     - "Linf" 
     - "L2"
@@ -48,15 +48,15 @@ attack:
     FFGSM:
       untargeted:
         loss_fn: "cross_entropy"
-        alpha_linf: 0.4   # Standard value from Wong et al. (2020)
-        alpha_l2: 0.25    # Standard value for L2 norm
+        alpha_linf: 0.04  # 1.25 × 8/255 
+        alpha_l2: 0.625   # 1.25 × 0.5 (the L2 epsilon)
         eps_values:
           Linf: [8/255]   # Should achieve ~87.5% success with SSIM > 0.8
           L2: [0.5]       # Should achieve good success with SSIM > 0.7
       targeted:
         loss_fn: "cross_entropy"
-        alpha_linf: 0.5   # Increased alpha for targeted attacks
-        alpha_l2: 0.35    # Increased alpha for targeted attacks
+        alpha_linf: 0.02  # 1.25 × 16/255
+        alpha_l2: 2.5     # 1.25 × 2.0
         eps_values:
           Linf: [16/255, 32/255]  # Larger epsilon for targeted attacks
           L2: [2.0, 3.0]          # Larger epsilon for targeted attacks
@@ -72,15 +72,15 @@ attack:
     
     CW:
       untargeted:
-        confidence_values: [0.0]   # Standard value from Carlini & Wagner (2017)
+        confidence_values: [0.0]   # Correct
         c_init: 1.0                # Initial c value
-        steps: 100                 # Standard number of iterations for untargeted
+        steps: 1000               # Practical compromise (more is better)
         learning_rate: 0.01        # Standard learning rate from original paper
         abort_early: true          # Enable early stopping for efficiency
       targeted:
-        confidence_values: [20.0]  # Higher confidence for targeted attacks
+        confidence_values: [5.0, 20.0]  # Multiple options to try
         c_init: 10.0               # Higher c value for targeted attacks
-        steps: 200                 # More iterations for targeted attacks
+        steps: 2000                     # More steps for targeted
         learning_rate: 0.01        # Same learning rate
         abort_early: true          # Enable early stopping for efficiency
     

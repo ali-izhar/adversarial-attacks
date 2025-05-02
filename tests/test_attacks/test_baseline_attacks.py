@@ -7,12 +7,12 @@ USAGE::
 
 import os
 import sys
-import time
 import argparse
 import yaml
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import torch
+import numpy as np
 
 # Add the project root to the path
 project_root = os.path.dirname(
@@ -197,6 +197,13 @@ def test_attack(attack, model, dataset, attack_name, args):
     total_samples = 0
     total_batches = len(dataloader)
 
+    # Apply max_batches limit if specified
+    if args.max_batches > 0 and args.max_batches < total_batches:
+        total_batches = args.max_batches
+        print(f"Limiting test to first {total_batches} batches as requested")
+    else:
+        print(f"Running test on all {total_batches} batches")
+
     print(
         f"Processing {num_samples} samples in {total_batches} batches (batch size: {batch_size})"
     )
@@ -204,6 +211,10 @@ def test_attack(attack, model, dataset, attack_name, args):
     for batch_idx, (inputs, labels) in enumerate(
         tqdm(dataloader, desc=f"{attack_name}", total=total_batches)
     ):
+        # Break if we've reached the max_batches limit
+        if args.max_batches > 0 and batch_idx >= args.max_batches:
+            break
+
         # Ensure inputs and labels are the right type and on the right device
         inputs = inputs.to(args.device, dtype=torch.float32)  # Explicitly set dtype
         labels = labels.to(args.device)
@@ -239,20 +250,37 @@ def test_attack(attack, model, dataset, attack_name, args):
             _, adv_preds = torch.max(adv_outputs, 1)
             model_accuracy = (adv_preds == correct_labels).float().mean().item() * 100
 
-        # Explicitly evaluate attack success - this updates the attack's internal metrics
-        batch_success_rate, success_mask, (orig_preds, adv_preds) = (
-            attack.evaluate_attack_success(correct_inputs, adversarial, correct_labels)
+        # Get perturbation metrics without updating the attack's internal metrics
+        # (internal metrics were already updated during the attack() call)
+        success_mask = (
+            adv_preds != correct_labels
+            if not attack.targeted
+            else adv_preds == attack.get_target_label(correct_inputs, correct_labels)
         )
 
-        # Explicitly compute perturbation metrics - this updates the attack's internal metrics
-        perturbation_metrics = attack.compute_perturbation_metrics(
-            correct_inputs, adversarial, success_mask
-        )
+        # Use numpy.mean for Python lists
+        perturbation_metrics = {
+            "l2_norm": (
+                np.mean(attack.l2_norms[-len(success_mask) :])
+                if len(attack.l2_norms) > 0
+                else 0.0
+            ),
+            "linf_norm": (
+                np.mean(attack.linf_norms[-len(success_mask) :])
+                if len(attack.linf_norms) > 0
+                else 0.0
+            ),
+            "ssim": (
+                np.mean(attack.ssim_values[-len(success_mask) :])
+                if len(attack.ssim_values) > 0
+                else 1.0
+            ),
+        }
 
         # Display batch results
         print(
             f"  Batch {batch_idx+1}/{total_batches}: "
-            f"Attack Success = {batch_success_rate:.2f}%, "
+            f"Attack Success = {100-model_accuracy:.2f}%, "
             f"Model Accuracy = {model_accuracy:.2f}%, "
             f"L2: {perturbation_metrics['l2_norm']:.4f}, "
             f"L∞: {perturbation_metrics['linf_norm']:.4f}, "
@@ -344,6 +372,13 @@ def create_attack(model, attack_type, config, targeted=False):
     Returns:
         tuple: (attack_instance, attack_name)
     """
+    # DeepFool doesn't support targeted attacks
+    if attack_type == "DeepFool" and targeted:
+        print(
+            f"Warning: DeepFool does not support targeted attacks. Switching to untargeted mode."
+        )
+        targeted = False
+
     # Get attack parameters from config
     try:
         attack_params = config.get("attack", {}).get("params", {})
@@ -402,9 +437,8 @@ def create_attack(model, attack_type, config, targeted=False):
             if "alpha_linf" not in params:
                 raise ValueError("Missing alpha_linf parameter for FFGSM")
 
-            alpha = (
-                parse_fraction(params["alpha_linf"]) * eps
-            )  # Alpha is typically relative to epsilon
+            # Use alpha directly as configured in the YAML - it's now absolute, not relative
+            alpha = parse_fraction(params["alpha_linf"])
 
             attack = FFGSM(model, eps=eps, alpha=alpha)
             attack_name = f"FFGSM (ε={eps:.4f}, α={alpha:.4f})"
@@ -722,14 +756,14 @@ if __name__ == "__main__":
 
     # Test parameters
     parser.add_argument(
-        "--batch-size", "-b", type=int, default=4, help="Batch size for testing"
+        "--batch-size", "-b", type=int, default=32, help="Batch size for testing"
     )
     parser.add_argument(
         "--max-batches",
         "-mb",
         type=int,
-        default=1,
-        help="Maximum number of batches to test per attack",
+        default=0,
+        help="Maximum number of batches to test per attack (0 = unlimited)",
     )
     parser.add_argument(
         "--num-vis",

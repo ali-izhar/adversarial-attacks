@@ -879,7 +879,10 @@ class Attack(object):
         given_training = self.model.training
         if given_training:
             self.model.eval()
-        outputs = self.get_logits(inputs)
+
+        # Use direct model call instead of get_logits to avoid incrementing gradient calls counter
+        outputs = self.model(inputs)
+
         if given_training:
             self.model.train()
         return outputs

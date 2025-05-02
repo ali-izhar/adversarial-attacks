@@ -119,9 +119,14 @@ class DeepFool(Attack):
 
         # Calculate number of fooled samples
         with torch.no_grad():
-            preds = self.get_logits(adv_batch).argmax(dim=1)
+            # Use model directly instead of get_logits to avoid incrementing gradient counter during evaluation
+            preds = self.model(adv_batch).argmax(dim=1)
             fooled_mask = preds != labels
             fooled_count = fooled_mask.sum().item()
+
+            # Update success metrics in parent class
+            self.attack_success_count += fooled_count
+            self.total_samples += batch_size
 
         # Calculate perturbation metrics only for successful attacks
         perturbation_metrics = self.compute_perturbation_metrics(

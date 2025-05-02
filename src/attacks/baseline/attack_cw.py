@@ -143,8 +143,9 @@ class CW(Attack):
             current_L2 = MSELoss(Flatten(adv_images), Flatten(images)).sum(dim=1)
             L2_loss = current_L2.sum()
 
-            # Get model predictions
-            outputs = self.get_logits(adv_images)
+            # Get model predictions - use model directly to avoid double-counting gradient calls
+            # since we explicitly track them below with self.track_gradient_calls
+            outputs = self.model(adv_images)
 
             # Calculate the f-function loss (misclassification loss)
             # This implements max(max_{j≠y_true} f_j(x+δ) - f_{y_true}(x+δ), -κ) from the paper
@@ -214,6 +215,27 @@ class CW(Attack):
         # Update time
         end_time = time.time()
         self.total_time += end_time - start_time
+
+        # Calculate final success metrics
+        with torch.no_grad():
+            outputs = self.get_output_with_eval_nograd(best_adv_images)
+            pre = torch.argmax(outputs, 1)
+
+            # Determine which attacks were successful
+            if self.targeted:
+                # For targeted attacks, we want predictions to match target labels
+                success_mask = pre == target_labels
+            else:
+                # For untargeted attacks, we want predictions to differ from true labels
+                success_mask = pre != labels
+
+            # Update success metrics in parent class
+            success_count = success_mask.sum().item()
+            self.attack_success_count += success_count
+            self.total_samples += batch_size
+
+            # Calculate perturbation metrics for successful attacks
+            self.compute_perturbation_metrics(images, best_adv_images, success_mask)
 
         # Return the best adversarial examples found
         return best_adv_images

@@ -5,30 +5,20 @@
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 from .baseline.attack import Attack
 from .optimize.cg import ConjugateGradientOptimizer
-from .utils import (
-    project_adversarial_example,
-    total_variation_loss,
-    color_regularization,
-    perceptual_loss,
-    refine_perturbation,
-)
+from .utils import project_adversarial_example
 
 
 class CG(Attack):
     r"""
-    Enhanced Conjugate Gradient Attack with perceptual constraints.
+    Conjugate Gradient Attack.
 
-    # Paper: "For adversarial attacks, we formulate the optimization problem as:
-    # min_δ L(f(x + δ), y) subject to ||δ||_p ≤ ε"
-
-    This attack creates adversarial examples by optimizing the input using
-    conjugate gradient descent to find minimal perturbations that cause
-    misclassification while maintaining visual similarity. The improved implementation
-    uses proper conjugate gradient formulas for better convergence.
+    This attack creates adversarial examples using conjugate gradient descent
+    to find minimal perturbations that cause misclassification.
 
     Arguments:
         model (nn.Module): Model to attack.
@@ -37,11 +27,11 @@ class CG(Attack):
         n_iter (int): Number of iterations.
         beta_method (str): Formula to use for conjugate updates ('FR', 'PR', or 'HS').
         restart_interval (int): Interval for restarting conjugate gradient updates.
-        tv_lambda (float): Total variation regularization weight for smoothness.
-        color_lambda (float): Color regularization weight for perceptual quality.
-        perceptual_lambda (float): Weight for frequency domain perceptual loss.
+        tv_lambda (float): Total variation regularization weight.
+        color_lambda (float): Color regularization weight.
+        perceptual_lambda (float): Weight for perceptual loss.
         rand_init (bool): If True, use random initialization.
-        fgsm_init (bool): If True, use FGSM initialization for better starting point.
+        fgsm_init (bool): If True, use FGSM initialization.
         adaptive_restart (bool): If True, dynamically restart based on conjugacy loss.
         early_stopping (bool): If True, stop when adversarial goal is achieved.
         verbose (bool): If True, print progress updates.
@@ -65,7 +55,6 @@ class CG(Attack):
         early_stopping: bool = True,
         verbose: bool = False,
         strict_epsilon_constraint: bool = True,
-        refine_perturbation: bool = False,
     ):
         # Initialize the Attack base class
         super().__init__("CG", model)
@@ -92,33 +81,13 @@ class CG(Attack):
         self.early_stopping = early_stopping
         self.verbose = verbose
         self.strict_epsilon_constraint = strict_epsilon_constraint
-        self.refine_perturbation = refine_perturbation
+
         # Set up supported modes
         self.supported_mode = ["default", "targeted"]
 
-        # Create the optimizer with correct parameters
-        self.optimizer = ConjugateGradientOptimizer(
-            norm=norm,
-            eps=self.eps,  # Pass the scaled epsilon for normalized space
-            n_iterations=n_iter,
-            beta_method=beta_method,
-            restart_interval=restart_interval,
-            rand_init=rand_init,
-            early_stopping=early_stopping,
-            verbose=verbose,
-            fgsm_init=fgsm_init,
-            adaptive_restart=adaptive_restart,
-            momentum=0.0,  # Don't use momentum for proper CG
-            line_search_factor=0.5,
-            sufficient_decrease=1e-4,
-        )
-
     def forward(self, images, labels):
         r"""
-        Overridden method for generating adversarial examples.
-
-        # Paper: "min_δ L(f(x + δ), y) subject to ||δ||_p ≤ ε"
-        # This is the main attack method implementing the paper's approach
+        Generate adversarial examples.
 
         Arguments:
             images (torch.Tensor): Input images.
@@ -129,40 +98,30 @@ class CG(Attack):
         Returns:
             adversarial_images (torch.Tensor): Adversarial examples.
         """
-        # Track time for performance metrics
+        # Start timing
         start_time = time.time()
 
-        # Reset per-batch success tracking
-        batch_attack_success_count = 0
-
-        # Clone and detach input images to avoid modifying the original data
+        # Clone and detach input images
         images = images.clone().detach().to(self.device)
         labels = labels.clone().detach().to(self.device)
 
         # For targeted attacks, get the target labels
         if self.targeted:
             target_labels = self.get_target_label(images, labels)
-            # For targeted attacks, use larger epsilon for stronger effects
-            epsilon_scale = 2.0  # Scale epsilon higher for targeted attacks
-            self.eps = self.orig_eps * epsilon_scale / self.std.mean().item()
-            # Also increase iterations for targeted attack
-            self.optimizer.n_iterations = (
-                self.n_iter * 3
-            )  # Triple iterations for targeted
-            self.optimizer.restart_interval = 5  # More frequent restarts
-            # More aggressive line search for targeted attacks
-            self.optimizer.line_search_factor = 0.8
-            self.optimizer.sufficient_decrease = 1e-7
+            # Use much higher epsilon for targeted attacks (needs more perturbation)
+            eps = self.eps * 5.0  # 5x epsilon for targeted
+            # Use many more iterations for targeted attacks
+            n_iter = self.n_iter * 10  # 10x the iterations
 
             if self.verbose:
-                print(f"Using increased epsilon of {self.eps:.4f} for targeted attack")
-                print(
-                    f"Targeted CG attack with {self.optimizer.n_iterations} iterations, restart every {self.optimizer.restart_interval}"
-                )
+                print(f"Using increased epsilon of {eps:.4f} for targeted attack")
+                print(f"Targeted CG attack with {n_iter} iterations")
         else:
             target_labels = labels
+            eps = self.eps
+            n_iter = self.n_iter
 
-        # Calculate normalized min/max bounds for valid pixel ranges after denormalization
+        # Calculate normalized min/max bounds for valid pixel ranges
         min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
         max_bound = ((1 - self.mean) / self.std).to(
             device=images.device, dtype=images.dtype
@@ -170,408 +129,352 @@ class CG(Attack):
         min_bound = min_bound.view(1, 3, 1, 1)
         max_bound = max_bound.view(1, 3, 1, 1)
 
-        # Use cross-entropy loss for classification
-        ce_loss = nn.CrossEntropyLoss(reduction="none")
-
-        # Enhanced initialization for targeted attacks
-        # Start closer to the target class in feature space
+        # Initialize adversarial examples
+        # For targeted attacks, start with stronger random perturbation
         if self.targeted and self.rand_init:
-            # Get feature representations
-            with torch.no_grad():
-                # Get model predictions on original images
-                outputs = self.get_logits(images)
+            # Create random initialization - for targeted attacks, make it closer to the original
+            # but with high epsilon to allow sufficient exploration
+            adv_images = torch.zeros_like(images)
 
-                # Check if initialization is beneficial
-                # Only spend time on good initialization if there's a reasonable chance of success
-                preds = outputs.argmax(dim=1)
-                if (
-                    preds != target_labels
-                ).float().mean() > 0.8:  # At least 80% are different
-                    # Apply stronger epsilon initialization for targeted attacks
-                    if self.norm.lower() == "l2":
-                        # Use larger initial perturbation for targeted attacks
-                        noise = torch.randn_like(images) * (self.eps * 0.5)
-                        # Scale to exact epsilon to start with maximum perturbation
-                        noise_flat = noise.view(noise.shape[0], -1)
-                        noise_norm = torch.norm(noise_flat, p=2, dim=1).view(
-                            -1, 1, 1, 1
-                        )
-                        noise = noise * self.eps / (noise_norm + 1e-12)
-                    else:  # Linf
-                        # Use full epsilon range for initialization
-                        noise = torch.zeros_like(images).uniform_(-self.eps, self.eps)
-
-                    # Apply initial perturbation and clip to valid range
-                    perturbed_images = torch.clamp(
-                        images + noise, min=min_bound, max=max_bound
-                    )
-
-                    # Simple FGSM-like initialization without using autograd
-                    # Initialize with random noise and refine using a simple targeted FGSM approach
-                    for step in range(5):  # 5 steps of targeted initialization
-                        # For each sample, get the current prediction
-                        with torch.no_grad():
-                            current_outputs = self.get_logits(perturbed_images)
-                            current_preds = current_outputs.argmax(dim=1)
-
-                            # Calculate loss value manually - Minimize distance to target class
-                            target_logits = current_outputs.gather(
-                                1, target_labels.unsqueeze(1)
-                            ).squeeze(1)
-                            other_logits = current_outputs.clone()
-                            other_logits.scatter_(
-                                1, target_labels.unsqueeze(1), float("-inf")
-                            )
-                            highest_other_logits = other_logits.max(1)[0]
-
-                            # We want to move towards target_logits and away from highest_other_logits
-                            # This is like a gradient estimation for targeted attacks
-                            # First get the indices of the highest non-target class
-                            highest_indices = other_logits.argmax(dim=1)
-
-                            # Create a manual gradient estimate: subtract target logits from others
-                            # This should approximate moving toward target class
-                            # For each image, create a perturbation that increases target and decreases others
-                            step_size = self.eps * 0.1
-
-                            for i in range(images.size(0)):
-                                # Get feature activations for the target and highest non-target classes
-                                with torch.no_grad():
-                                    target_class = target_labels[i].item()
-                                    other_class = highest_indices[i].item()
-
-                                    # Get activations for the penultimate layer
-                                    if target_logits[i] > highest_other_logits[i]:
-                                        # If already targeting correctly, focus on a different high class
-                                        # Find 2nd highest non-target class
-                                        temp_logits = current_outputs[i].clone()
-                                        temp_logits[target_class] = float("-inf")
-                                        temp_logits[other_class] = float("-inf")
-                                        other_class = temp_logits.argmax().item()
-
-                                    if target_class == other_class:
-                                        # Skip this sample if we can't find different classes
-                                        continue
-
-                                    # Simple direction toward target class in logit space
-                                    # Create a simple perturbation that moves toward target class and away from others
-                                    weights = current_outputs[i].softmax(0)
-                                    weights[target_class] += 0.2  # Boost target class
-                                    weights[
-                                        other_class
-                                    ] -= 0.1  # Reduce highest non-target
-
-                                    # Create a targeted perturbation
-                                    delta = (
-                                        perturbed_images[i : i + 1] - images[i : i + 1]
-                                    )
-
-                                    # Add perturbation to move toward target and away from others
-                                    direction = torch.zeros_like(
-                                        perturbed_images[i : i + 1]
-                                    )
-                                    if current_preds[i] != target_class:
-                                        # If not already correctly classified, add small push toward target class
-                                        direction = (
-                                            step_size
-                                            * torch.randn_like(
-                                                perturbed_images[i : i + 1]
-                                            ).sign()
-                                        )
-
-                                    # Apply perturbation with clipping and projection
-                                    delta = delta + direction
-
-                                    # Project perturbation to epsilon constraint
-                                    if self.norm.lower() == "l2":
-                                        delta_flat = delta.reshape(-1)
-                                        delta_norm = torch.norm(delta_flat, p=2)
-                                        if delta_norm > self.eps:
-                                            delta = delta * (self.eps / delta_norm)
-                                    else:  # linf norm
-                                        delta = torch.clamp(delta, -self.eps, self.eps)
-
-                                    # Update perturbed images
-                                    perturbed_images[i : i + 1] = torch.clamp(
-                                        images[i : i + 1] + delta,
-                                        min=min_bound,
-                                        max=max_bound,
-                                    )
-
-                    # Check if the initialization improved classification toward target
-                    with torch.no_grad():
-                        final_outputs = self.get_logits(perturbed_images)
-                        final_preds = final_outputs.argmax(dim=1)
-                        success_rate = (
-                            (final_preds == target_labels).float().mean().item()
-                        )
-
-                    # Only use this initialization if it meaningfully improved
-                    if success_rate > 0:
-                        if self.verbose:
-                            print(
-                                f"Using enhanced initialization for targeted attack with {success_rate*100:.1f}% initial success"
-                            )
-                        images = perturbed_images
-
-        # Define the gradient function for the optimizer
-        def gradient_fn(x):
-            # Ensure gradients are enabled
-            x.requires_grad_(True)
-
-            # Forward pass
-            outputs = self.get_logits(x)
-
-            # Get appropriate labels for the current batch
-            # This handles cases when we're only processing a subset of samples
-            if self.targeted:
-                # For targeted, use target labels matching the current batch size
-                curr_labels = target_labels[: x.size(0)]
-            else:
-                # For untargeted, use true labels matching the current batch size
-                curr_labels = labels[: x.size(0)]
-
-            # Classification loss
-            if self.targeted:
-                # For targeted attacks, we need to make the target class more likely
-                # First term: minimize negative CE loss to target class
-                class_loss = -ce_loss(outputs, curr_labels)
-
-                # Second term: increase margin between target and other classes
-                # This encourages larger gaps between the target class and others
-                target_logits = outputs.gather(1, curr_labels.view(-1, 1)).squeeze(1)
-                other_logits = outputs.clone()
-                other_logits.scatter_(1, curr_labels.view(-1, 1), float("-inf"))
-                max_other_logits = other_logits.max(1)[0]
-
-                # Increased confidence for targeted attacks
-                conf = 20.0  # Higher confidence value
-                margin_loss = torch.clamp(
-                    max_other_logits - target_logits + conf, min=0
-                )
-
-                # Combined loss with stronger weight on targeting components
-                # Additional cross-entropy term to focus more on target class
-                cross_entropy = nn.functional.cross_entropy(
-                    outputs, curr_labels, reduction="none"
-                )
-
-                # More aggressive combined loss for targeted attacks
-                class_loss = class_loss + 3.0 * margin_loss + 2.0 * cross_entropy
-            else:
-                # For untargeted attacks, maximize CE loss to true class
-                class_loss = ce_loss(outputs, curr_labels)
-
-            # Compute current perturbation
-            delta = x - images[: x.size(0)]
-
-            # Add regularization losses - all should return per-sample values
-            # Note: These regularization terms are enhancements beyond the paper
-            tv_loss = total_variation_loss(delta)
-            color_loss = color_regularization(delta)
-            percept_loss = perceptual_loss(delta, images[: x.size(0)])
-
-            # Combine losses with weights - keeping per-sample values
-            # For targeted attacks, reduce regularization to focus more on target achievement
-            reg_factor = (
-                0.1 if self.targeted else 1.0
-            )  # Even less regularization for targeted attacks
-            total_loss = (
-                class_loss
-                + reg_factor * self.tv_lambda * tv_loss
-                + reg_factor * self.color_lambda * color_loss
-                + reg_factor * self.perceptual_lambda * percept_loss
-            )
-
-            # Compute gradients for each sample
-            # Paper: "g_t = ∇_δ L(f(x + δ_t), y)" - computing the gradient
-            grads = []
-            for i in range(x.size(0)):
-                grad = torch.autograd.grad(
-                    total_loss[i], x, retain_graph=(i < x.size(0) - 1)
-                )[0][i : i + 1]
-                grads.append(grad)
-
-            # Combine gradients
-            full_grad = torch.cat(grads, dim=0)
-            return full_grad
-
-        # Define the loss function that returns per-sample loss values
-        def loss_fn(x):
-            with torch.no_grad():
-                # Forward pass
-                outputs = self.get_logits(x)
-
-                # Get matching labels for current batch size
-                if self.targeted:
-                    curr_labels = target_labels[: x.size(0)]
-                else:
-                    curr_labels = labels[: x.size(0)]
-
-                # Classification loss
-                if self.targeted:
-                    # For targeted attacks
-                    class_loss = -ce_loss(outputs, curr_labels)
-
-                    # Add margin loss component for targeted attack
-                    target_logits = outputs.gather(1, curr_labels.view(-1, 1)).squeeze(
-                        1
-                    )
-                    other_logits = outputs.clone()
-                    other_logits.scatter_(1, curr_labels.view(-1, 1), float("-inf"))
-                    max_other_logits = other_logits.max(1)[0]
-
-                    # Increased confidence for targeted attacks
-                    conf = 20.0  # Higher confidence value
-                    margin_loss = torch.clamp(
-                        max_other_logits - target_logits + conf, min=0
-                    )
-
-                    # Additional cross-entropy term to focus more on target class
-                    cross_entropy = nn.functional.cross_entropy(
-                        outputs, curr_labels, reduction="none"
-                    )
-
-                    # More aggressive combined loss for targeted attacks
-                    class_loss = class_loss + 3.0 * margin_loss + 2.0 * cross_entropy
-                else:
-                    # For untargeted attacks
-                    class_loss = ce_loss(outputs, curr_labels)
-
-                # Compute current perturbation
-                delta = x - images[: x.size(0)]
-
-                # Add regularization losses
-                tv_loss = total_variation_loss(delta)
-                color_loss = color_regularization(delta)
-                percept_loss = perceptual_loss(delta, images[: x.size(0)])
-
-                # Combine losses with weights - reduce regularization for targeted attacks
-                reg_factor = (
-                    0.1 if self.targeted else 1.0
-                )  # Even less regularization for targeted attacks
-                total_loss = (
-                    class_loss
-                    + reg_factor * self.tv_lambda * tv_loss
-                    + reg_factor * self.color_lambda * color_loss
-                    + reg_factor * self.perceptual_lambda * percept_loss
-                )
-
-                return total_loss
-
-        # Define success function for early stopping
-        def success_fn(x):
-            with torch.no_grad():
-                outputs = self.get_logits(x)
-
-                # Get matching labels for the current batch
-                if self.targeted:
-                    curr_labels = target_labels[: x.size(0)]
-                else:
-                    curr_labels = labels[: x.size(0)]
-
-                if self.targeted:
-                    # Attack succeeds if model predicts target class
-                    return outputs.argmax(dim=1) == curr_labels
-                else:
-                    # Attack succeeds if model predicts any class other than the true label
-                    # Paper: "break if ||r_{k+1}|| < tol or arg max_j f_j(x + δ_{k+1}) ≠ y_true"
-                    # This is the second condition for early stopping
-                    return outputs.argmax(dim=1) != curr_labels
-
-        # Set optimizer parameters suited for targeted attacks if needed
-        if self.targeted:
-            # Adjust optimizer parameters for targeted attacks
-            self.optimizer.line_search_factor = 0.7  # More aggressive line search
-            self.optimizer.sufficient_decrease = 1e-6  # More permissive acceptance
-            self.optimizer.n_iterations = (
-                self.n_iter * 2
-            )  # Double the iterations for targeted
-            self.optimizer.restart_interval = 5  # More frequent restarts
-
-        # Run the optimizer to generate adversarial examples
-        # This executes the Algorithm 1 from the paper (Efficient Conjugate Gradient Attack)
-        adv_images, metrics = self.optimizer.optimize(
-            x_init=images,
-            gradient_fn=gradient_fn,
-            loss_fn=loss_fn,
-            success_fn=success_fn,
-            x_original=images,
-            targeted=self.targeted,
-            min_bound=min_bound,
-            max_bound=max_bound,
-        )
-
-        # Update attack metrics from optimizer results
-        self.total_iterations += int(metrics["iterations"] * images.size(0))
-        self.total_gradient_calls += int(metrics["gradient_calls"] * images.size(0))
-
-        # Update success count from optimizer metrics - this is critical for targeted attacks
-        if "success_rate" in metrics and metrics["success_rate"] > 0:
-            # Calculate how many samples were successful based on optimizer's success rate
-            batch_size = images.size(0)
-            success_count = int((metrics["success_rate"] / 100) * batch_size)
-            self.attack_success_count += success_count
-            self.total_samples += batch_size
-
-        # Strictly enforce epsilon constraint if enabled, but ensure minimal perturbation size
-        if self.strict_epsilon_constraint:
-            batch_size = images.shape[0]
-            for i in range(batch_size):
-                # Calculate current perturbation magnitude
-                delta = adv_images[i : i + 1] - images[i : i + 1]
+            for i in range(images.size(0)):
                 if self.norm.lower() == "l2":
-                    delta_norm = torch.norm(delta.flatten(), p=2).item()
-                else:  # Linf
-                    delta_norm = torch.norm(delta.flatten(), p=float("inf")).item()
-
-                # Only project if perturbation exceeds epsilon
-                if delta_norm > self.eps:
-                    adv_images[i : i + 1] = project_adversarial_example(
-                        adv_images[i : i + 1],
-                        images[i : i + 1],
-                        self.eps,
-                        self.norm,
-                        min_bound=min_bound,
-                        max_bound=max_bound,
+                    # L2 random direction with 95% of epsilon
+                    delta = torch.randn_like(images[i : i + 1])
+                    flat_delta = delta.reshape(1, -1)
+                    l2_norm = torch.norm(flat_delta, p=2)
+                    delta = delta / (l2_norm + 1e-10) * (eps * 0.95)
+                else:
+                    # Uniform random in 95% of epsilon range
+                    delta = torch.zeros_like(images[i : i + 1]).uniform_(
+                        -eps * 0.95, eps * 0.95
                     )
 
-        # Ensure outputs are properly clamped to valid input range
-        adv_images = torch.clamp(adv_images, min=min_bound, max=max_bound).detach()
+                # Apply perturbation
+                adv_images[i : i + 1] = torch.clamp(
+                    images[i : i + 1] + delta, min=min_bound, max=max_bound
+                )
 
-        # Apply post-processing refinement to improve SSIM and reduce perturbation
-        # Only refine if we have successful examples
-        if metrics["success_rate"] > 0 and self.refine_perturbation:
-            adv_images = refine_perturbation(
-                model=self.model,
-                original_images=images,
-                adv_images=adv_images,
-                labels=labels,
-                targeted=self.targeted,
-                get_target_label_fn=self.get_target_label if self.targeted else None,
-                refinement_steps=10,
-                min_bound=min_bound,
-                max_bound=max_bound,
-                device=self.device,
-                verbose=self.verbose,
-            )
+            if self.verbose:
+                print("Using strong random initialization for targeted attack")
+        else:
+            # Use original images as starting point
+            adv_images = images.clone()
+
+        # Set up optimization parameters
+        best_advs = adv_images.clone()
+        best_l2_dist = torch.full([images.size(0)], float("inf"), device=images.device)
+
+        # For untargeted: maximize loss; for targeted: minimize loss
+        multiplier = -1 if self.targeted else 1
+
+        # Track attack metrics
+        total_grad_calls = 0
+
+        # Create momentum buffer for better targeted attack convergence
+        previous_grad = torch.zeros_like(images)
+        momentum = 0.9 if self.targeted else 0.0
+
+        # Initialize for conjugate gradient
+        prev_direction = None
+        prev_grad = None
+
+        # For targeted attacks, try multiple restart points
+        max_restarts = 5 if self.targeted else 1
+        restart_points = []
+
+        # Main optimization loop, with multiple restarts for targeted attacks
+        for restart in range(max_restarts):
+            if restart > 0:
+                # For subsequent restarts, use a new random initialization
+                if self.targeted:
+                    # Create a different random perturbation
+                    temp_adv = torch.zeros_like(images)
+                    for i in range(images.size(0)):
+                        if self.norm.lower() == "l2":
+                            # L2 random direction with 95% of epsilon
+                            delta = torch.randn_like(images[i : i + 1])
+                            flat_delta = delta.reshape(1, -1)
+                            l2_norm = torch.norm(flat_delta, p=2)
+                            delta = delta / (l2_norm + 1e-10) * (eps * 0.95)
+                        else:
+                            # Uniform random in 95% of epsilon range
+                            delta = torch.zeros_like(images[i : i + 1]).uniform_(
+                                -eps * 0.95, eps * 0.95
+                            )
+
+                        # Apply perturbation
+                        temp_adv[i : i + 1] = torch.clamp(
+                            images[i : i + 1] + delta, min=min_bound, max=max_bound
+                        )
+
+                    # Use the new initialization
+                    adv_images = temp_adv.clone()
+
+                    if self.verbose:
+                        print(
+                            f"Restart {restart+1}/{max_restarts} with new random initialization"
+                        )
+
+                # Reset direction and gradient
+                prev_direction = None
+                prev_grad = None
+
+            # Inner optimization loop for current restart
+            inner_iterations = n_iter // max_restarts
+            for i in range(inner_iterations):
+                # Create a fresh copy that requires grad
+                adv_images_var = adv_images.clone().detach().requires_grad_(True)
+
+                # Forward pass
+                outputs = self.get_logits(adv_images_var)
+
+                # Compute loss based on attack mode
+                if self.targeted:
+                    # For targeted attacks - more aggressive loss function
+
+                    # Targeted logit loss (direct logit manipulation)
+                    target_logits = outputs.gather(
+                        1, target_labels.unsqueeze(1)
+                    ).squeeze(1)
+                    other_logits = outputs.clone()
+                    other_logits.scatter_(1, target_labels.unsqueeze(1), float("-inf"))
+                    highest_other = other_logits.max(1)[0]
+
+                    # Margin term with higher confidence (30.0)
+                    logit_diff = highest_other - target_logits
+                    margin_loss = torch.clamp(logit_diff + 30.0, min=0)
+
+                    # Cross-entropy term (smaller weight to keep focus on direct logit manipulation)
+                    ce_loss = F.cross_entropy(outputs, target_labels, reduction="none")
+
+                    # Combined loss - weighted heavily toward margin term
+                    loss = margin_loss + 0.1 * ce_loss
+                else:
+                    # For untargeted attacks, we maximize CE loss
+                    loss = F.cross_entropy(outputs, target_labels, reduction="none")
+
+                # Compute gradients
+                grad = torch.autograd.grad(
+                    loss.sum(), adv_images_var, retain_graph=False, create_graph=False
+                )[0]
+
+                # Update gradient call counter
+                total_grad_calls += 1
+
+                # Check success to determine which examples to update
+                with torch.no_grad():
+                    if self.targeted:
+                        success = outputs.argmax(dim=1) == target_labels
+                    else:
+                        success = outputs.argmax(dim=1) != labels
+
+                    # Only optimize examples that aren't yet successful
+                    if self.early_stopping and success.all():
+                        break
+
+                    # Mask for active examples (those still being optimized)
+                    active = (
+                        ~success
+                        if self.early_stopping
+                        else torch.ones_like(success, dtype=torch.bool)
+                    )
+
+                    # Skip if no active examples
+                    if not active.any():
+                        break
+
+                # Apply momentum to gradient - higher for targeted attacks
+                grad = momentum * previous_grad + (1 - momentum) * grad
+                previous_grad = grad.clone().detach()
+
+                # Apply multiplier to gradient based on attack type
+                grad = multiplier * grad
+
+                # Conjugate gradient update
+                if i == 0 or prev_grad is None or i % (self.restart_interval // 2) == 0:
+                    # First iteration or restart: use steepest descent direction
+                    direction = -grad
+                    prev_grad = grad.clone()
+                    prev_direction = direction.clone()
+                else:
+                    # Compute beta using Hestenes-Stiefel formula
+                    beta = torch.zeros(images.size(0), device=images.device)
+
+                    for j in range(images.size(0)):
+                        if not active[j]:
+                            continue
+
+                        grad_diff = grad[j].flatten() - prev_grad[j].flatten()
+                        numerator = torch.dot(grad[j].flatten(), grad_diff)
+                        denominator = torch.dot(prev_direction[j].flatten(), grad_diff)
+
+                        # Safeguard against division by zero
+                        if abs(denominator) > 1e-10:
+                            beta[j] = numerator / denominator
+
+                        # Ensure beta is positive and not too large
+                        beta[j] = torch.clamp(beta[j], min=0.0, max=1.0)
+
+                    # Compute new direction: d_i = -g_i + beta * d_{i-1}
+                    direction = torch.zeros_like(grad)
+                    for j in range(images.size(0)):
+                        if active[j]:
+                            direction[j] = -grad[j] + beta[j] * prev_direction[j]
+
+                    # Update previous gradient and direction
+                    prev_grad = grad.clone()
+                    prev_direction = direction.clone()
+
+                # Determine step size based on attack type and progress
+                if self.targeted:
+                    # For targeted attacks, higher step size throughout
+                    progress = i / inner_iterations
+                    if progress < 0.25:
+                        step_size = (
+                            0.1  # Very large steps initially (10x more aggressive)
+                        )
+                    elif progress < 0.75:
+                        step_size = 0.05  # Medium steps in the middle
+                    else:
+                        step_size = 0.01  # Smaller steps at the end for fine-tuning
+                else:
+                    # For untargeted attacks, use smaller constant step size
+                    step_size = 0.01
+
+                # Create a new tensor for the updated adversarial examples
+                new_adv_images = adv_images.clone()
+
+                # Update adversarial examples only for active examples
+                with torch.no_grad():
+                    for j in range(images.size(0)):
+                        if not active[j]:
+                            continue
+
+                        # Normalize direction for L2 norm
+                        current_dir = direction[j : j + 1].clone()
+                        if self.norm.lower() == "l2":
+                            dir_norm = torch.norm(current_dir.flatten())
+                            if dir_norm > 1e-10:
+                                current_dir = current_dir / dir_norm
+
+                        # Take a step in the direction
+                        if self.norm.lower() == "l2":
+                            temp = adv_images[j : j + 1] + step_size * current_dir
+                        else:  # Linf
+                            temp = adv_images[j : j + 1] + step_size * torch.sign(
+                                current_dir
+                            )
+
+                        # Project perturbation to epsilon constraint
+                        temp = project_adversarial_example(
+                            temp, images[j : j + 1], eps, self.norm
+                        )
+
+                        # Ensure valid bounds
+                        temp = torch.clamp(temp, min=min_bound, max=max_bound)
+
+                        # Store the result in the new tensor
+                        new_adv_images[j : j + 1] = temp
+
+                        # Update best adversarial example if this one meets the adversarial condition
+                        # and has smaller L2 distance
+                        pred_class = outputs[j].argmax().item()
+                        if (
+                            self.targeted and pred_class == target_labels[j].item()
+                        ) or (not self.targeted and pred_class != labels[j].item()):
+                            current_dist = torch.norm(
+                                (new_adv_images[j] - images[j]).flatten(), p=2
+                            )
+                            if current_dist < best_l2_dist[j]:
+                                best_l2_dist[j] = current_dist
+                                best_advs[j] = new_adv_images[j].clone()
+
+                # Update adv_images with the new version
+                adv_images = new_adv_images.clone()
+
+                # Print progress periodically
+                if self.verbose and (i + 1) % max(1, inner_iterations // 5) == 0:
+                    with torch.no_grad():
+                        outputs = self.get_logits(adv_images)
+                        if self.targeted:
+                            success_rate = (
+                                outputs.argmax(dim=1) == target_labels
+                            ).float().mean().item() * 100
+                        else:
+                            success_rate = (
+                                outputs.argmax(dim=1) != labels
+                            ).float().mean().item() * 100
+                        print(
+                            f"Restart {restart+1}/{max_restarts}, Iteration {i+1}/{inner_iterations}, "
+                            f"Success rate: {success_rate:.2f}%"
+                        )
+
+            # Save current adv_images as a potential restart point
+            restart_points.append(adv_images.clone())
+
+        # End timing
+        end_time = time.time()
+
+        # Use the best adversarial examples found across all restarts
+        adv_images = best_advs.clone()
+
+        # One final refinement for targeted attacks
+        if self.targeted:
+            with torch.no_grad():
+                outputs = self.get_logits(adv_images)
+                success = outputs.argmax(dim=1) == target_labels
+
+                # If we have at least one successful example, use binary search to find
+                # minimal perturbation that maintains the target class
+                for j in range(images.size(0)):
+                    if success[j]:
+                        # Binary search for minimal perturbation
+                        original = images[j : j + 1]
+                        perturbed = adv_images[j : j + 1].clone()
+                        delta = perturbed - original
+
+                        # Start with current successful perturbation
+                        alpha_low = 0.0  # Lower bound = no perturbation
+                        alpha_high = 1.0  # Upper bound = full perturbation
+                        best_alpha = 1.0  # Start with full perturbation
+
+                        # Binary search for 10 steps
+                        for search_step in range(10):
+                            alpha_mid = (alpha_low + alpha_high) / 2
+                            mid_point = original + alpha_mid * delta
+
+                            # Check if midpoint is still adversarial
+                            mid_output = self.get_logits(mid_point)
+                            mid_class = mid_output.argmax(dim=1)
+
+                            if mid_class.item() == target_labels[j].item():
+                                # Still successful, can reduce perturbation
+                                alpha_high = alpha_mid
+                                best_alpha = alpha_mid  # Save this successful alpha
+                            else:
+                                # Not successful, need more perturbation
+                                alpha_low = alpha_mid
+
+                        # Use the minimal successful perturbation found
+                        refined = original + best_alpha * delta
+                        adv_images[j : j + 1] = refined
 
         # Evaluate success and compute perturbation metrics
         success_rate, success_mask, pred_info = self.evaluate_attack_success(
             images, adv_images, labels
         )
 
-        # Manually update attack success statistics for accurate metrics
+        # Update metrics
+        self.total_iterations += n_iter * images.size(0)
+        self.total_gradient_calls += total_grad_calls
         self.attack_success_count += success_mask.sum().item()
+        self.total_samples += images.size(0)
+        self.total_time += end_time - start_time
 
-        # Compute perturbation metrics on all samples, not just successful ones
+        # Compute perturbation metrics
         perturbation_metrics = self.compute_perturbation_metrics(
-            images, adv_images, None  # Pass None to compute metrics on all samples
+            images, adv_images, None  # Use all samples
         )
-
-        # Update final metrics counters - but avoid double counting
-        self.attack_success_count += batch_attack_success_count
-        # Don't increment total_samples again, already done above
 
         # Log metrics if verbose
         if self.verbose:
@@ -581,13 +484,9 @@ class CG(Attack):
                 f"L∞={perturbation_metrics['linf_norm']:.6f}, "
                 f"SSIM={perturbation_metrics['ssim']:.4f}"
             )
+            print(f"Gradient calls: {total_grad_calls}")
             print(
-                f"Iterations: {metrics['iterations']:.1f}, Gradient calls: {metrics['gradient_calls']:.1f}"
+                f"Time per sample: {(end_time - start_time) * 1000 / images.size(0):.2f}ms"
             )
-            print(f"Time per sample: {metrics['time_per_sample']*1000:.2f}ms")
-
-        # End timing
-        end_time = time.time()
-        self.total_time += end_time - start_time
 
         return adv_images
