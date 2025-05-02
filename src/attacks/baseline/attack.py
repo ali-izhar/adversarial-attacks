@@ -121,10 +121,14 @@ class Attack(object):
         self.total_time = 0
         self.attack_success_count = 0
         self.total_samples = 0
-        # Reset perturbation metrics lists
+        # Reset perturbation metrics lists (successful attacks only)
         self.l2_norms = []
         self.linf_norms = []
         self.ssim_values = []
+        # Reset perturbation metrics lists (ALL samples)
+        self.all_l2_norms = []
+        self.all_linf_norms = []
+        self.all_ssim_values = []
 
     def get_metrics(self):
         """Return dictionary of metrics for paper evaluation."""
@@ -134,32 +138,30 @@ class Attack(object):
             avg_iterations = 0
             avg_grad_calls = 0
             avg_time = 0
+            # Report 0 perturbation if no samples processed
             avg_l2 = 0.0
             avg_linf = 0.0
-            avg_ssim = 1.0
+            avg_ssim = 1.0  # Default SSIM is 1 (perfect similarity)
         else:
             success_rate = 100 * self.attack_success_count / self.total_samples
             avg_iterations = self.total_iterations / self.total_samples
             avg_grad_calls = self.total_gradient_calls / self.total_samples
             avg_time = self.total_time / self.total_samples
 
-            # Use only successful attacks for perturbation metrics
-            if self.attack_success_count > 0 and len(self.l2_norms) > 0:
-                # For attacks that track per-sample norms, ensure we only use successful samples
-                if len(self.l2_norms) == self.total_samples:
-                    # We have metrics for all samples, filter for successful ones
-                    avg_l2 = np.mean(self.l2_norms[-self.attack_success_count :])
-                    avg_linf = np.mean(self.linf_norms[-self.attack_success_count :])
-                    avg_ssim = np.mean(self.ssim_values[-self.attack_success_count :])
-                else:
-                    # We already have only successful metrics
-                    avg_l2 = np.mean(self.l2_norms)
-                    avg_linf = np.mean(self.linf_norms)
-                    avg_ssim = np.mean(self.ssim_values)
-            else:
-                avg_l2 = 0.0
-                avg_linf = 0.0
-                avg_ssim = 1.0
+            # Calculate average perturbation across ALL samples
+            avg_l2 = np.mean(self.all_l2_norms) if self.all_l2_norms else 0.0
+            avg_linf = np.mean(self.all_linf_norms) if self.all_linf_norms else 0.0
+            avg_ssim = np.mean(self.all_ssim_values) if self.all_ssim_values else 1.0
+
+            # --- Optional: Keep metrics for successful attacks if needed ---
+            # if self.attack_success_count > 0 and len(self.l2_norms) > 0:
+            #     avg_l2_success = np.mean(self.l2_norms)
+            #     avg_linf_success = np.mean(self.linf_norms)
+            #     avg_ssim_success = np.mean(self.ssim_values)
+            # else:
+            #     avg_l2_success = 0.0
+            #     avg_linf_success = 0.0
+            #     avg_ssim_success = 1.0
 
         metrics = {
             "attack_name": self.attack,
@@ -169,9 +171,13 @@ class Attack(object):
             "iterations": avg_iterations,
             "gradient_calls": avg_grad_calls,
             "time_per_sample": avg_time,
-            "l2_norm": avg_l2,
-            "linf_norm": avg_linf,
-            "ssim": avg_ssim,
+            "l2_norm": avg_l2,  # Now represents average over ALL samples
+            "linf_norm": avg_linf,  # Now represents average over ALL samples
+            "ssim": avg_ssim,  # Now represents average over ALL samples
+            # --- Optional: Add success-specific metrics if needed ---
+            # "l2_norm_successful": avg_l2_success,
+            # "linf_norm_successful": avg_linf_success,
+            # "ssim_successful": avg_ssim_success,
         }
         return metrics
 
@@ -248,12 +254,17 @@ class Attack(object):
             success_mask: Optional boolean mask indicating which samples were successfully attacked
 
         Returns:
-            dict: Dictionary with L2 norm, L-inf norm, and SSIM
+            dict: Dictionary with AVERAGE L2 norm, L-inf norm, and SSIM for the BATCH
 
         Note:
             For accurate reporting, we denormalize images to [0,1] range
             before computing perturbation metrics.
+            Stores metrics for ALL samples and for SUCCESSFUL samples separately.
         """
+        batch_size = original_images.size(0)
+        if batch_size == 0:
+            return {"l2_norm": 0.0, "linf_norm": 0.0, "ssim": 1.0}
+
         # Denormalize images for more intuitive metrics in [0,1] space
         original_denorm = self.denormalize(original_images)
         adversarial_denorm = self.denormalize(adversarial_images)
@@ -261,91 +272,86 @@ class Attack(object):
         # Calculate perturbation in denormalized space [0,1]
         perturbation = adversarial_denorm - original_denorm
 
-        # L2 norm (Euclidean distance) - normalize by image dimensions
-        # This gives the average per-pixel, per-channel distortion
+        # --- L2 norm (Euclidean distance) per sample ---
         pixel_count = (
             original_images.size(1) * original_images.size(2) * original_images.size(3)
-        )  # C * H * W
-        l2_norm = torch.norm(
-            perturbation.view(original_images.size(0), -1), p=2, dim=1
-        ) / torch.sqrt(torch.tensor(pixel_count).float())
-
-        # L-inf norm (maximum absolute pixel difference)
-        linf_norm = torch.norm(
-            perturbation.view(original_images.size(0), -1), p=float("inf"), dim=1
+        )
+        # Ensure pixel_count is float for division
+        pixel_count_float = torch.tensor(
+            pixel_count, device=perturbation.device, dtype=torch.float32
         )
 
-        # Calculate mean values for the batch (before filtering for successful attacks)
-        l2_norm_mean = l2_norm.mean().item()
-        linf_norm_mean = linf_norm.mean().item()
+        l2_norm_per_sample = torch.norm(perturbation.view(batch_size, -1), p=2, dim=1)
+        # Normalize by sqrt(number of elements) for per-element average
+        l2_norm_per_sample_normalized = l2_norm_per_sample / torch.sqrt(
+            pixel_count_float
+        )
 
-        # Store metrics only for successful attacks if a success mask is provided
-        if success_mask is not None:
-            # Filter for successful attacks only
-            if success_mask.any():
-                successful_l2 = l2_norm[success_mask].detach().cpu().numpy()
-                successful_linf = linf_norm[success_mask].detach().cpu().numpy()
+        # --- L-inf norm (max abs difference) per sample ---
+        linf_norm_per_sample = torch.norm(
+            perturbation.view(batch_size, -1), p=float("inf"), dim=1
+        )
 
-                # Store only the successful metrics
-                self.l2_norms.extend(successful_l2)
-                self.linf_norms.extend(successful_linf)
+        # Store normalized L2 norms for ALL samples in the batch
+        self.all_l2_norms.extend(l2_norm_per_sample_normalized.detach().cpu().numpy())
+        self.all_linf_norms.extend(linf_norm_per_sample.detach().cpu().numpy())
 
-            # For SSIM, we'll also filter by success mask
-            filter_by_success = True
-        else:
-            # No success mask provided, store all metrics (legacy behavior)
-            self.l2_norms.extend(l2_norm.detach().cpu().numpy())
-            self.linf_norms.extend(linf_norm.detach().cpu().numpy())
-            filter_by_success = False
-
-        # SSIM (structural similarity) - computed in denormalized [0,1] space
+        # --- SSIM calculation (per sample) ---
+        ssim_vals_all = []
         if SSIM_AVAILABLE:
-            batch_size = original_images.size(0)
-            ssim_vals = []
-            success_indices = []
-
-            # If success mask provided, get indices of successful attacks
-            if filter_by_success and success_mask is not None:
-                success_indices = success_mask.nonzero().flatten().tolist()
-            else:
-                # Process all samples
-                success_indices = list(range(batch_size))
-
-            # Process each successful image in the batch individually
-            for i in success_indices:
-                # Get individual images in denormalized [0,1] range
+            for i in range(batch_size):
                 orig_img = original_denorm[i].detach().cpu().permute(1, 2, 0).numpy()
                 adv_img = adversarial_denorm[i].detach().cpu().permute(1, 2, 0).numpy()
-
-                # Clamp images to [0, 1] range for SSIM calculation
                 orig_img = np.clip(orig_img, 0, 1)
                 adv_img = np.clip(adv_img, 0, 1)
-
-                # Calculate SSIM using skimage
                 try:
-                    # Try newer scikit-image API (>=0.19.0) with channel_axis
                     ssim_val = structural_similarity(
                         orig_img, adv_img, channel_axis=2, data_range=1.0
                     )
                 except TypeError:
-                    # Fall back to older API (<0.19.0) with multichannel
                     ssim_val = structural_similarity(
                         orig_img, adv_img, multichannel=True, data_range=1.0
                     )
-
-                # Ensure SSIM is in [0, 1] range
                 ssim_val = max(0.0, min(1.0, ssim_val))
-                ssim_vals.append(ssim_val)
-
-            # Average SSIM across successful samples
-            ssim_val = np.mean(ssim_vals) if ssim_vals else 1.0
-
-            # Store SSIM values
-            self.ssim_values.extend(ssim_vals)
+                ssim_vals_all.append(ssim_val)
         else:
-            ssim_val = 1.0  # Default value when SSIM is not available
+            ssim_vals_all = [
+                1.0
+            ] * batch_size  # Default to 1.0 if skimage not available
 
-        return {"l2_norm": l2_norm_mean, "linf_norm": linf_norm_mean, "ssim": ssim_val}
+        # Store SSIM for ALL samples
+        self.all_ssim_values.extend(ssim_vals_all)
+
+        # --- Store metrics ONLY for successful attacks ---
+        if success_mask is not None and success_mask.any():
+            # Filter NORMALIZED L2 norms for successful attacks
+            successful_l2_normalized = (
+                l2_norm_per_sample_normalized[success_mask].detach().cpu().numpy()
+            )
+            successful_linf = (
+                linf_norm_per_sample[success_mask].detach().cpu().numpy()
+            )  # Linf is already max, no normalization needed
+            self.l2_norms.extend(
+                successful_l2_normalized
+            )  # Store normalized successful L2
+            self.linf_norms.extend(successful_linf)
+
+            # Filter SSIM for successful attacks
+            successful_ssim = [
+                ssim_vals_all[i] for i, success in enumerate(success_mask) if success
+            ]
+            self.ssim_values.extend(successful_ssim)
+
+        # Return the BATCH average metrics (using NORMALIZED L2)
+        batch_avg_l2_normalized = l2_norm_per_sample_normalized.mean().item()
+        batch_avg_linf = linf_norm_per_sample.mean().item()
+        batch_avg_ssim = np.mean(ssim_vals_all) if ssim_vals_all else 1.0
+
+        return {
+            "l2_norm": batch_avg_l2_normalized,  # Return normalized batch average
+            "linf_norm": batch_avg_linf,
+            "ssim": batch_avg_ssim,
+        }
 
     def evaluate_attack_success(self, original_images, adversarial_images, true_labels):
         """Evaluate if attack was successful (caused misclassification).

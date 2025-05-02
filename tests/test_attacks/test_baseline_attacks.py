@@ -12,7 +12,6 @@ import yaml
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import torch
-import numpy as np
 
 # Add the project root to the path
 project_root = os.path.dirname(
@@ -244,70 +243,8 @@ def test_attack(attack, model, dataset, attack_name, args):
         # Attack only the correctly classified samples
         adversarial = attack(correct_inputs, correct_labels)
 
-        # Get model predictions on adversarial examples
-        with torch.no_grad():
-            adv_outputs = model(adversarial)
-            _, adv_preds = torch.max(adv_outputs, 1)
-            model_accuracy = (adv_preds == correct_labels).float().mean().item() * 100
-
-        # Get perturbation metrics without updating the attack's internal metrics
-        # (internal metrics were already updated during the attack() call)
-        success_mask = (
-            adv_preds != correct_labels
-            if not attack.targeted
-            else adv_preds == attack.get_target_label(correct_inputs, correct_labels)
-        )
-
-        # Use numpy.mean for Python lists
-        perturbation_metrics = {
-            "l2_norm": (
-                np.mean(attack.l2_norms[-len(success_mask) :])
-                if len(attack.l2_norms) > 0
-                else 0.0
-            ),
-            "linf_norm": (
-                np.mean(attack.linf_norms[-len(success_mask) :])
-                if len(attack.linf_norms) > 0
-                else 0.0
-            ),
-            "ssim": (
-                np.mean(attack.ssim_values[-len(success_mask) :])
-                if len(attack.ssim_values) > 0
-                else 1.0
-            ),
-        }
-
-        # Display batch results
-        print(
-            f"  Batch {batch_idx+1}/{total_batches}: "
-            f"Attack Success = {100-model_accuracy:.2f}%, "
-            f"Model Accuracy = {model_accuracy:.2f}%, "
-            f"L2: {perturbation_metrics['l2_norm']:.4f}, "
-            f"L∞: {perturbation_metrics['linf_norm']:.4f}, "
-            f"SSIM: {perturbation_metrics['ssim']:.4f}"
-        )
-
-        # Save a successful example for visualization
-        if success_mask.any() and len(successful_examples) < args.num_vis:
-            success_idx = torch.where(success_mask)[0][0].item()
-
-            original_img = correct_inputs[success_idx].cpu()
-            adversarial_img = adversarial[success_idx].cpu()
-            original_label_idx = correct_labels[success_idx].item()
-            adv_pred_idx = adv_preds[success_idx].item()
-
-            successful_examples.append(
-                {
-                    "original": original_img,
-                    "adversarial": adversarial_img,
-                    "original_label": class_names[original_label_idx],
-                    "original_idx": original_label_idx,
-                    "adv_prediction": class_names[adv_pred_idx],
-                    "adv_idx": adv_pred_idx,
-                }
-            )
-
-    # Get metrics from the attack
+    # Get metrics from the attack AFTER processing all batches
+    # This now correctly aggregates metrics for both targeted/untargeted
     attack_metrics = attack.get_metrics()
 
     # Combine metrics
@@ -333,18 +270,11 @@ def test_attack(attack, model, dataset, attack_name, args):
     print(f"  Average iterations: {metrics['iterations']:.2f}")
     print(f"  Average gradient calls: {metrics['gradient_calls']:.2f}")
 
-    # Create visualizations
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    for i, example in enumerate(successful_examples):
-        plot_images(
-            original=example["original"],
-            adversarial=example["adversarial"],
-            attack_name=attack_name,
-            original_label=f"{example['original_label']} ({example['original_idx']})",
-            adv_prediction=f"{example['adv_prediction']} ({example['adv_idx']})",
-            save_path=f"{args.output_dir}/{attack_name.lower().replace(' ', '_')}_example_{i+1}.png",
-        )
+    attack_mode = "targeted" if args.targeted else "untargeted"
+    print(f"\nResults and visualizations saved to {args.output_dir}")
+    print(f"Attack mode: {attack_mode.upper()}")
+    if args.targeted:
+        print(f"Target method: {args.target_method}")
 
     return metrics
 

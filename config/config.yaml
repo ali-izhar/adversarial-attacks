@@ -26,13 +26,16 @@ evaluation:
 
 # Attack method configuration
 attack:
-  method: "CW"  # Options: FGSM, FFGSM, DeepFool, CW, PGD, CG, LBFGS
+  method: "FGSM"  # Options: FGSM, FFGSM, DeepFool, CW, PGD, CG, LBFGS
   norm_types:
     - "Linf" 
     - "L2"
   
   # Method-specific parameters
   params:
+
+  # BASELINE ATTACKS
+  # ------------------
     FGSM:
       untargeted:
         loss_fn: "cross_entropy"
@@ -84,6 +87,9 @@ attack:
         learning_rate: 0.01        # Same learning rate
         abort_early: true          # Enable early stopping for efficiency
     
+
+    # ADVERSARIAL ATTACKS
+    # ---------------------
     CG:
       untargeted:
         loss_fn: "cross_entropy"

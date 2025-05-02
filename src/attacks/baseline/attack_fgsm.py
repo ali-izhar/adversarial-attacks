@@ -69,10 +69,6 @@ class FGSM(Attack):
         labels = labels.clone().detach().to(self.device)
         batch_size = images.size(0)
 
-        # For targeted attacks, get the target labels
-        if self.targeted:
-            target_labels = self.get_target_label(images, labels)
-
         # Calculate normalized min/max bounds for valid pixel values
         min_bound = (-self.mean / self.std).to(device=images.device, dtype=images.dtype)
         max_bound = ((1 - self.mean) / self.std).to(
@@ -82,90 +78,81 @@ class FGSM(Attack):
         min_bound = min_bound.view(1, 3, 1, 1)
         max_bound = max_bound.view(1, 3, 1, 1)
 
-        # Keep track of best adversarial examples (for metrics)
-        best_adv_images = images.clone().detach()
-        best_L2 = 1e10 * torch.ones((len(images))).to(self.device)
-        dim = len(images.shape)
-
         # Use cross-entropy loss for classification tasks
-        # This implements L(f(x+δ), y) from the paper's formulation
         loss = nn.CrossEntropyLoss()
-        MSELoss = nn.MSELoss(reduction="none")  # Used for L2 distance calculation
-        Flatten = (
-            nn.Flatten()
-        )  # Needed to flatten spatial dimensions for L2 calculation
-
-        # Enable gradient computation for input images
-        images.requires_grad = True
-
-        # Get model predictions - this increments gradient call counter in the base class
-        outputs = self.get_logits(images)  # f(x) in the paper
 
         # FGSM is a single-step method (one gradient computation per sample)
         # We count this as one iteration per sample in our metrics
         self.total_iterations += batch_size
 
-        # Calculate loss based on attack mode
+        # Create adversarial examples with different logic for targeted vs untargeted attacks
         if self.targeted:
-            # For targeted attacks, minimize loss with respect to target labels
-            # This is an extension of the original FGSM but follows the same principle
-            cost = -loss(
-                outputs, target_labels
-            )  # Negative sign to minimize instead of maximize
+            # For targeted attacks, get the target labels and apply targeted perturbation
+            target_labels = self.get_target_label(images, labels)
+
+            # Enable gradient computation for input images
+            images.requires_grad = True
+
+            # Get model predictions
+            outputs = self.get_logits(images)
+
+            # For targeted attacks, we want to minimize the loss with respect to target class
+            cost = loss(outputs, target_labels)
+
+            # Compute gradients
+            grad = torch.autograd.grad(
+                cost, images, retain_graph=False, create_graph=False
+            )[0]
+
+            # For targeted attacks, move AWAY from gradient to move TOWARD target class
+            adv_images = images - self.eps * grad.sign()
+
+            # Clamp to valid normalized range
+            adv_images = torch.clamp(adv_images, min=min_bound, max=max_bound).detach()
+
+            # Track how long the attack took (before metric calculation)
+            end_time = time.time()
+            self.total_time += end_time - start_time
+
+            # Evaluate attack success using the base class method
+            # This updates self.attack_success_count and self.total_samples correctly
+            _success_rate, success_mask, _predictions = self.evaluate_attack_success(
+                images, adv_images, labels  # Use original labels for evaluation context
+            )
+
+            # Calculate and store perturbation metrics for successful attacks using base class method
+            # This appends L2, Linf, and SSIM for successful attacks only
+            self.compute_perturbation_metrics(images, adv_images, success_mask)
+
+            # FGSM iteration count is already handled above for the batch
+
+            # Return the generated adversarial images
+            return adv_images
         else:
-            # For untargeted attacks, maximize loss with respect to true labels
-            # This implements max_δ L(f(x+δ), y) from the paper
+            # Original untargeted FGSM implementation
+            images.requires_grad = True
+            outputs = self.get_logits(images)
             cost = loss(outputs, labels)
+            grad = torch.autograd.grad(
+                cost, images, retain_graph=False, create_graph=False
+            )[0]
+            adv_images = images + self.eps * grad.sign()
 
-        # Compute gradients of loss with respect to input images
-        # This calculates ∇_x L(f(x), y) from the paper
-        grad = torch.autograd.grad(
-            cost, images, retain_graph=False, create_graph=False
-        )[0]
+            # Clamp to valid normalized range
+            adv_images = torch.clamp(adv_images, min=min_bound, max=max_bound).detach()
 
-        # FGSM update: add signed gradients scaled by epsilon
-        # This implements x_adv = x + ε * sign(∇_x L(f(x), y)) from the paper
-        adv_images = images + self.eps * grad.sign()
+            # Track how long the attack took (before metric calculation)
+            end_time = time.time()
+            self.total_time += end_time - start_time
 
-        # Clamp to valid normalized range
-        # This enforces the constraint ||δ||_∞ ≤ ε indirectly by ensuring
-        # the adversarial examples remain valid images
-        adv_images = torch.clamp(adv_images, min=min_bound, max=max_bound).detach()
+            # Evaluate success of the attack and track metrics using base class method
+            _success_rate, success_mask, _predictions = self.evaluate_attack_success(
+                images, adv_images, labels
+            )
 
-        # Calculate L2 distance between original and adversarial images
-        # This is for tracking metrics - exactly like in CW
-        current_L2 = MSELoss(Flatten(adv_images), Flatten(images)).sum(dim=1)
+            # Calculate perturbation metrics using the base class method for final report
+            # Using the direct adv_images and the success_mask from evaluate_attack_success
+            self.compute_perturbation_metrics(images, adv_images, success_mask)
 
-        # Evaluate success of the attack and track metrics (exactly like CW)
-        with torch.no_grad():
-            adv_outputs = self.get_output_with_eval_nograd(adv_images)
-            pre = torch.argmax(adv_outputs, 1)
-
-            # Different success conditions based on attack mode
-            if self.targeted:
-                # For targeted attacks, we want predictions to match target labels
-                condition = (pre == target_labels).float()
-            else:
-                # For untargeted attacks, we want predictions to differ from true labels
-                condition = (pre != labels).float()
-
-            # Update best adversarial examples and track L2 norms - exactly like in CW
-            mask = condition * (best_L2 > current_L2)
-            best_L2 = mask * current_L2 + (1 - mask) * best_L2
-
-            # Update best adversarial images (only keep successful attacks with better L2)
-            mask = mask.view([-1] + [1] * (dim - 1))
-            best_adv_images = mask * adv_images + (1 - mask) * best_adv_images
-
-            # Update attack success count (following CW's approach)
-            self.attack_success_count += condition.sum().item()
-            self.total_samples += batch_size
-
-        # Calculate perturbation metrics for final report
-        self.compute_perturbation_metrics(images, best_adv_images, condition.bool())
-
-        # Track how long the attack took
-        end_time = time.time()
-        self.total_time += end_time - start_time
-
-        return best_adv_images
+            # Return the directly calculated adversarial images
+            return adv_images
