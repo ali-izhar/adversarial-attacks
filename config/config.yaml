@@ -8,7 +8,7 @@
 # Dataset configuration
 dataset:
   name: "imagenet"
-  num_images: 64    # Number of images to evaluate per model
+  num_images: 10    # Number of images to evaluate per model
   image_dir: "data"
 
 # Model configuration
