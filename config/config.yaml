@@ -1,14 +1,9 @@
 # Configuration for adversarial attack method evaluation
 
-##############################################################
-# ALL CONFIGS BELOW ARE DEFAULT VALUES THAT CAN BE OVERRIDEN 
-# IN THE DEMO.PY SCRIPT THROUGH COMMAND LINE ARGUMENTS
-##############################################################
-
 # Dataset configuration
 dataset:
   name: "imagenet"
-  num_images: 10    # Number of images to evaluate per model
+  num_images: 1000    # Number of images to evaluate per model
   image_dir: "data"
 
 # Model configuration
@@ -137,36 +132,6 @@ attack:
         eps_values:
           Linf: [16/255, 32/255]   # Larger Linf epsilons
           L2: [2.0, 3.0]           # Larger L2 epsilons
-
-    LBFGS:
-      untargeted:
-        loss_fn: "cross_entropy"
-        n_iterations: 50           # Standard from Zhu et al. (2019)
-        history_size: 10           # Common value for L-BFGS memory
-        line_search_fn: "armijo"   # Efficient line search
-        max_line_search: 15        # Balance between precision and speed
-        initial_step: 3.0          # Aggressive initial step size
-        rand_init: true           # Random initialization
-        init_std: 0.05            # Standard deviation for initialization
-        grad_scale: 1.0           # No gradient scaling
-        early_stopping: true      # Stop when attack succeeds
-        eps_values:
-          Linf: [8/255, 16/255]   # Standard bounds from literature
-          L2: [1.0, 2.0]          # Common L2 bounds
-      targeted:
-        loss_fn: "cross_entropy"
-        n_iterations: 100          # More iterations for targeted attacks
-        history_size: 15           # Larger memory for better Hessian approximation
-        line_search_fn: "strong_wolfe" # More precise line search
-        max_line_search: 20        # More line search iterations
-        initial_step: 2.0          # More conservative step size
-        rand_init: true           # Random initialization
-        init_std: 0.01            # Smaller initialization
-        grad_scale: 1.5           # Slightly aggressive updates
-        early_stopping: true      # Stop when attack succeeds
-        eps_values:
-          Linf: [16/255, 32/255]  # Larger bounds for targeted
-          L2: [2.0, 4.0]          # Larger L2 bounds
 
 # Target method configuration for targeted attacks
 target_methods:

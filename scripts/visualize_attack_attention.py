@@ -53,8 +53,8 @@ def get_args():
     parser.add_argument(
         "--image_idx",
         type=int,
-        default=175,
-        help="Index of the image in the dataset (default: 175 - a saluki)",
+        default=268,
+        help="Index of the image in the dataset (default: 268 - a timber wolf)",
     )
     parser.add_argument(
         "--data_dir",
@@ -481,14 +481,15 @@ def visualize_attack_grid(
     num_cols = 1 + num_attacks
     num_rows = 2
 
-    # Configure Matplotlib for LaTeX
+    # Configure matplotlib to use LaTeX for text rendering
     plt.rcParams.update(
         {
             "text.usetex": True,
             "font.family": "serif",
-            "font.serif": ["Computer Modern"],
-            "font.size": 10,
-            "axes.titlesize": 11,  # Slightly adjusted sizes
+            "font.serif": ["Computer Modern Roman"],
+            "font.size": 11,
+            "axes.titlesize": 14,
+            "axes.labelsize": 12,
         }
     )
 
@@ -555,7 +556,7 @@ def visualize_attack_grid(
 
         axs[0, col_idx].imshow(cam_overlay_untargeted)
         axs[0, col_idx].set_title(
-            r"{} (U)\\Pred: {} ({:.1f}\%) ".format(
+            r"{} (U)\\{} ({:.1f}\%) ".format(
                 name.replace("_", " "), adv_label_latex, adv_conf_untargeted
             )
         )
@@ -586,7 +587,7 @@ def visualize_attack_grid(
                 adv_label_targeted.replace("_", " ").replace("%", r"\%")
             )
             axs[1, col_idx].set_title(
-                r"{} Grad-CAM (T)\\Pred: {} ({:.1f}\%) ".format(
+                r"{} Grad-CAM (T)\\{} ({:.1f}\%) ".format(
                     name.replace("_", " "), adv_label_latex, adv_conf_targeted
                 )
             )

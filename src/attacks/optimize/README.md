@@ -65,55 +65,12 @@ $$\mathcal{L}(f(x_t + \alpha_t d_t), y) \leq \mathcal{L}(f(x_t), y) + c_1 \alpha
 
 For quadratic objectives, CG converges in at most $n$ iterations (where $n$ is the problem dimension). For non-quadratic objectives, CG with periodic restarts still offers superlinear convergence rates under certain conditions.
 
-## 3. Limited-memory BFGS (L-BFGS)
-
-L-BFGS approximates the inverse Hessian matrix using a limited history of positions and gradients, offering quasi-Newton acceleration without storing the full Hessian.
-
-### Algorithm
-
-Initialize $x_0 = x$ and iterate:
-
-1. Compute search direction using two-loop recursion to implicitly apply $H_k \approx [\nabla^2 \mathcal{L}(f(x_k), y)]^{-1}$:
-   - $q = g_k$
-   - For $i = k-1, k-2, ..., k-m$:
-     - $\alpha_i = \rho_i s_i^T q$
-     - $q = q - \alpha_i y_i$
-   - $r = H_0^k q$ (with $H_0^k = \frac{s_{k-1}^T y_{k-1}}{y_{k-1}^T y_{k-1}} I$)
-   - For $i = k-m, ..., k-1$:
-     - $\beta = \rho_i y_i^T r$
-     - $r = r + s_i(\alpha_i - \beta)$
-   - Set direction $d_k = -r$
-2. Line search: Find $\alpha_k$ satisfying Wolfe conditions
-3. Update: $x_{k+1} = \Pi_{\mathcal{B}_\epsilon(x)}\left(x_k + \alpha_k d_k\right)$
-4. Store history:
-   - $s_k = x_{k+1} - x_k$
-   - $y_k = g_{k+1} - g_k$
-   - $\rho_k = \frac{1}{y_k^T s_k}$
-
-Where:
-- $s_i$ is the position difference at iteration $i$
-- $y_i$ is the gradient difference at iteration $i$
-- $\rho_i = \frac{1}{y_i^T s_i}$
-- $m$ is the history size
-
-### Wolfe Conditions
-
-1. Sufficient decrease (Armijo): $\mathcal{L}(f(x_k + \alpha_k d_k), y) \leq \mathcal{L}(f(x_k), y) + c_1 \alpha_k g_k^T d_k$
-2. Curvature: $|g_{k+1}^T d_k| \leq c_2 |g_k^T d_k|$
-
-Where $0 < c_1 < c_2 < 1$ are constants (typically $c_1 = 10^{-4}$, $c_2 = 0.9$).
-
-### Convergence
-
-L-BFGS exhibits superlinear convergence rates for strongly convex functions with Lipschitz continuous Hessians. For non-convex problems, it generally converges faster than first-order methods.
-
 ## Comparative Analysis
 
 Each method offers different trade-offs:
 
 - **PGD**: Simplest to implement and most robust, but slower convergence
 - **CG**: Better convergence than PGD and moderate memory requirements
-- **L-BFGS**: Fastest convergence but more complex and potentially less stable for highly non-convex problems
 
 The choice between methods depends on factors such as problem size, available computational resources, and the need for precision versus speed.
 
@@ -122,4 +79,3 @@ The choice between methods depends on factors such as problem size, available co
 1. Goodfellow, I. J., Shlens, J., & Szegedy, C. (2014). Explaining and harnessing adversarial examples. arXiv preprint arXiv:1412.6572.
 2. Nocedal, J., & Wright, S. (2006). Numerical optimization. Springer Science & Business Media.
 3. Hestenes, M. R., & Stiefel, E. (1952). Methods of conjugate gradients for solving linear systems. Journal of Research of the National Bureau of Standards, 49(6), 409-436.
-4. Liu, D. C., & Nocedal, J. (1989). On the limited memory BFGS method for large scale optimization. Mathematical Programming, 45(1-3), 503-528.

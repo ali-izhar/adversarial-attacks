@@ -614,7 +614,3 @@ class PGD(Attack):
                 print(f"  Avg Grad Calls per sample: {avg_grads:.2f}")
 
         return final_adv_images
-
-    # Removed optimize_with_normalized_bounds - integrated logic into forward/optimizer call
-
-    # Removed get_metrics override - use base class implementation

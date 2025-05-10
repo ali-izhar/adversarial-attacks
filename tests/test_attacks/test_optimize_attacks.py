@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Tests for all optimization attacks (PGD, CG, LBFGS) on a small sample of ImageNet data.
+"""Tests for all optimization attacks (PGD, CG) on a small sample of ImageNet data.
 
 USAGE::
     >>> python -m tests.test_attacks.test_optimize_attacks
@@ -22,7 +22,7 @@ sys.path.insert(0, project_root)
 
 from src.datasets.imagenet import get_dataset, get_dataloader
 from src.models.wrappers import get_model
-from src.attacks import CG, PGD, LBFGS
+from src.attacks import CG, PGD
 
 
 def load_config(config_path):
@@ -296,7 +296,7 @@ def create_attack(
 
     Args:
         model: The model to attack
-        attack_type: Type of attack (e.g., "CG", "LBFGS", "PGD")
+        attack_type: Type of attack (e.g., "CG", "PGD")
         config: Configuration dictionary
         targeted: Whether the attack is targeted
         norm_override: Override the default norm with this value if provided
@@ -344,35 +344,6 @@ def create_attack(
             rand_init=params.get("rand_init", False),  # Get rand_init
         )
         attack_name = f"CG ({norm_type}, ε={eps:.4f})"
-
-    elif attack_type == "LBFGS":
-        params = attack_params["LBFGS"][attack_mode]
-        if norm_type not in params["eps_values"]:
-            print(
-                f"Warning: {norm_type} not found in LBFGS config for {attack_mode}, falling back to Linf"
-            )
-            norm_type = "Linf"
-        eps_value = params["eps_values"][norm_type][0]
-        eps = parse_fraction(eps_value)
-        n_iterations = params.get("n_iterations", 50)
-        history_size = params.get("history_size", 10)
-        rand_init = params.get("rand_init", True)
-        init_std = params.get("init_std", 0.01)
-        line_search_fn = params.get("line_search_fn", "strong_wolfe")
-        max_line_search = params.get("max_line_search", 10)
-
-        attack = LBFGS(
-            model,
-            norm=norm_type,
-            eps=eps,
-            n_iterations=n_iterations,
-            history_size=history_size,
-            rand_init=rand_init,
-            init_std=init_std,
-            line_search_fn=line_search_fn,
-            max_line_search=max_line_search,
-        )
-        attack_name = f"LBFGS ({norm_type}, ε={eps:.4f})"
 
     elif attack_type == "PGD":
         params = attack_params["PGD"][attack_mode]
@@ -490,7 +461,7 @@ def main(args):
     attack_types_to_test = set()
 
     if "all" in args.attacks:
-        attack_types_to_test.update(["CG", "LBFGS", "PGD"])
+        attack_types_to_test.update(["CG", "PGD"])
     else:
         for attack_type in args.attacks:
             attack_types_to_test.add(attack_type.upper())
@@ -622,7 +593,7 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["all"],
-        choices=["all", "cg", "lbfgs", "pgd"],
+        choices=["all", "cg", "pgd"],
         help="Which attacks to test",
     )
 

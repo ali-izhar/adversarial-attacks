@@ -65,28 +65,11 @@ Key parameters:
 - `restart_interval`: Frequency of direction resets
 - `backtracking_factor`: Rate to reduce step size during line search
 
-### 3. L-BFGS Attack
-
-The Limited-memory BFGS attack (`LBFGS`) approximates second-order information for faster convergence:
-
-1. **Initialization**: Same as other methods
-2. **Iteration**:
-   - Compute search direction using two-loop recursion to approximate inverse Hessian
-   - Perform line search satisfying Wolfe conditions
-   - Update image and projection
-   - Store position and gradient differences for Hessian approximation
-3. **Memory**: Maintain limited history (typically 5-20 iterations) to approximate Hessian
-
-Key parameters:
-- `history_size`: Number of past iterations to store
-- `line_search_fn`: Search method ('strong_wolfe' or 'armijo')
-- `initial_step`: Starting step size for line search
-
 ## Usage Example
 
 ```python
 import torch
-from src.attacks import PGD, ConjugateGradient, LBFGS
+from src.attacks import PGD, ConjugateGradient
 
 # Load a model
 model = load_model()
@@ -113,9 +96,6 @@ The three methods offer different trade-offs:
 
 - **PGD**: Most reliable but slowest convergence; works well on any model
 - **Conjugate Gradient**: Better convergence than PGD with moderately higher complexity
-- **L-BFGS**: Fastest convergence when loss landscape is well-behaved, but may struggle with highly non-convex objectives
-
-In practice, L-BFGS typically requires fewer iterations, but each iteration is more expensive due to line search and two-loop recursion.
 
 ## References
 
