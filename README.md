@@ -20,41 +20,42 @@ Based on the findings in our survey, the following attack methods are highlighte
 1. **C\&W (Carlini & Wagner)**: Consistently achieves high success rates with minimal perturbations, particularly for targeted attacks, but incurs high computational overhead.
    ```bash
    # Example for a strong targeted L2 attack (parameters from paper/tests):
-   python demo.py --method cw --norm L2 --targeted --target-method least-likely --c-val 10 --confidence 5 --steps 500 --learning-rate 0.01
+   # Assumes test.JPEG exists at the specified path
+   python demo.py -i path/to/your/test.JPEG -a cw -n L2 -t -tm least-likely -cv 10 -k 5 -s 500 -lr 0.01 -o results/demo_cw_targeted
    # Example for a default untargeted L2 attack:
-   # python demo.py --method cw --norm L2 --c-val 1 --confidence 0 --steps 1000 --learning-rate 0.01
+   # python demo.py -i path/to/your/test.JPEG -a cw -n L2 -cv 1 -k 0 -s 1000 -lr 0.01 -o results/demo_cw_untargeted
    ```
 
 2. **PGD (Projected Gradient Descent)**: Offers a strong balance between attack effectiveness and computational cost. Effective for both untargeted and targeted attacks under various L_p norms.
    ```bash
    # Example for Linf Untargeted (epsilon=8/255, 40 steps, step_size=eps/4):
-   python demo.py --method pgd --norm Linf --epsilon 0.03137 --steps 40 --step-size 0.00784
+   python demo.py -i path/to/your/test.JPEG -a pgd -n Linf -e 0.03137 -s 40 -ss 0.00784 -o results/demo_pgd_linf_untargeted
    # Example for Linf Targeted (epsilon=16/255, 200 steps, step_size=eps/10):
-   # python demo.py --method pgd --norm Linf --targeted --target-method least-likely --epsilon 0.06274 --steps 200 --step-size 0.00627
+   # python demo.py -i path/to/your/test.JPEG -a pgd -n Linf -t -tm least-likely -e 0.06274 -s 200 -ss 0.00627 -o results/demo_pgd_linf_targeted
    ```
 
 3. **DeepFool**: Particularly effective for generating untargeted attacks with very small L2 perturbations, though computationally more intensive than FGSM or PGD. (DeepFool is generally untargeted).
    ```bash
    # Example (L2 norm is implicit for DeepFool):
-   python demo.py --method deepfool --steps 50 --overshoot 0.02
+   python demo.py -i path/to/your/test.JPEG -a deepfool -s 50 -os 0.02 -o results/demo_deepfool
    ```
 
 4. **CG (Conjugate Gradient)**: Can be more efficient than PGD on certain complex loss landscapes by utilizing approximate second-order information, offering a balance between cost and potency.
    ```bash
    # Example for Linf Untargeted (epsilon=8/255, 40 steps):
-   python demo.py --method cg --norm Linf --epsilon 0.03137 --steps 40 --alpha 0.00784 # alpha similar to PGD step_size
+   python demo.py -i path/to/your/test.JPEG -a cg -n Linf -e 0.03137 -s 40 -al 0.00784 -o results/demo_cg_linf_untargeted
    # Example for Linf Targeted (epsilon=16/255, 60 steps from paper):
-   # python demo.py --method cg --norm Linf --targeted --target-method least-likely --epsilon 0.06274 --steps 60 --alpha 0.00627
+   # python demo.py -i path/to/your/test.JPEG -a cg -n Linf -t -tm least-likely -e 0.06274 -s 60 -al 0.00627 -o results/demo_cg_linf_targeted
    ```
 
 5. **FGSM/FFGSM**: The fastest methods, suitable for scenarios requiring rapid generation (e.g., adversarial training). Less effective for targeted attacks and against robust models. FFGSM adds a small random initialization to potentially improve FGSM.
    ```bash
    # Example FGSM (Untargeted, Linf, epsilon=4/255):
-   python demo.py --method fgsm --norm Linf --epsilon 0.01568
+   python demo.py -i path/to/your/test.JPEG -a fgsm -n Linf -e 0.01568 -o results/demo_fgsm_linf_untargeted
    # Example FFGSM (Untargeted, Linf, epsilon=8/255, alpha=0.1*epsilon):
-   python demo.py --method ffgsm --norm Linf --epsilon 0.03137 --alpha 0.00313
+   python demo.py -i path/to/your/test.JPEG -a ffgsm -n Linf -e 0.03137 -al 0.00313 -o results/demo_ffgsm_linf_untargeted
    # Example FFGSM (Targeted, Linf, epsilon=32/255, alpha=0.02 from paper):
-   # python demo.py --method ffgsm --norm Linf --targeted --target-method least-likely --epsilon 0.12549 --alpha 0.02
+   # python demo.py -i path/to/your/test.JPEG -a ffgsm -n Linf -t -tm least-likely -e 0.12549 -al 0.02 -o results/demo_ffgsm_linf_targeted
    ```
 
 ## Repository Structure
@@ -155,11 +156,11 @@ Below are some example visualizations from the paper, illustrating the effects o
 If you use this code or refer to the findings in your research, please cite our paper:
 
 ```
-@article{ali2023survey,
+@article{ali2025survey,
   title={Adversarial Attacks on Neural Networks: A Survey},
   author={Ali, Izhar},
-  journal={arXiv preprint arXiv:XXXX.XXXXX},  # Update with actual arXiv ID once available
-  year={2023} # Or the actual year of publication/submission
+  journal={arXiv preprint arXiv:XXXX.XXXXX},
+  year={2025}
 }
 ```
 

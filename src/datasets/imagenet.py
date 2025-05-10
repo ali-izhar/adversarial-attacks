@@ -24,6 +24,25 @@ import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image, UnidentifiedImageError
 
+# Standard ImageNet normalization constants
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+def get_imagenet_transforms(pretrained: bool = True) -> Callable:
+    """Returns standard ImageNet transformations.
+    The 'pretrained' argument is kept for API consistency with some torchvision models,
+    but currently doesn't change the transform returned by this function.
+    """
+    return transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+
 
 class ImageNetDataset(Dataset):
     """Dataset for loading ImageNet-style data.
@@ -62,16 +81,7 @@ class ImageNetDataset(Dataset):
 
         # Use a default set of transformations if none is provided
         if self.transform is None:
-            self.transform = transforms.Compose(
-                [
-                    transforms.Resize(256),
-                    transforms.CenterCrop(224),
-                    transforms.ToTensor(),
-                    transforms.Normalize(
-                        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-                    ),  # ImageNet normalization
-                ]
-            )
+            self.transform = get_imagenet_transforms()
 
     def load_class_names(self):
         """Load class names from imagenet_classes.txt."""
