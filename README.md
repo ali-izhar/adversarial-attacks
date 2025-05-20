@@ -1,5 +1,7 @@
 # Adversarial Attacks on Neural Networks: A Survey
 
+[adversarial_perturbations.pdf](assets/adversarial_perturbations.pdf)
+
 This repository contains implementations of various optimization methods for generating adversarial examples against convolutional neural networks. It accompanies the research paper "Adversarial Attacks on Neural Networks: A Survey."
 
 Below are some example visualizations from the paper, illustrating the effects of different adversarial attacks.
